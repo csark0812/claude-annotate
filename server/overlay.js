@@ -70,7 +70,7 @@
   const pageUrl = () => location.href;
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
-  let tool = "rect";
+  let tool = "element";
   let ink = INKS[0];
   // draw | browse. annotate_open starts in browse, so every page stays usable until a tool is picked.
   // The extension's toolbar icon is the switch: there the overlay exists only while annotating.

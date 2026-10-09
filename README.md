@@ -80,9 +80,9 @@ Per note that is: your text, the element under the pin with its visible text and
 
 | | |
 |---|---|
-| **Element** | `E`, then point: the element under the pointer is outlined with its selector and size, inside iframes too (nested, and from other sites once you allow it). Click to mark it and comment; the note carries that element and the frame path to it. |
+| **Element** | The default tool (`E`). Point: the element under the pointer is outlined with its selector and size, inside iframes too (nested, and from other sites once you allow it). Click to mark it and comment; the note carries that element and the frame path to it. |
 | **Marks** | Box, arrow, pen. Four inks with a dark halo, so they read on light and dark pages. Hold `⇧` for a square, or an arrow in 15° steps. When you let go, a comment box opens under the mark: type and `↵`, or `esc` to keep the mark without a comment. |
-| **Comments** | Click anywhere (no drag) for a bare comment at that spot. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
+| **Comments** | With box, arrow or pen, a click (no drag) opens a bare comment at that spot. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
 | **Browse** | `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. With the Chrome extension, its toolbar icon is the switch instead. |
 | **Across pages** | Marks are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
 | **Edit** | Click a pin to edit its comment or delete it (a mark's comment takes the mark with it). Pins drag in any mode. `⌘Z` and `⇧⌘Z` for undo and redo. |

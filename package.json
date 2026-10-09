@@ -1,6 +1,6 @@
 {
   "name": "claude-annotate-plugin",
-  "version": "0.3.12-local",
+  "version": "0.3.13-local",
   "private": true,
   "type": "module",
   "description": "Channel server, browser driver and overlay for the Annotate plugin.",
