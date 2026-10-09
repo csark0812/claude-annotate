@@ -92,4 +92,34 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(out.text).toContain(PAGE)
     expect(out.text).toContain('1. make this blue')
   })
+
+  test(`${surface}: /annotations lists the notes as text even when the pane is placed`, async ($, on) => {
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n4242\n', stderr: '' } }) as never)
+    on('fs.exists', (_$, e) => ({ value: e.path === SESSIONS || e.path === `${SESSIONS}/4242.json` }))
+    on('fs.read', () => ({ value: JSON.stringify(BRIDGE) }))
+    on('fs.list', () => ({ value: [] }))
+    on('clock.every', () => ({ value: undefined }))
+    on('command.register', () => ({ value: { command: 'annotations' } }))
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('ui.status', () => ({ value: undefined }))
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    on('http.fetch', () => ({ value: {
+      status: 200,
+      ok: true,
+      headers: {},
+      text: JSON.stringify({
+        ok: true,
+        mode: 'chat',
+        totals: { notes: 1, shapes: 0, pages: 1, unsent: 1, open: 0, batches: 0 },
+        pages: [{ url: PAGE, notes: [{ n: 1, text: 'make this blue' }], shapes: 0 }],
+        batches: [],
+      }),
+    } }))
+
+    await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
+    const out = await $.command.run({ command: 'annotations', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+    expect(out.text).not.toContain('No pane here')
+    expect(out.text).toContain('1. make this blue')
+  })
 }

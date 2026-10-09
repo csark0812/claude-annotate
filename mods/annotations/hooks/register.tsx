@@ -34,10 +34,10 @@ export const register: Register = on => {
     const opened = await $.ui.open({ id: PANE, title: 'Annotations' })
     const now = await read($, overview)
     if (now.kind !== 'linked') return { text: 'Annotations: no annotate server in this session yet.' }
-    if (opened.isPlaced) return { text: `Annotations: ${statusLine(now.totals)}.` }
-
-    // This surface placed no pane (an older desktop app): list the notes here instead.
-    return { text: [`Annotations: ${statusLine(now.totals)}. No pane here: ${opened.reason}`, ...noteLines(now.pages)].join('\n') }
+    // The notes go in the text too: a headless host (the desktop app's Code tab) reports the pane
+    // as placed but draws nothing, and an older desktop says it placed none.
+    const head = `Annotations: ${statusLine(now.totals)}.${opened.isPlaced ? '' : ` No pane here: ${opened.reason}`}`
+    return { text: [head, ...noteLines(now.pages)].join('\n') }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
