@@ -193,9 +193,10 @@ svg.ink .hit { stroke: transparent; fill: none; stroke-width: 16; pointer-events
 :host(.draw.t-select) svg.ink rect.hit, :host(.draw.t-select) svg.ink ellipse.hit { pointer-events: all; }
 :host(.dragging) svg.ink .hit, :host(.dragging) .pin .dot { cursor: grabbing !important; }
 :host(.draw.t-select) svg.ink g.shape:hover .halo { stroke: rgba(255,255,255,.55); }
-svg.ink g.shape.selected .halo { stroke: #fff; stroke-dasharray: 8 6; stroke-width: 10; }
-svg.ink .halo { fill: none; stroke: rgba(10,8,14,.42); stroke-width: 10; stroke-linecap: round; stroke-linejoin: round; }
-svg.ink .line { fill: none; stroke-width: 6; stroke-linecap: round; stroke-linejoin: round; }
+svg.ink g.shape.selected .halo { stroke: #fff; stroke-dasharray: 5 4; stroke-width: 5; }
+svg.ink .halo { fill: none; stroke: rgba(10,8,14,.42); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+svg.ink .box { stroke-dasharray: 7 5; stroke-linecap: butt; stroke-linejoin: miter; } /* a box reads as a selection */
+svg.ink .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 svg.ink .head { stroke: rgba(10,8,14,.42); stroke-width: 2; stroke-linejoin: round; }
 svg.ink g.draft { opacity: .9; }
 :host(.capturing) svg.ink .hit, :host(.capturing) .chrome, :host(.capturing) .pop, :host(.capturing) g.shape.selected .halo { display: none !important; }
@@ -612,7 +613,7 @@ svg.ink g.draft { opacity: .9; }
   }
   function arrowParts(s) {
     const a = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
-    const size = 22; // in step with the 6px line
+    const size = 11; // in step with the 2px line
     const bx = s.x2 - Math.cos(a) * size * 0.75, by = s.y2 - Math.sin(a) * size * 0.75;
     const p1 = [s.x2 - size * Math.cos(a - 0.5), s.y2 - size * Math.sin(a - 0.5)];
     const p2 = [s.x2 - size * Math.cos(a + 0.5), s.y2 - size * Math.sin(a + 0.5)];
@@ -626,8 +627,8 @@ svg.ink g.draft { opacity: .9; }
       body = `<path class="halo" d="${d}"/><path class="line" stroke="${hex}" d="${d}"/>`;
       hit = `<path class="hit" d="${d}"/>`;
     } else if (s.type === "rect") {
-      const a = `x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="8"`;
-      body = `<rect class="halo" ${a}/><rect class="line" stroke="${hex}" ${a}/>`;
+      const a = `x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}"`;
+      body = `<rect class="halo box" ${a}/><rect class="line box" stroke="${hex}" ${a}/>`;
       hit = `<rect class="hit" ${a}/>`;
     } else if (s.type === "ellipse") {
       const a = `cx="${s.x + s.w / 2}" cy="${s.y + s.h / 2}" rx="${s.w / 2}" ry="${s.h / 2}"`;
