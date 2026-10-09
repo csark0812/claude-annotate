@@ -80,8 +80,8 @@ Per note that is: your text, the element under the pin with its visible text and
 
 | | |
 |---|---|
-| **Marks** | Pen, arrow, line, box, circle. Four inks with a dark halo, so they read on light and dark pages. Hold `⇧` for a square, a circle, or a line or arrow in 15° steps. When you let go, a comment box opens under the mark: type and `↵`, or `esc` to keep the mark without a comment. |
-| **Notes** | `N` then click. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
+| **Marks** | Box, arrow, pen. Four inks with a dark halo, so they read on light and dark pages. Hold `⇧` for a square, or an arrow in 15° steps. When you let go, a comment box opens under the mark: type and `↵`, or `esc` to keep the mark without a comment. |
+| **Comments** | Click anywhere (no drag) for a bare comment at that spot. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
 | **Browse** | `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. With the Chrome extension, its toolbar icon is the switch instead. |
 | **Across pages** | Marks are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
 | **Edit** | Click a pin to edit its comment or delete it (a mark's comment takes the mark with it). Pins drag in any mode. `⌘Z` and `⇧⌘Z` for undo and redo. |
@@ -89,7 +89,7 @@ Per note that is: your text, the element under the pin with its visible text and
 | **Progress** | Pin spins: Claude is on that note. Green with a line: done. Grey: skipped, with why. The toolbar shows which file Claude is editing. |
 | **Clear** | Two clicks (the second one says *Sure?*). Removes every mark on every page and the temporary screenshots. |
 
-Keys: `P` pen · `A` arrow · `L` line · `R` box · `E` circle · `N` note · `1` – `4` inks · `V` / `esc` browse · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included. Drag the toolbar by its grip, it remembers where you put it per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost.
+Keys: `R` box · `A` arrow · `P` pen · `1` – `4` inks · `V` / `esc` browse (with the extension, `esc` turns annotation off) · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included. Drag the toolbar by its grip, it remembers where you put it per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost.
 
 ## Chrome extension
 

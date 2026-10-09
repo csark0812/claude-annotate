@@ -39,14 +39,14 @@
     { id: "cyan", hex: "#35D7FF", dark: "#062530" },
     { id: "lime", hex: "#9BFF4D", dark: "#142A05" },
   ];
-  const TOOLS = ["pen", "arrow", "line", "rect", "ellipse", "note"];
-  const KEYS = { p: "pen", a: "arrow", l: "line", r: "rect", e: "ellipse", n: "note" };
+  const TOOLS = ["rect", "arrow", "pen"];
+  const KEYS = { r: "rect", a: "arrow", p: "pen" };
+  const CLICK_SLOP = 5; // a press that moves less than this is a click: it opens a bare comment
   const ICON = {
     pen: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
     arrow: '<path d="M5 19 19 5"/><path d="M9 5h10v10"/>',
     line: '<path d="M5 19 19 5"/>',
     rect: '<rect x="3" y="5" width="18" height="14" rx="3"/>',
-    ellipse: '<ellipse cx="12" cy="12" rx="9" ry="7"/>',
     note: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>',
     undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
     trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
@@ -69,7 +69,7 @@
   const pageUrl = () => location.href;
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
-  let tool = "pen";
+  let tool = "rect";
   let ink = INKS[0];
   // draw | browse. annotate_open starts in browse, so every page stays usable until a tool is picked.
   // The extension's toolbar icon is the switch: there the overlay exists only while annotating.
@@ -896,7 +896,7 @@ svg.ink g.draft { opacity: .9; }
     host.style.setProperty("--ink", ink.hex);
     host.style.setProperty("--ink-dark", ink.dark);
     const cur = `url("data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'><circle cx='11' cy='11' r='6.5' fill='${ink.hex}' stroke='rgba(10,8,14,.75)' stroke-width='2'/></svg>`)}") 11 11, crosshair`;
-    host.style.setProperty("--cursor", tool === "note" ? "copy" : cur);
+    host.style.setProperty("--cursor", cur);
   }
   function setMode(m) {
     mode = m;
@@ -935,12 +935,9 @@ svg.ink g.draft { opacity: .9; }
       <span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>${frozen ? `
       <span class="frozen" title="The page's hover state is held while you annotate">Hover held</span>` : ""}
       <span class="sep"></span>
-      ${btn("pen", "Pen", "P", tool === "pen" && mode === "draw" ? "on" : "")}
-      ${btn("arrow", "Arrow", "A", tool === "arrow" && mode === "draw" ? "on" : "")}
-      ${btn("line", "Line", "L", tool === "line" && mode === "draw" ? "on" : "")}
       ${btn("rect", "Box", "R", tool === "rect" && mode === "draw" ? "on" : "")}
-      ${btn("ellipse", "Circle", "E", tool === "ellipse" && mode === "draw" ? "on" : "")}
-      ${btn("note", "Note", "N", tool === "note" && mode === "draw" ? "on" : "")}
+      ${btn("arrow", "Arrow", "A", tool === "arrow" && mode === "draw" ? "on" : "")}
+      ${btn("pen", "Pen", "P", tool === "pen" && mode === "draw" ? "on" : "")}
       <span class="sep"></span>
       <span class="inks">${INKS.map((i, idx) => `<button class="inkb${ink.id === i.id ? " on" : ""}" type="button" data-ink="${i.id}" style="--c:${i.hex}" aria-label="${i.id} ink" title="${i.id} (${idx + 1})"></button>`).join("")}</span>
       <span class="sep"></span>
@@ -1100,46 +1097,63 @@ svg.ink g.draft { opacity: .9; }
     if (mode !== "draw" || e.button !== 0) return;
     if (!popover.classList.contains("hidden")) { commitPopover(); }
     const [x, y] = toDoc(e);
-    if (tool === "note") { e.preventDefault(); createNote(x, y); return; }
     e.preventDefault();
     svg.setPointerCapture(e.pointerId);
+    pressAt = [x, y];
     if (tool === "pen") draft = { id: uid(), type: "pen", color: ink.id, points: [[x, y]] };
-    else if (tool === "arrow" || tool === "line") draft = { id: uid(), type: tool, color: ink.id, x1: x, y1: y, x2: x, y2: y };
-    else draft = { id: uid(), type: tool, color: ink.id, x, y, w: 0, h: 0, _ox: x, _oy: y };
+    else if (tool === "arrow") draft = { id: uid(), type: "arrow", color: ink.id, x1: x, y1: y, x2: x, y2: y };
+    else draft = { id: uid(), type: "rect", color: ink.id, x, y, w: 0, h: 0, _ox: x, _oy: y };
     sizeDoc();
     renderDraft();
   }
-  // The overlay covers the page, so a wheel over it would scroll only the document. Pages that
-  // scroll an inner container (an app shell) get the wheel passed to that container.
+  // The overlay sits outside the page's elements, so the browser would scroll nothing (or only
+  // the document) under it. The wheel goes to what would scroll under the pointer: the nearest
+  // scrollable ancestor that can still move that way (body and the document included), else the
+  // smallest scrollable area on screen that holds the pointer (a container beside a fixed layer).
   function onWheel(e) {
-    const target = scrollerAt(e.clientX, e.clientY, e.deltaX, e.deltaY);
-    if (!target) return; // the document itself: the browser scrolls it
-    e.preventDefault();
     const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
-    target.scrollBy({ left: e.deltaX * k, top: e.deltaY * k, behavior: "instant" });
+    const dx = e.deltaX * k, dy = e.deltaY * k;
+    const target = scrollerAt(e.clientX, e.clientY, dx, dy);
+    if (!target) return;
+    e.preventDefault();
+    target.scrollBy({ left: dx, top: dy, behavior: "instant" });
+  }
+  function canScroll(el, dx, dy) {
+    const root = el === document.scrollingElement;
+    const st = getComputedStyle(el);
+    const yOk = root ? st.overflowY !== "hidden" && st.overflowY !== "clip" : /(auto|scroll|overlay)/.test(st.overflowY);
+    const xOk = root ? st.overflowX !== "hidden" && st.overflowX !== "clip" : /(auto|scroll|overlay)/.test(st.overflowX);
+    const moveY = dy !== 0 && yOk && (dy < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+    const moveX = dx !== 0 && xOk && (dx < 0 ? el.scrollLeft > 0 : el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+    return moveY || moveX;
   }
   function scrollerAt(cx, cy, dx, dy) {
     host.style.visibility = "hidden";
-    let el = document.elementFromPoint(cx, cy);
+    const hit = document.elementFromPoint(cx, cy);
     host.style.visibility = "";
-    for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
-      const st = getComputedStyle(el);
-      const canY = /(auto|scroll|overlay)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 1;
-      const canX = /(auto|scroll|overlay)/.test(st.overflowX) && el.scrollWidth > el.clientWidth + 1;
-      const moves = (canY && (dy < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1)) ||
-        (canX && (dx < 0 ? el.scrollLeft > 0 : el.scrollLeft + el.clientWidth < el.scrollWidth - 1));
-      if (moves) return el;
+    for (let el = hit; el; el = el.parentElement) if (canScroll(el, dx, dy)) return el;
+    const root = document.scrollingElement;
+    if (root && canScroll(root, dx, dy)) return root;
+    let best = null, bestArea = Infinity;
+    for (const el of document.querySelectorAll("*")) {
+      if (el.scrollHeight <= el.clientHeight + 1 && el.scrollWidth <= el.clientWidth + 1) continue;
+      const r = el.getBoundingClientRect();
+      if (cx < r.left || cx > r.right || cy < r.top || cy > r.bottom) continue;
+      const area = r.width * r.height;
+      if (area < bestArea && canScroll(el, dx, dy)) { best = el; bestArea = area; }
     }
-    return null;
+    return best;
   }
   let drag = null; // { kind: "pin", ... } while a pin is being moved
+  let pressAt = null, farthest = 0; // where the press began, and how far the pointer has gone since
   function onMove(e) {
     if (!draft) return;
     const [x, y] = toDoc(e);
+    farthest = Math.max(farthest, Math.hypot(x - pressAt[0], y - pressAt[1]));
     if (draft.type === "pen") {
       const l = draft.points[draft.points.length - 1];
       if (Math.hypot(x - l[0], y - l[1]) >= 2.5) draft.points.push([x, y]);
-    } else if (draft.type === "arrow" || draft.type === "line") { [draft.x2, draft.y2] = e.shiftKey ? snap15(draft.x1, draft.y1, x, y) : [x, y]; }
+    } else if (draft.type === "arrow") { [draft.x2, draft.y2] = e.shiftKey ? snap15(draft.x1, draft.y1, x, y) : [x, y]; }
     else {
       draft.x = Math.min(draft._ox, x); draft.y = Math.min(draft._oy, y);
       draft.w = Math.abs(x - draft._ox); draft.h = Math.abs(y - draft._oy);
@@ -1150,9 +1164,12 @@ svg.ink g.draft { opacity: .9; }
   function onUp() {
     if (!draft) return;
     const d = draft; draft = null;
+    const wasClick = farthest < CLICK_SLOP;
+    farthest = 0;
+    if (wasClick) { renderDraft(); createNote(pressAt[0], pressAt[1]); return; }
     let ok = false;
     if (d.type === "pen") ok = d.points.length >= 3;
-    else if (d.type === "arrow" || d.type === "line") ok = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) >= 12;
+    else if (d.type === "arrow") ok = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) >= 12;
     else { ok = d.w >= 8 && d.h >= 8; delete d._ox; delete d._oy; }
     if (!ok) { renderDraft(); return; }
     addShape(d);
@@ -1177,8 +1194,15 @@ svg.ink g.draft { opacity: .9; }
     if (meta && e.key === "Enter") { e.preventDefault(); send(); return; }
     if (meta || e.altKey) return;
     const k = e.key.toLowerCase();
-    if (e.key === "Escape") { if (clearArmed) disarmClear(); else if (mode === "draw") setMode("browse"); return; } // never steals the page's own Escape
+    if (e.key === "Escape") {
+      if (clearArmed) disarmClear();
+      // Mounted by the extension: Esc turns annotation mode off (the extension unmounts us).
+      else if (CFG.startMode === "draw") { e.preventDefault(); e.stopPropagation(); document.dispatchEvent(new CustomEvent("claude-annotate:exit")); }
+      else if (mode === "draw") setMode("browse");
+      return;
+    }
     if (mode === "browse" && !(k in KEYS) && k !== "v") return;
+    if (k === "v" && CFG.startMode === "draw") return; // the extension's icon is the switch
     if (k === "v") { setMode(mode === "draw" ? "browse" : "draw"); return; }
     if (k in KEYS) { setTool(KEYS[k]); return; }
     if (/^[1-4]$/.test(k)) { ink = INKS[Number(k) - 1]; applyInk(); renderToolbar(); return; }

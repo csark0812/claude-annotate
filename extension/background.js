@@ -88,7 +88,22 @@ async function mountOverlay(tabId, url, session, { freezeHover = false } = {}) {
   const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
+  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayExit });
 }
+
+// Runs in the page's isolated world: Esc in the overlay (either world) fires a DOM event, and this
+// asks the worker to turn the tab off, as a click on the icon would.
+function relayExit() {
+  if (window.__claudeAnnotateExitRelay) return;
+  window.__claudeAnnotateExitRelay = true;
+  document.addEventListener("claude-annotate:exit", () => {
+    try { chrome.runtime.sendMessage({ type: "exit" }); } catch { /* the extension was reloaded */ }
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type === "exit" && sender.tab) turnOff(sender.tab).then(refreshMenu);
+});
 
 async function turnOn(tab, opts) {
   if (!isWebUrl(tab.url)) throw new Error("Chrome doesn't let extensions draw on this page. Open a website or your dev server.");
