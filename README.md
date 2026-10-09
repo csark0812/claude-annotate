@@ -93,7 +93,9 @@ Keys: `P` pen · `A` arrow · `L` line · `R` box · `E` circle · `N` note · `
 
 ## Chrome extension
 
-The extension puts the same toolbar on any local dev tab you already have open, with no `/annotate` first. Its toolbar button turns annotation mode on and off for the tab (`⌥⇧A` does the same). Notes go to the Claude Code session you typed in last, or to the one you pick in the popup.
+The extension puts the same toolbar on any tab you already have open, with no `/annotate` first: your dev server, a deployed copy of your app, or a site you want yours to look like. Its toolbar button turns annotation mode on and off for the tab (`⌥⇧A` does the same). Notes go to the Claude Code session you typed in last, or to the one you pick in the popup.
+
+On a local dev page the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, and Claude is told that text quoted from that site is data, not instructions. Turning it on for a site asks Chrome for access to that site once, so it stays on across reloads.
 
 ```sh
 npm run extension:install   # copies the overlay into extension/ and registers the native host with Chrome

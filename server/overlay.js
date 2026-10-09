@@ -1,7 +1,12 @@
 /* Annotate — in-page overlay.
  *
- * Injected into every page of the annotation browser before the page's own scripts
- * run (window.__CLAUDE_ANNOTATE__ carries endpoint + token). Everything lives in a
+ * window.__CLAUDE_ANNOTATE__ says how it reaches the session's annotate server:
+ *  - { endpoint, token }: direct, from the page's main world. Local dev pages only: injected
+ *    by the annotation browser before the page's scripts run, or by the extension.
+ *  - { transport: "port" }: through the browser extension, from its isolated world. Any page:
+ *    the page's scripts never see the token, the requests or the overlay itself.
+ *  - { state, renderOnly }: no server at all. The marks to draw for a screenshot.
+ * Everything lives in a
  * Shadow DOM on a host appended to <html>, so the page's CSS never touches it and ours
  * never leaks out. Document coordinates everywhere, so marks stay put while scrolling.
  *
@@ -14,8 +19,10 @@
   const CFG = window.__CLAUDE_ANNOTATE__;
   try { delete window.__CLAUDE_ANNOTATE__; } catch { window.__CLAUDE_ANNOTATE__ = undefined; } // the token never stays on the page
   if (!CFG || window.__claudeAnnotate) return;
-  // Local development hosts only: a third-party page in this profile must never see the bridge.
-  if (!isLocalHost(location.hostname)) return;
+  const VIA_PORT = CFG.transport === "port";
+  const INLINE = !!CFG.state;
+  // The token in a page's main world: local development hosts only. A third-party page must never see the bridge.
+  if (!VIA_PORT && !INLINE && !isLocalHost(location.hostname)) return;
   const F = window.fetch.bind(window), ES = window.EventSource; // taken before page scripts can patch them
   const RENDER_ONLY = !!CFG.renderOnly || !!window.__CLAUDE_ANNOTATE_RENDER_ONLY__;
 
@@ -82,13 +89,81 @@
   // ---------------------------------------------------------------------------
   // Transport
   // ---------------------------------------------------------------------------
-  const H = { "Content-Type": "application/json", "X-Annot-Token": CFG.token };
-  const req = async (method, p, body) => {
-    const r = await F(CFG.endpoint + p, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || r.statusText);
-    return j;
-  };
+  // req(method, path, body) → the server's JSON answer. events() → { onopen, onerror, onmessage, close }.
+  const transport = VIA_PORT ? portTransport() : INLINE ? inlineTransport() : directTransport();
+  const req = transport.req;
+
+  function directTransport() {
+    const H = { "Content-Type": "application/json", "X-Annot-Token": CFG.token };
+    return {
+      async req(method, p, body) {
+        const r = await F(CFG.endpoint + p, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || r.statusText);
+        return j;
+      },
+      events: () => new ES(`${CFG.endpoint}/events?t=${CFG.token}`),
+    };
+  }
+
+  // The extension's background holds the token and makes the requests. One port per page:
+  // requests carry an id, server-sent events come back without one.
+  function portTransport() {
+    const waiting = new Map();
+    let port = null, seq = 0, subscribed = false, closed = false;
+    // A message into the extension's worker keeps it from being stopped while the page listens.
+    const keepAlive = setInterval(() => { if (port && subscribed) port.postMessage({ ping: true }); }, 20000);
+    const stream = { onopen: null, onerror: null, onmessage: null, close() { closed = true; clearInterval(keepAlive); if (port) port.disconnect(); } };
+    const connect = () => {
+      port = globalThis.chrome.runtime.connect({ name: "annotate" }); // the extension API; `chrome` here is the toolbar
+      port.onMessage.addListener((m) => {
+        if (m.id) {
+          const w = waiting.get(m.id);
+          waiting.delete(m.id);
+          if (w) m.ok ? w.resolve(m.data) : w.reject(new Error((m.data && m.data.error) || m.error || `HTTP ${m.status}`));
+        } else if (m.open) stream.onopen && stream.onopen();
+        else if (m.event != null) stream.onmessage && stream.onmessage({ data: m.event });
+        else if (m.closed) stream.onerror && stream.onerror();
+      });
+      port.onDisconnect.addListener(() => {
+        port = null;
+        for (const w of waiting.values()) w.reject(new Error("extension disconnected"));
+        waiting.clear();
+        if (closed) return;
+        stream.onerror && stream.onerror();
+        // The extension's worker restarted: come back and listen again.
+        if (subscribed) setTimeout(() => { if (!closed && !port) { connect(); port.postMessage({ subscribe: true }); } }, 1000);
+      });
+    };
+    connect();
+    return {
+      req(method, p, body) {
+        if (!port) connect();
+        const id = ++seq;
+        return new Promise((resolve, reject) => {
+          waiting.set(id, { resolve, reject });
+          port.postMessage({ id, method, path: p, body });
+        });
+      },
+      events() {
+        if (!port) connect();
+        subscribed = true;
+        port.postMessage({ subscribe: true });
+        return stream;
+      },
+    };
+  }
+
+  // A screenshot of a page that isn't open: the marks come with the script, nothing goes back.
+  function inlineTransport() {
+    return {
+      async req(method, p) {
+        if (method === "GET" && p.startsWith("/state")) return { ok: true, ...CFG.state };
+        return { ok: true };
+      },
+      events: () => ({ close() {} }),
+    };
+  }
   let saveTimer = null;
   const save = () => {
     clearTimeout(saveTimer);
@@ -952,6 +1027,9 @@ svg.ink g.draft { opacity: .9; }
 
     // Window-level listeners go through `off` so unmount() removes them all at once.
     const { signal } = off;
+    // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
+    document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
+
     // Keyboard
     window.addEventListener("keydown", onKey, { capture: true, signal });
 
@@ -967,6 +1045,7 @@ svg.ink g.draft { opacity: .9; }
       ro.observe(document.documentElement);
       if (document.body) ro.observe(document.body); // idempotent; re-arms after a body swap
       sizeDoc();
+      onUrlChange(); // an isolated world's history wrappers never see the page's own pushState
     }, 1500);
     signal.addEventListener("abort", () => clearInterval(keeper));
 
@@ -1146,8 +1225,9 @@ svg.ink g.draft { opacity: .9; }
     } catch { setLink("off"); }
   }
   function connectSse() {
+    if (INLINE) return;
     setLink("connecting");
-    sse = new ES(`${CFG.endpoint}/events?t=${CFG.token}`);
+    sse = transport.events();
     sse.onopen = () => setLink("on");
     sse.onerror = () => setLink("off");
     sse.onmessage = (ev) => {
