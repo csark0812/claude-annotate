@@ -31,10 +31,13 @@ export const register: Register = on => {
 
   on('command.run', { command: 'annotations' }, async $ => {
     await refresh($, cwd)
-    await $.ui.open({ id: PANE, title: 'Annotations' })
+    const opened = await $.ui.open({ id: PANE, title: 'Annotations' })
     const now = await read($, overview)
+    if (now.kind !== 'linked') return { text: 'Annotations: no annotate server in this session yet.' }
+    if (opened.isPlaced) return { text: `Annotations: ${statusLine(now.totals)}.` }
 
-    return { text: now.kind === 'linked' ? `Annotations: ${statusLine(now.totals)}.` : 'Annotations: no annotate server in this session yet.' }
+    // This surface placed no pane (an older desktop app): list the notes here instead.
+    return { text: [`Annotations: ${statusLine(now.totals)}. No pane here: ${opened.reason}`, ...noteLines(now.pages)].join('\n') }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -165,6 +168,13 @@ async function act($: EngineInterface, cwd: string, method: string, path: string
 
 function statusLine(t: { notes: number; unsent: number; open: number }) {
   return `✎ ${t.notes} note${t.notes === 1 ? '' : 's'} · ${t.unsent} unsent · ${t.open} open`
+}
+
+function noteLines(pages: Page[]) {
+  return pages.flatMap(page => [
+    page.url,
+    ...page.notes.map(note => `  ${STATUS_MARK[note.status ?? ''] ?? '·'} ${note.n}. ${clip(note.text || '(no text)', 160)}`),
+  ])
 }
 
 function clip(text: string, max: number) {
