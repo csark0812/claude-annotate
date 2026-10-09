@@ -1,7 +1,7 @@
 // Claude Annotate: turns annotation mode on and off per tab.
 //
 // On: ask the native host for the live Claude Code sessions, pick one (the one the user
-// pinned in the popup, else the one they typed in last), and mount the overlay.
+// picked in the icon's right-click menu, else the one they typed in last), and mount the overlay.
 //  - A local dev page: in the page's main world with the session's endpoint and token, so it
 //    can read React's component and source data. The page is the user's own code.
 //  - Any other page: in this extension's isolated world. The page's scripts can't see it, and
@@ -77,23 +77,25 @@ async function unmountOverlay(tabId) {
 }
 
 // Records the tab's session first: an isolated overlay asks for it over the port as soon as it runs.
-async function mountOverlay(tabId, url, session) {
+// freezeHover: hold what the pointer rests on hovered (turned on from the keyboard).
+async function mountOverlay(tabId, url, session, { freezeHover = false } = {}) {
   await unmountOverlay(tabId); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
   const version = chrome.runtime.getManifest().version;
   const local = isLocalUrl(url);
   const world = local ? "MAIN" : "ISOLATED";
-  const cfg = local ? { endpoint: session.endpoint, token: session.token, renderOnly: false, version } : { transport: "port", renderOnly: false, version };
+  const common = { renderOnly: false, version, startMode: "draw", freezeHover };
+  const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
 }
 
-async function turnOn(tab) {
+async function turnOn(tab, opts) {
   if (!isWebUrl(tab.url)) throw new Error("Chrome doesn't let extensions draw on this page. Open a website or your dev server.");
   const { session } = await targetSession();
   if (!session) throw new Error("No Claude Code session is running with the annotate plugin. Start one, then try again.");
   try {
-    await mountOverlay(tab.id, tab.url, session);
+    await mountOverlay(tab.id, tab.url, session, opts);
   } catch (e) {
     await setTabSession(tab.id, null);
     throw e;
@@ -105,9 +107,9 @@ async function turnOff(tab) {
   await setTabSession(tab.id, null);
 }
 
-async function toggle(tab) {
+async function toggle(tab, opts) {
   if ((await onTabs())[tab.id] != null) await turnOff(tab);
-  else await turnOn(tab);
+  else await turnOn(tab, opts);
 }
 
 // Re-points every tab that is on at the session now chosen.
@@ -145,42 +147,85 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   await chrome.storage.session.set({ tabs });
 });
 
-chrome.commands.onCommand.addListener(async (command, tab) => {
-  if (command !== "toggle-annotate" || !tab) return;
+// Toggles and says what went wrong on the icon itself: a "!" badge, the reason in its tooltip.
+async function toggleFromUser(tab, opts) {
   try {
-    await toggle(tab);
+    await toggle(tab, opts);
     await chrome.action.setBadgeText({ tabId: tab.id, text: "" });
+    await chrome.action.setTitle({ tabId: tab.id, title: "Claude Annotate" });
   } catch (e) {
-    await chrome.action.setBadgeText({ tabId: tab.id, text: "!" });
-    await chrome.action.setTitle({ tabId: tab.id, title: `Claude Annotate: ${e.message}` });
+    await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: "#FF4D8D" }).catch(() => {});
+    await chrome.action.setBadgeText({ tabId: tab.id, text: "!" }).catch(() => {});
+    await chrome.action.setTitle({ tabId: tab.id, title: `Claude Annotate: ${e.message}` }).catch(() => {});
   }
+  refreshMenu();
+}
+
+// Asks for the site so the toolbar comes back after a reload there. Called before any await, while
+// the click still counts as a user gesture. Declined or unavailable, it works until the page reloads.
+function askForSite(tab) {
+  if (!isWebUrl(tab.url) || isLocalUrl(tab.url)) return;
+  chrome.permissions.request({ origins: [`${new URL(tab.url).origin}/*`] }).catch(() => {});
+}
+
+// The toolbar icon is the switch.
+chrome.action.onClicked.addListener((tab) => {
+  askForSite(tab);
+  toggleFromUser(tab, { freezeHover: false });
 });
 
-// The popup's requests. Each answers { ok, ... } or { ok: false, error }.
-const handlers = {
-  async status({ tabId, url }) {
-    const tabs = await onTabs();
-    let sessions = [], pinned = null, hostError = null;
-    try { ({ sessions, pinned } = await targetSession()); } catch (e) { hostError = e.message; }
-    return { on: tabs[tabId] != null, onPid: tabs[tabId] ?? null, web: isWebUrl(url), local: isLocalUrl(url), sessions, pinned, hostError };
-  },
-  async toggle({ tab }) {
-    await toggle(tab);
-    return handlers.status({ tabId: tab.id, url: tab.url });
-  },
-  async pin({ pid, tab }) {
-    await chrome.storage.local.set({ pinnedPid: pid ?? null });
-    await remountAll();
-    return handlers.status({ tabId: tab.id, url: tab.url });
-  },
-};
-
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-  const handler = handlers[msg?.type];
-  if (!handler) return false;
-  handler(msg).then((r) => reply({ ok: true, ...r }), (e) => reply({ ok: false, error: e.message }));
-  return true; // answered asynchronously
+// The keyboard switch also holds the hover state: the pointer is still where the user left it.
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command !== "toggle-annotate" || !tab) return;
+  askForSite(tab);
+  toggleFromUser(tab, { freezeHover: true });
 });
+
+// ---------------------------------------------------------------------------
+// Right-click on the icon: which session the notes go to
+// ---------------------------------------------------------------------------
+const MENU_PARENT = "send-to";
+let menuBuiltAt = 0;
+
+async function refreshMenu() {
+  menuBuiltAt = Date.now();
+  let sessions = [], pinned = null;
+  try { ({ sessions, pinned } = await targetSession()); } catch { /* host missing: the menu says so */ }
+  await chrome.contextMenus.removeAll();
+  chrome.contextMenus.create({ id: MENU_PARENT, title: "Send notes to", contexts: ["action"] });
+  if (!sessions.length) {
+    chrome.contextMenus.create({ id: "none", parentId: MENU_PARENT, title: "No Claude Code session running", enabled: false, contexts: ["action"] });
+    return;
+  }
+  const isPinned = sessions.some((s) => s.pid === pinned);
+  chrome.contextMenus.create({ id: "pid:auto", parentId: MENU_PARENT, type: "radio", checked: !isPinned, title: `The session I typed in last (${folder(sessions[0].cwd)})`, contexts: ["action"] });
+  for (const s of sessions) {
+    chrome.contextMenus.create({ id: `pid:${s.pid}`, parentId: MENU_PARENT, type: "radio", checked: s.pid === pinned, title: describeSession(s), contexts: ["action"] });
+  }
+}
+
+function folder(cwd) {
+  return cwd ? cwd.split("/").filter(Boolean).pop() : "unknown folder";
+}
+function describeSession(s) {
+  const at = s.lastPromptAt ?? s.startedAt;
+  const min = Math.max(0, Math.round((Date.now() - at) / 60000));
+  const ago = min < 1 ? "just now" : min < 60 ? `${min} min ago` : `${Math.round(min / 60)} h ago`;
+  return `${folder(s.cwd)} · ${s.lastPromptAt ? "typed" : "started"} ${ago}`;
+}
+
+chrome.contextMenus.onClicked.addListener(async (info) => {
+  if (!String(info.menuItemId).startsWith("pid:")) return;
+  const pid = info.menuItemId === "pid:auto" ? null : Number(String(info.menuItemId).slice(4));
+  await chrome.storage.local.set({ pinnedPid: pid });
+  await remountAll();
+  refreshMenu();
+});
+
+chrome.runtime.onInstalled.addListener(refreshMenu);
+chrome.runtime.onStartup.addListener(refreshMenu);
+// Sessions come and go: rebuild at most every 30 s as the user moves between tabs.
+chrome.tabs.onActivated.addListener(() => { if (Date.now() - menuBuiltAt > 30000) refreshMenu(); });
 
 // ---------------------------------------------------------------------------
 // The "annotate" port: an isolated-world overlay's line to its session's server

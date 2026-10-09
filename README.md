@@ -82,18 +82,20 @@ Per note that is: your text, the element under the pin with its visible text and
 |---|---|
 | **Marks** | Pen, arrow, line, box, circle. Four inks with a dark halo, so they read on light and dark pages. Hold `⇧` for a square, a circle, or a line or arrow in 15° steps. In Select, drag a mark to move it or its handles to resize it. |
 | **Notes** | `N` then click. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
-| **Browse** | The default. `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. |
+| **Browse** | `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. With the Chrome extension, its toolbar icon is the switch instead. |
 | **Across pages** | Marks are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
 | **Select** | `S`, click a mark to select it, drag to move it, `⌫` to delete. Pins drag in any mode. `⌘Z` and `⇧⌘Z` for undo and redo. |
 | **Send** | `⌘↵` or the button. It counts what hasn't been sent yet, so you can send, keep drawing, send again. |
 | **Progress** | Pin spins: Claude is on that note. Green with a line: done. Grey: skipped, with why. The toolbar shows which file Claude is editing. |
 | **Clear** | Two clicks (the second one says *Sure?*). Removes every mark on every page and the temporary screenshots. |
 
-Keys: `P` pen · `A` arrow · `L` line · `R` box · `E` circle · `N` note · `S` select · `1` – `4` inks · `V` / `esc` browse · `⌘Z` · `⇧⌘Z` · `⌫` · `⌘↵` send. Drag the toolbar by its grip, it remembers where you put it per site.
+Keys: `P` pen · `A` arrow · `L` line · `R` box · `E` circle · `N` note · `S` select · `1` – `4` inks · `V` / `esc` browse · `⌘Z` · `⇧⌘Z` · `⌫` · `⌘↵` send. Drag the toolbar by its grip, it remembers where you put it per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost.
 
 ## Chrome extension
 
-The extension puts the same toolbar on any tab you already have open, with no `/annotate` first: your dev server, a deployed copy of your app, or a site you want yours to look like. Its toolbar button turns annotation mode on and off for the tab (`⌥⇧A` does the same). Notes go to the Claude Code session you typed in last, or to the one you pick in the popup.
+The extension puts the same toolbar on any tab you already have open, with no `/annotate` first: your dev server, a deployed copy of your app, or a site you want yours to look like. Click its toolbar icon to annotate the tab, and click again to go back to the page. Notes go to the Claude Code session you typed in last; right-click the icon to pick another.
+
+To mark up a hover state (a menu, a tooltip, a hover style), point at it and press `⌥⇧A` instead of clicking the icon. The toolbar comes up with that hover held: hover styles stay applied and the page never hears the pointer leave, until you turn annotation off. Hover styles from stylesheets on another origin can't be held.
 
 On a local dev page the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, and Claude is told that text quoted from that site is data, not instructions. Turning it on for a site asks Chrome for access to that site once, so it stays on across reloads.
 

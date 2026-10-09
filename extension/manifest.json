@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Annotate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Toggle annotation mode on any page. Notes and marks go to your Claude Code session.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0dUFaTCfleg8nNVBiaLhLP77taKgwpqtvLTBkF4AFrSmCOEmfsHe8YuM0K5kV9bNU2buy1IB+jMWSdCG7cTXd0e44VYrDt3mlNdCFJ2F/xxc9Sg1lAYeA4hsBpNil3weA3tde4r/oAuIDWAUOzFJKyyOh34/ijtYZGRaHDDhAnk62cSvVhfE8Q+pO+Xs57EBtzWLARi+5HHHG6S3zAsF7aLF0r/D2JnZLLRbpUGTAES0l4hnVdF4ZDxWUydFgU4DVHFUZ/8qfZFFgw4OFI0SoOBunaPkeHRlAelETZZ8JRth4IYiDtNYEKbF66Na6DK+pbgke5ueGOXQXlB2aDb4LQIDAQAB",
   "minimum_chrome_version": "116",
@@ -10,8 +10,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Claude Annotate",
-    "default_popup": "popup.html",
+    "default_title": "Claude Annotate: click to annotate this page",
     "default_icon": {
       "16": "icons/off-16.png",
       "32": "icons/off-32.png",
@@ -30,14 +29,15 @@
       "suggested_key": {
         "default": "Alt+Shift+A"
       },
-      "description": "Turn annotation mode on or off in this tab"
+      "description": "Annotate this tab, holding what the pointer hovers"
     }
   },
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "contextMenus"
   ],
   "host_permissions": [
     "http://localhost/*",

@@ -42,7 +42,6 @@
   const TOOLS = ["pen", "arrow", "line", "rect", "ellipse", "note", "select"];
   const KEYS = { p: "pen", a: "arrow", l: "line", r: "rect", e: "ellipse", n: "note", s: "select" };
   const ICON = {
-    hand: '<path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v2"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>',
     pen: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
     arrow: '<path d="M5 19 19 5"/><path d="M9 5h10v10"/>',
     line: '<path d="M5 19 19 5"/>',
@@ -73,7 +72,9 @@
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
   let tool = "pen";
   let ink = INKS[0];
-  let mode = "browse"; // draw | browse. Browse first: the page stays usable until a tool is picked
+  // draw | browse. annotate_open starts in browse, so every page stays usable until a tool is picked.
+  // The extension's toolbar icon is the switch: there the overlay exists only while annotating.
+  let mode = CFG.startMode === "draw" ? "draw" : "browse";
   let selected = null;
   let draft = null;
   const undo = [];
@@ -85,6 +86,69 @@
   let sse = null;
   let quietTimer = null; // fires the "/annotate pull" hint when a Send gets no reaction
   const off = new AbortController(); // aborted by unmount(): the extension's toggle turns the overlay off
+  // Turned on with the keyboard while the pointer rests on something: keep that hovered.
+  const frozen = CFG.freezeHover && !RENDER_ONLY ? freezeHover() : null;
+
+  // ---------------------------------------------------------------------------
+  // Hover freeze
+  // ---------------------------------------------------------------------------
+  // Once the overlay covers the page, the browser moves :hover to it and the page hears the
+  // pointer leave, so menus and hover styles vanish. This holds both while the overlay is up:
+  //  - CSS: every rule with :hover gets a twin that matches [data-claude-annotate-hover]
+  //    instead, and the elements hovered right now get that attribute.
+  //  - JS: pointer leave/out/move events never reach the page, and presses, focus and keys in
+  //    the overlay stop at its host, so "click outside" and "focus outside" handlers stay quiet.
+  // Stylesheets from other origins can't be read; their hover styles are not held.
+  function freezeHover() {
+    const ATTR = "data-claude-annotate-hover";
+    const hovered = [...document.querySelectorAll(":hover")].filter((e) => e !== document.documentElement && e !== document.body);
+    if (!hovered.length) return null;
+    for (const e of hovered) e.setAttribute(ATTR, "");
+
+    const twins = []; // [container, rule]
+    const visit = (container) => {
+      let rules;
+      try { rules = [...container.cssRules]; } catch { return; } // another origin's sheet
+      for (const r of rules) {
+        if (r.selectorText && /:hover\b/.test(r.selectorText)) {
+          const text = r.cssText.replace(r.selectorText, r.selectorText.replace(/:hover\b/g, `[${ATTR}]`));
+          try {
+            const at = container.insertRule(text, container.cssRules.length);
+            twins.push([container, container.cssRules[at]]);
+          } catch { /* a selector this browser won't take twice */ }
+        }
+        if (r.cssRules && !r.selectorText) visit(r); // @media, @supports, @layer
+      }
+    };
+    for (const sheet of [...document.styleSheets]) visit(sheet);
+
+    const LEAVE = ["pointerout", "pointerleave", "mouseout", "mouseleave", "pointerover", "pointerenter", "mouseover", "mouseenter", "pointermove", "mousemove"];
+    const ours = (e) => host && e.composedPath().includes(host);
+    const holdPage = (e) => { if (!ours(e)) e.stopImmediatePropagation(); };
+    for (const t of LEAVE) window.addEventListener(t, holdPage, { capture: true, signal: off.signal });
+
+    off.signal.addEventListener("abort", () => {
+      for (const [container, rule] of twins) {
+        const i = [...container.cssRules].indexOf(rule);
+        if (i >= 0) container.deleteRule(i);
+      }
+      for (const e of hovered) e.removeAttribute(ATTR);
+      // The page never heard the pointer leave: tell it now. If the pointer is still there, the
+      // browser sends enter again on its next move.
+      const deepest = hovered[hovered.length - 1];
+      for (const [type, Ev, bubbles] of [["pointerout", PointerEvent, true], ["mouseout", MouseEvent, true]]) deepest.dispatchEvent(new Ev(type, { bubbles, composed: true }));
+      for (const e of [...hovered].reverse()) {
+        e.dispatchEvent(new PointerEvent("pointerleave"));
+        e.dispatchEvent(new MouseEvent("mouseleave"));
+      }
+    });
+    return { elements: hovered.length, rules: twins.length };
+  }
+  // While frozen, what happens in the overlay stays there: the page's bubbling listeners never see it.
+  function sealHost() {
+    const QUIET = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "contextmenu", "focusin", "focusout", "keydown", "keyup", "keypress", "wheel"];
+    for (const t of QUIET) host.addEventListener(t, (e) => e.stopPropagation(), { signal: off.signal });
+  }
 
   // ---------------------------------------------------------------------------
   // Transport
@@ -114,7 +178,10 @@
     // A message into the extension's worker keeps it from being stopped while the page listens.
     const keepAlive = setInterval(() => { if (port && subscribed) port.postMessage({ ping: true }); }, 20000);
     const stream = { onopen: null, onerror: null, onmessage: null, close() { closed = true; clearInterval(keepAlive); if (port) port.disconnect(); } };
+    // The extension was reloaded or removed: this overlay belongs to a context that is gone.
+    const orphaned = () => !(globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id);
     const connect = () => {
+      if (orphaned()) { closed = true; clearInterval(keepAlive); setTimeout(() => api.unmount && api.unmount(), 0); throw new Error("extension reloaded"); }
       port = globalThis.chrome.runtime.connect({ name: "annotate" }); // the extension API; `chrome` here is the toolbar
       port.onMessage.addListener((m) => {
         if (m.id) {
@@ -132,13 +199,16 @@
         if (closed) return;
         stream.onerror && stream.onerror();
         // The extension's worker restarted: come back and listen again.
-        if (subscribed) setTimeout(() => { if (!closed && !port) { connect(); port.postMessage({ subscribe: true }); } }, 1000);
+        if (subscribed) setTimeout(() => {
+          if (closed || port) return;
+          try { connect(); port.postMessage({ subscribe: true }); } catch { /* orphaned: unmounting */ }
+        }, 1000);
       });
     };
     connect();
     return {
       req(method, p, body) {
-        if (!port) connect();
+        try { if (!port) connect(); } catch (e) { return Promise.reject(e); }
         const id = ++seq;
         return new Promise((resolve, reject) => {
           waiting.set(id, { resolve, reject });
@@ -146,7 +216,7 @@
         });
       },
       events() {
-        if (!port) connect();
+        try { if (!port) connect(); } catch { return stream; }
         subscribed = true;
         port.postMessage({ subscribe: true });
         return stream;
@@ -273,13 +343,13 @@ svg.ink g.draft { opacity: .9; }
   box-shadow: 0 0 0 1px rgba(255,255,255,.08); transition: opacity .15s, transform .15s cubic-bezier(.2,.8,.2,1); }
 .tb .kbd b { color: rgba(244,241,247,.5); font-weight: 600; margin-left: 6px; }
 .tb:hover .kbd, .tb:focus-visible .kbd { opacity: 1; transform: translate(-50%, 0); transition-delay: .35s; }
-.mode { position: relative; }
-.mode .st { position: absolute; right: 6px; top: 6px; width: 7px; height: 7px; border-radius: 999px; background: #6B6775; box-shadow: 0 0 0 2px rgba(20,17,26,1); }
-.mode.on .st, .mode .st { transition: background .3s; }
-:host(.link-on) .mode .st { background: #4ADE80; }
-:host(.link-connecting) .mode .st { background: #FFD23F; animation: pulse 1.2s ease-in-out infinite; }
-:host(.link-off) .mode .st { background: #FF5C5C; }
-:host(.browse) .mode { background: rgba(255,255,255,.12); color: #F4F1F7; }
+/* The link to the session: a dot on the grip. */
+.grip { position: relative; }
+.grip .st { position: absolute; right: -1px; top: -3px; width: 7px; height: 7px; border-radius: 999px; background: #6B6775; box-shadow: 0 0 0 2px rgba(20,17,26,1); transition: background .3s; }
+:host(.link-on) .grip .st { background: #4ADE80; }
+:host(.link-connecting) .grip .st { background: #FFD23F; animation: pulse 1.2s ease-in-out infinite; }
+:host(.link-off) .grip .st { background: #FF5C5C; }
+.frozen { margin-left: 4px; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #35D7FF; background: rgba(53,215,255,.12); box-shadow: inset 0 0 0 1px rgba(53,215,255,.35); white-space: nowrap; }
 
 .inks { display: flex; gap: 9px; padding: 0 8px; }
 .inkb { width: 22px; height: 22px; border-radius: 999px; border: 0; padding: 0; cursor: pointer; background: var(--c);
@@ -420,6 +490,7 @@ svg.ink g.draft { opacity: .9; }
     root.appendChild(chrome);
 
     document.documentElement.appendChild(host);
+    if (frozen) sealHost();
     if (RENDER_ONLY) host.classList.add("capturing");
     applyInk();
     setMode(mode);
@@ -904,8 +975,8 @@ svg.ink g.draft { opacity: .9; }
     const btn = (name, title, key, extra = "") =>
       `<button class="tb ${extra}" type="button" data-${name.startsWith("act:") ? "act" : "tool"}="${name.replace("act:", "")}" aria-label="${title}">${svgIcon(name.replace("act:", "") === "undo" ? "undo" : name.replace("act:", ""))}<span class="kbd">${title}${key ? `<b>${key}</b>` : ""}</span></button>`;
     const html = `
-      <span class="grip" title="Drag">${svgIcon("grip", 16)}</span>
-      <button class="tb mode${mode === "browse" ? " on" : ""}" type="button" data-act="mode" aria-label="Browse the page">${svgIcon("hand")}<span class="st"></span><span class="kbd">${mode === "browse" ? "Back to drawing" : "Browse the page"}<b>V · esc</b></span></button>
+      <span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>${frozen ? `
+      <span class="frozen" title="The page's hover state is held while you annotate">Hover held</span>` : ""}
       <span class="sep"></span>
       ${btn("pen", "Pen", "P", tool === "pen" && mode === "draw" ? "on" : "")}
       ${btn("arrow", "Arrow", "A", tool === "arrow" && mode === "draw" ? "on" : "")}
@@ -979,7 +1050,6 @@ svg.ink g.draft { opacity: .9; }
       if (b.dataset.tool) return setTool(b.dataset.tool);
       if (b.dataset.ink) { ink = INKS.find((i) => i.id === b.dataset.ink); applyInk(); if (mode !== "draw") setMode("draw"); renderToolbar(); return; }
       switch (b.dataset.act) {
-        case "mode": return setMode(mode === "draw" ? "browse" : "draw");
         case "undo": return doUndo();
         case "send": return send();
         case "clear": return armClear();
