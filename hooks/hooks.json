@@ -30,23 +30,6 @@
           }
         ]
       }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/scripts/rewake-test.mjs"
-            ],
-            "async": true,
-            "asyncRewake": true,
-            "rewakeSummary": "annotate test",
-            "timeout": 60
-          }
-        ]
-      }
     ]
   }
 }
