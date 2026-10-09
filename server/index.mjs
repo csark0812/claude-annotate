@@ -6,8 +6,8 @@
 //      capability so it can PUSH events into the running session, and exposes a few
 //      tools (open, progress, done, screenshot, pull, wait, clear, close).
 //   2. Local HTTP bridge for the in-page overlay: state sync, Send, SSE for progress.
-//   3. Browser driver: launches your installed Chrome through playwright-core with a
-//      dedicated profile, injects the overlay on every page, takes the screenshots.
+//   3. Browser driver: attaches to the Chrome you already have open (or launches Chrome
+//      with a dedicated profile), injects the overlay on every page, takes the screenshots.
 //
 // stdout is reserved for JSON-RPC. All logging goes to stderr.
 
@@ -36,19 +36,25 @@ const SESSIONS_DIR = path.join(CACHE_DIR, "sessions");
 const SHOTS_ROOT = path.join(os.tmpdir(), "claude-annotate");
 const SHOTS_DIR = path.join(SHOTS_ROOT, SESSION);
 const OVERLAY_SRC = fs.readFileSync(path.join(__dirname, "overlay.js"), "utf8");
-const BROWSER_CHANNEL = process.env.ANNOTATE_BROWSER || "chrome"; // chrome | msedge | chromium
+const BROWSER_CHANNEL = process.env.ANNOTATE_BROWSER || "attach"; // attach | chrome | msedge | chromium
+const ATTACH = BROWSER_CHANNEL === "attach";
+// The profile of the Chrome to attach to. Chrome writes DevToolsActivePort there once remote debugging is allowed.
+const CHROME_DATA_DIR = process.env.ANNOTATE_CHROME_DATA_DIR || path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+const ALLOW_DEBUGGING_HINT = 'In Chrome, open chrome://inspect/#remote-debugging and turn on "Allow remote debugging for this browser instance", then try again.';
+const NEXT_POLL_MS = 240000; // the chat hook's long poll; it asks again after a 204
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 const state = {
-  mode: "channel", // "channel": push into the session. "poll": Claude blocks in annotate_wait.
+  mode: "chat", // "chat": a background hook wakes the session. "channel": push into the session. "poll": Claude blocks in annotate_wait.
   pages: new Map(), // url -> { shapes: [], notes: [] }
   nextNote: 1,
   batchSeq: 0,
   batches: [], // { id, dir, content, notes, pages, createdAt, done }
   pending: [], // batches sent but not yet pulled/handled (poll mode + safety net)
   waiters: [],
+  hookWaiter: null, // the chat hook's open long poll; a newer hook replaces it
   listeners: new Set(),
   lastUrl: null,
   sending: false, // one Send (or Clear) at a time; the build takes seconds
@@ -71,6 +77,7 @@ function broadcast(obj) {
 // ---------------------------------------------------------------------------
 // Browser
 // ---------------------------------------------------------------------------
+let browser = null; // attach mode only: the connection to the user's Chrome
 let context = null;
 let mainPage = null;
 let sessionProfile = null;
@@ -87,6 +94,7 @@ function ensureBrowser() {
 }
 async function launchBrowser() {
   await ready;
+  if (ATTACH) return attachToChrome();
   await fsp.mkdir(PROFILE_DIR, { recursive: true });
   const opts = {
     headless: false,
@@ -121,6 +129,38 @@ async function launchBrowser() {
   return context;
 }
 
+async function devToolsEndpoint() {
+  let raw;
+  try { raw = await fsp.readFile(path.join(CHROME_DATA_DIR, "DevToolsActivePort"), "utf8"); } catch { throw new Error(`Chrome is not accepting connections. ${ALLOW_DEBUGGING_HINT}`); }
+  const [port, wsPath] = raw.trim().split("\n");
+  return `ws://127.0.0.1:${port}${wsPath}`;
+}
+
+// The user's own Chrome: their windows, tabs and logins. Chrome asks the user to allow the connection.
+async function attachToChrome() {
+  try {
+    browser = await chromium.connectOverCDP(await devToolsEndpoint());
+  } catch (e) {
+    throw new Error(`Could not attach to Chrome. Is it open, and did you allow the connection? ${ALLOW_DEBUGGING_HINT} (${String(e.message).split("\n")[0]})`);
+  }
+  context = browser.contexts()[0];
+  browser.on("disconnected", () => {
+    browser = null;
+    context = null;
+    mainPage = null;
+    log("detached from Chrome");
+  });
+  await context.addInitScript(bootstrapSource(false));
+  return context;
+}
+
+// Attach mode leaves the user's Chrome running; launch mode closes the window it opened.
+async function releaseBrowser() {
+  if (browser) await browser.close().catch(() => {});
+  else if (context) await context.close().catch(() => {});
+  browser = null; context = null; mainPage = null;
+}
+
 function sameUrl(a, b) {
   try { return new URL(a).href === new URL(b).href; } catch { return a === b; }
 }
@@ -141,10 +181,14 @@ async function openUrl(url) {
   url = assertLocal(url);
   const ctx = await ensureBrowser();
   const live = ctx.pages().filter((p) => !p.isClosed());
-  const page = live.find((p) => sameUrl(p.url(), url)) || (mainPage && !mainPage.isClosed() ? mainPage : null) || live[0] || (await ctx.newPage());
+  // In the user's own Chrome, never take over an unrelated tab: reuse the one on this url or open a new one.
+  const spare = ATTACH ? null : live[0];
+  const page = live.find((p) => sameUrl(p.url(), url)) || (mainPage && !mainPage.isClosed() ? mainPage : null) || spare || (await ctx.newPage());
   mainPage = page;
   await page.bringToFront();
   if (!sameUrl(page.url(), url)) await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  // A tab that was already open loaded before the init script existed. The overlay skips a second mount.
+  else await page.evaluate(bootstrapSource(false));
   state.lastUrl = url;
   return page;
 }
@@ -413,7 +457,8 @@ const INSTRUCTIONS = [
   "Events arrive as <channel source=\"...annotate\" batch=\"N\" notes=\"K\" pages=\"P\">: a list of pages, numbered notes (with the user's text, the element under the pin, its React component chain and source when known), marks (strokes, arrows, lines, boxes, circles), and PNG paths.",
   "When one arrives: Read every PNG path listed (the crops first, the full-page overview for context). Then for each note in order call annotate_progress(note, \"working\"), change the code, and call annotate_progress(note, \"done\", <one short line>) or (note, \"skipped\", <why>). Marks without a note describe what they point at: act on them too. If the dev server hot-reloads you may call annotate_screenshot to check the result. Finish with annotate_done(summary): it shows the summary on the page and removes the temporary screenshots.",
   "Say one short line in the terminal when you start on a batch and one when you finish. The user is watching the page, not the terminal.",
-  "If the session was started without the channel flag, nothing is pushed: use annotate_pull after the user says they hit Send, or run the loop with annotate_wait in poll mode.",
+  "In chat delivery (the default) a batch arrives in the chat by itself, as a hook message that starts with \"Browser annotations\": handle it exactly like a channel event. Never call annotate_wait in chat delivery.",
+  "If nothing arrives after the user says they hit Send, call annotate_pull.",
 ].join(" ");
 
 const mcp = new Server(
@@ -424,8 +469,8 @@ const mcp = new Server(
 const TOOLS = [
   {
     name: "annotate_open",
-    description: "Open a URL in the annotation browser with the drawing and note tools ready. Reuses the open browser. Returns when the page is loaded. delivery: 'channel' (default, events are pushed into this session when the user hits Send) or 'poll' (you must call annotate_wait).",
-    inputSchema: { type: "object", properties: { url: { type: "string" }, delivery: { type: "string", enum: ["channel", "poll"] } }, required: ["url"] },
+    description: "Open a URL in the annotation browser with the drawing and note tools ready. Reuses the open browser. Returns when the page is loaded. delivery: 'chat' (default, the batch arrives in this chat by itself when the user hits Send), 'channel' (pushed into a session started with the channel flag) or 'poll' (you must call annotate_wait).",
+    inputSchema: { type: "object", properties: { url: { type: "string" }, delivery: { type: "string", enum: ["chat", "channel", "poll"] } }, required: ["url"] },
   },
   {
     name: "annotate_progress",
@@ -486,16 +531,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   switch (req.params.name) {
     case "annotate_open": {
       const url = String(args.url || "").trim();
-      state.mode = args.delivery === "poll" ? "poll" : "channel";
+      state.mode = ["channel", "poll"].includes(args.delivery) ? args.delivery : "chat";
       await openUrl(url);
       broadcast({ type: "hello", mode: state.mode });
       return text({
         ok: true,
         url,
         delivery: state.mode,
-        note: state.mode === "channel"
-          ? "Tools are on the page. Do not poll: a channel event arrives here when the user hits Send. If the user says they sent and nothing arrived, call annotate_pull."
-          : "Tools are on the page. Call annotate_wait now and process what it returns; call it again after annotate_done.",
+        note: {
+          chat: "Tools are on the page. Do not poll and do not wait: the batch arrives in this chat by itself when the user hits Send. If the user says they sent and nothing arrived, call annotate_pull.",
+          channel: "Tools are on the page. Do not poll: a channel event arrives here when the user hits Send. If the user says they sent and nothing arrived, call annotate_pull.",
+          poll: "Tools are on the page. Call annotate_wait now and process what it returns; call it again after annotate_done.",
+        }[state.mode],
       });
     }
     case "annotate_progress": {
@@ -569,8 +616,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return text("cleared");
     }
     case "annotate_close": {
-      if (context) await context.close().catch(() => {});
-      context = null; mainPage = null;
+      await releaseBrowser();
       return text("closed");
     }
     case "annotate_debug": {
@@ -670,12 +716,31 @@ const server = http.createServer(async (req, res) => {
         let batch;
         try { batch = await buildBatch(); } catch (e) { return json(res, 400, { ok: false, error: e.message }); }
         const pushed = await deliver(batch);
-        log(`batch ${batch.id}: ${batch.notes} notes on ${batch.pages} page(s) → ${pushed ? "written to the channel" : state.mode === "poll" ? "handed to waiter" : "queued (pull)"}`);
+        log(`batch ${batch.id}: ${batch.notes} notes on ${batch.pages} page(s) → ${pushed ? "written to the channel" : { chat: "handed to the chat hook", poll: "handed to waiter", channel: "queued (pull)" }[state.mode]}`);
         broadcast({ type: "sent", batch: batch.id, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode });
         return json(res, 200, { ok: true, batch: batch.id, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals() });
       } finally {
         state.sending = false;
       }
+    }
+    if (req.method === "GET" && url.pathname === "/next") {
+      // The chat hook's long poll. 200 carries a batch, 204 means ask again, 409 means stop.
+      if (state.mode !== "chat") return json(res, 409, { ok: false, error: `delivery is ${state.mode}` });
+      if (state.pending[0]) return json(res, 200, { ok: true, content: takePending(state.pending[0]).content });
+      if (state.hookWaiter) state.hookWaiter(null);
+      const waiter = (batch) => {
+        clearTimeout(timer);
+        state.waiters = state.waiters.filter((w) => w !== waiter);
+        if (state.hookWaiter === waiter) state.hookWaiter = null;
+        if (res.writableEnded) return;
+        if (batch) json(res, 200, { ok: true, content: batch.content });
+        else { res.writeHead(204, CORS); res.end(); }
+      };
+      const timer = setTimeout(() => waiter(null), NEXT_POLL_MS);
+      state.hookWaiter = waiter;
+      state.waiters.push(waiter);
+      res.on("close", () => { if (!res.writableEnded) waiter(null); });
+      return;
     }
     if (req.method === "POST" && url.pathname === "/status") {
       const body = JSON.parse((await readBody(req)) || "{}");
@@ -724,7 +789,7 @@ async function shutdown() {
   if (stopping) return;
   stopping = true;
   setTimeout(() => process.exit(0), 3000).unref(); // a wedged Chrome must not keep an orphan alive
-  if (context) await context.close().catch(() => {});
+  await releaseBrowser();
   cleanupSync();
   process.exit(0);
 }

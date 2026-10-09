@@ -1,6 +1,6 @@
 ---
 description: Open a localhost page with drawing and note tools; what you mark comes straight back into this session
-argument-hint: <url> [--poll] | pull | clear | close
+argument-hint: <url> [--channel | --poll] | pull | clear | close
 ---
 
 The user wants to give visual feedback on a running page. Arguments: `$ARGUMENTS`
@@ -14,13 +14,14 @@ until something arrives.
 - `pull` → call `annotate_pull` and handle what it returns like a channel event (see below). If it says empty, tell the user to hit Send on the page.
 - `clear` → call `annotate_clear`, confirm in one line.
 - `close` → call `annotate_close`, confirm in one line.
-- A URL (optionally with `--poll`) → call `annotate_open` with that url and `delivery: "poll"` only if `--poll` was given. Then say one line: the page is open, draw and drop notes, hit **Send to Claude** when ready. Then stop.
+- A URL → call `annotate_open` with that url. Pass `delivery: "channel"` only if `--channel` was given, `delivery: "poll"` only if `--poll` was given; otherwise leave it out (chat delivery). Then say one line: the page is open in Chrome, draw and drop notes, hit **Send to Claude** when ready. Then stop. Do not wait or poll: in chat delivery the batch arrives in this chat by itself.
 - Nothing → ask for the URL in one line.
 
 ## When annotations arrive
 
-They come either as a `<channel source="…annotate" …>` event (normal) or as the
-result of `annotate_pull` / `annotate_wait` (poll mode or safety net). Both have
+They come as a hook message in this chat that starts with "Browser annotations"
+(chat delivery, the default), as a `<channel source="…annotate" …>` event (`--channel`),
+or as the result of `annotate_pull` / `annotate_wait` (poll mode or safety net). All three have
 the same shape: pages, numbered notes with the user's text and the element under
 the pin (selector, text, React components, source file when known), marks
 (strokes, arrows, lines, boxes, circles) with what they point at, and PNG paths.
@@ -48,7 +49,5 @@ call it again. If it returns `closed`, stop and say so.
 ## If Send never arrives
 
 If the user says they hit Send and nothing came in, call `annotate_pull`. If
-that returns a batch, the session was started without the channel flag: handle
-the batch, then tell the user once to restart with
-`claude --dangerously-load-development-channels plugin:annotate@claude-annotate`
-or to use `/annotate <url> --poll`.
+that returns a batch, handle it. If the user opened the page with `--channel`, the
+session was started without the channel flag: tell the user once to drop `--channel`.

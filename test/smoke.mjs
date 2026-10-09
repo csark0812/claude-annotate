@@ -13,17 +13,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, "..");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-for (const f of ["server/index.mjs", "server/overlay.js", "scripts/ticker.mjs"]) {
+for (const f of ["server/index.mjs", "server/overlay.js", "scripts/ticker.mjs", "scripts/deliver.mjs", "scripts/session.mjs"]) {
   const r = spawnSync(process.execPath, ["--check", path.join(root, f)], { encoding: "utf8" });
   assert.equal(r.status, 0, `${f} does not parse:\n${r.stderr}`);
 }
 console.log("✓ syntax");
 
 // The hook must exit 0 and stay silent with nothing to talk to.
-const hook = spawnSync(process.execPath, [path.join(root, "scripts/ticker.mjs")], { input: JSON.stringify({ tool_name: "Edit", cwd: root, tool_input: { file_path: path.join(root, "x.ts") } }), encoding: "utf8" });
+// An empty HOME hides the session files of any Claude Code session that runs this test.
+const noSessionEnv = { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), "annotate-smoke-")) };
+const hook = spawnSync(process.execPath, [path.join(root, "scripts/ticker.mjs")], { input: JSON.stringify({ tool_name: "Edit", cwd: root, tool_input: { file_path: path.join(root, "x.ts") } }), encoding: "utf8", env: noSessionEnv });
 assert.equal(hook.status, 0, "hook exit code");
 assert.equal(hook.stdout + hook.stderr, "", "hook must be silent");
-console.log("✓ hook is silent without a session");
+const deliverHook = spawnSync(process.execPath, [path.join(root, "scripts/deliver.mjs")], { input: "{}", encoding: "utf8", env: noSessionEnv, timeout: 10_000 });
+assert.equal(deliverHook.status, 0, "deliver hook exits 0 without a session");
+assert.equal(deliverHook.stdout + deliverHook.stderr, "", "deliver hook must be silent");
+console.log("✓ hooks are silent without a session");
 
 const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, "server/index.mjs")], stderr: "pipe" });
 const client = new Client({ name: "smoke", version: "0.0.0" }, { capabilities: {} });
@@ -69,11 +74,21 @@ const next = await (await fetch(`${endpoint}/note/next`, { method: "POST", heade
 assert.equal(next.n, 2, "note numbering continues after the highest stored note");
 const got = await (await fetch(`${endpoint}/state?url=${encodeURIComponent(url)}`, { headers: H })).json();
 assert.equal(got.notes[0].text, "hi");
-assert.equal(got.mode, "channel");
+assert.equal(got.mode, "chat", "chat delivery is the default");
 await client.callTool({ name: "annotate_progress", arguments: { note: 1, status: "working" } });
 const after = await (await fetch(`${endpoint}/state?url=${encodeURIComponent(url)}`, { headers: H })).json();
 assert.equal(after.notes[0].status, "working", "progress mutates the stored note");
 console.log("✓ bridge: token gate, state round trip, note numbering, progress");
+
+// The chat hook's long poll: a newer hook takes over and the older one is told to stop asking (204).
+const first = fetch(`${endpoint}/next`, { headers: H });
+await sleep(100);
+const secondAbort = new AbortController();
+const second = fetch(`${endpoint}/next`, { headers: H, signal: secondAbort.signal }).catch(() => null);
+assert.equal((await first).status, 204, "older long poll released when a newer hook arrives");
+secondAbort.abort();
+await second;
+console.log("✓ chat long poll: one hook at a time");
 
 // The hook finds the session by parent pid and posts a status line: watch it arrive on the SSE stream.
 const events = await fetch(`${endpoint}/events?t=${token}`);
