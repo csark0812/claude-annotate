@@ -491,6 +491,9 @@ svg.ink g.draft { opacity: .9; }
 
     document.documentElement.appendChild(host);
     if (frozen) sealHost();
+    // Turned on to draw: the tool keys must not type into a search box the page focused. Not while
+    // holding a hover state, where moving focus could close the very menu being held.
+    else if (mode === "draw" && isTextField(document.activeElement)) document.activeElement.blur();
     if (RENDER_ONLY) host.classList.add("capturing");
     applyInk();
     setMode(mode);
@@ -500,6 +503,10 @@ svg.ink g.draft { opacity: .9; }
     restoreBarPos();
     hydrate().finally(() => { api.ready = true; }); // the server screenshots temp pages once ready
     connectSse();
+  }
+
+  function isTextField(e) {
+    return !!e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName));
   }
 
   function el(tag, cls, html) {
