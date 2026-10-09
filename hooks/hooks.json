@@ -30,6 +30,37 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/deliver.mjs"
+            ],
+            "async": true,
+            "asyncRewake": true,
+            "rewakeSummary": "Annotations arrived from the page",
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/prompted.mjs"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "claude-annotate-plugin",
-  "version": "0.3.3-local",
+  "version": "0.3.4-local",
   "private": true,
   "type": "module",
   "description": "Channel server, browser driver and overlay for the Annotate plugin.",
@@ -12,6 +12,7 @@
     "playwright-core": "^1.58.0"
   },
   "scripts": {
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs",
+    "extension:install": "node scripts/install-extension.mjs"
   }
 }

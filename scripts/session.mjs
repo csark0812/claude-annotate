@@ -10,9 +10,14 @@ const parentOf = (pid) => { try { return Number(execSync(`ps -o ppid= -p ${pid}`
 // Walk up the process tree (hook → shell → claude) until a session file matches.
 // No match means no annotate session for this tree: return null, never guess another session's page.
 export function findSession() {
+  const file = findSessionFile();
+  return file ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+}
+
+export function findSessionFile() {
   for (let pid = process.ppid, i = 0; pid > 1 && i < 4; pid = parentOf(pid), i++) {
     const f = path.join(SESSIONS, `${pid}.json`);
-    if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, "utf8"));
+    if (fs.existsSync(f)) return f;
   }
   return null;
 }

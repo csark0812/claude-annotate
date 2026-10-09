@@ -77,6 +77,7 @@
   let clearArmed = null;
   let sse = null;
   let quietTimer = null; // fires the "/annotate pull" hint when a Send gets no reaction
+  const off = new AbortController(); // aborted by unmount(): the extension's toggle turns the overlay off
 
   // ---------------------------------------------------------------------------
   // Transport
@@ -949,34 +950,40 @@ svg.ink g.draft { opacity: .9; }
     pinsLayer.addEventListener("pointerup", endPinDrag);
     pinsLayer.addEventListener("pointercancel", endPinDrag);
 
+    // Window-level listeners go through `off` so unmount() removes them all at once.
+    const { signal } = off;
     // Keyboard
-    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey, { capture: true, signal });
 
     // Keep things aligned
-    window.addEventListener("scroll", placePopover, { passive: true });
-    window.addEventListener("resize", () => { sizeDoc(); placePopover(); restoreBarPos(); }, { passive: true });
+    window.addEventListener("scroll", placePopover, { passive: true, signal });
+    window.addEventListener("resize", () => { sizeDoc(); placePopover(); restoreBarPos(); }, { passive: true, signal });
     const ro = new ResizeObserver(() => sizeDoc());
     ro.observe(document.documentElement);
     if (document.body) ro.observe(document.body);
-    setInterval(() => {
+    signal.addEventListener("abort", () => ro.disconnect());
+    const keeper = setInterval(() => {
       if (!host.isConnected) document.documentElement.appendChild(host); // hydration or innerHTML replaced <html>'s children
       ro.observe(document.documentElement);
       if (document.body) ro.observe(document.body); // idempotent; re-arms after a body swap
       sizeDoc();
     }, 1500);
+    signal.addEventListener("abort", () => clearInterval(keeper));
 
     // SPA navigation: same document, new URL → reload state for the new URL
     const fire = () => setTimeout(onUrlChange, 50);
     for (const m of ["pushState", "replaceState"]) {
       const orig = history[m];
-      history[m] = function (...a) { const r = orig.apply(this, a); fire(); return r; };
+      const wrapped = function (...a) { const r = orig.apply(this, a); if (!signal.aborted) fire(); return r; };
+      history[m] = wrapped;
+      signal.addEventListener("abort", () => { if (history[m] === wrapped) history[m] = orig; });
     }
-    window.addEventListener("popstate", fire);
-    window.addEventListener("hashchange", fire);
+    window.addEventListener("popstate", fire, { signal });
+    window.addEventListener("hashchange", fire, { signal });
   }
   let currentUrl = location.href;
   function onUrlChange() {
-    if (location.href === currentUrl) return;
+    if (off.signal.aborted || location.href === currentUrl) return;
     currentUrl = location.href;
     closePopover();
     selected = null;
@@ -1180,6 +1187,20 @@ svg.ink g.draft { opacity: .9; }
   // Public hooks for the server
   // ---------------------------------------------------------------------------
   api.capture = (on) => { if (!host) return; host.classList.toggle("capturing", !!on); if (on) { selected = null; renderSelection(); } };
+
+  // Removes the overlay and everything it hooked into the page. Unsaved edits are saved first.
+  api.unmount = async () => {
+    if (off.signal.aborted) return;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      await req("PUT", "/state", { url: pageUrl(), shapes, notes }).catch(() => {});
+    }
+    off.abort();
+    if (sse) sse.close();
+    for (const t of [quietTimer, clearArmed, tickerTimer]) clearTimeout(t);
+    if (host) host.remove();
+    if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;
+  };
 
   // ---------------------------------------------------------------------------
   // Boot

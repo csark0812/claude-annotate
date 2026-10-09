@@ -61,6 +61,7 @@ const state = {
 };
 
 let endpoint = null;
+let contextHasOverlay = false; // the browser context injects the overlay into every page it loads
 let markReady;
 const ready = new Promise((r) => (markReady = r));
 
@@ -122,10 +123,12 @@ async function launchBrowser() {
   }
   context.on("close", () => {
     context = null;
+    contextHasOverlay = false;
     mainPage = null;
     log("browser closed");
   });
   await context.addInitScript(bootstrapSource(false));
+  contextHasOverlay = true;
   return context;
 }
 
@@ -147,10 +150,12 @@ async function attachToChrome() {
   browser.on("disconnected", () => {
     browser = null;
     context = null;
+    contextHasOverlay = false;
     mainPage = null;
     log("detached from Chrome");
   });
-  await context.addInitScript(bootstrapSource(false));
+  // No overlay yet: attaching only to screenshot a tab the browser extension annotates must not
+  // put the toolbar on every local page. annotate_open adds it (openUrl).
   return context;
 }
 
@@ -180,6 +185,10 @@ function assertLocal(url) {
 async function openUrl(url) {
   url = assertLocal(url);
   const ctx = await ensureBrowser();
+  if (!contextHasOverlay) {
+    await ctx.addInitScript(bootstrapSource(false));
+    contextHasOverlay = true;
+  }
   const live = ctx.pages().filter((p) => !p.isClosed());
   // In the user's own Chrome, never take over an unrelated tab: reuse the one on this url or open a new one.
   const spare = ATTACH ? null : live[0];
@@ -217,7 +226,8 @@ async function pageFor(url) {
   const found = live.find((p) => sameUrl(p.url(), url));
   if (found) return { page: found, temp: false };
   const page = await backgroundPage(ctx);
-  await page.addInitScript("window.__CLAUDE_ANNOTATE_RENDER_ONLY__ = true;");
+  // The overlay draws the marks into the shot: from the context's init script, or this page's own.
+  await page.addInitScript(contextHasOverlay ? "window.__CLAUDE_ANNOTATE_RENDER_ONLY__ = true;" : bootstrapSource(true));
   await page.goto(url, { waitUntil: "networkidle", timeout: 30000 }).catch(() => {});
   await page.waitForFunction(() => window.__claudeAnnotate && window.__claudeAnnotate.ready, null, { timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(250);
@@ -739,16 +749,18 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (req.method === "GET" && url.pathname === "/next") {
-      // The chat hook's long poll. 200 carries a batch, 204 means ask again, 409 means stop.
+      // The chat hook's long poll. 200 carries a batch, 204 means ask again, 409 and 410 mean stop.
       if (state.mode !== "chat") return json(res, 409, { ok: false, error: `delivery is ${state.mode}` });
       if (state.pending[0]) return json(res, 200, { ok: true, content: takePending(state.pending[0]).content });
-      if (state.hookWaiter) state.hookWaiter(null);
-      const waiter = (batch) => {
+      // One hook waits at a time. The older one gets 410 and exits, so two armed hooks never take turns.
+      if (state.hookWaiter) state.hookWaiter(null, true);
+      const waiter = (batch, superseded = false) => {
         clearTimeout(timer);
         state.waiters = state.waiters.filter((w) => w !== waiter);
         if (state.hookWaiter === waiter) state.hookWaiter = null;
         if (res.writableEnded) return;
         if (batch) json(res, 200, { ok: true, content: batch.content });
+        else if (superseded) json(res, 410, { ok: false, error: "a newer hook is waiting" });
         else { res.writeHead(204, CORS); res.end(); }
       };
       const timer = setTimeout(() => waiter(null), NEXT_POLL_MS);

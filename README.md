@@ -91,6 +91,18 @@ Per note that is: your text, the element under the pin with its visible text and
 
 Keys: `P` pen · `A` arrow · `L` line · `R` box · `E` circle · `N` note · `S` select · `1` – `4` inks · `V` / `esc` browse · `⌘Z` · `⇧⌘Z` · `⌫` · `⌘↵` send. Drag the toolbar by its grip, it remembers where you put it per site.
 
+## Chrome extension
+
+The extension puts the same toolbar on any local dev tab you already have open, with no `/annotate` first. Its toolbar button turns annotation mode on and off for the tab (`⌥⇧A` does the same). Notes go to the Claude Code session you typed in last, or to the one you pick in the popup.
+
+```sh
+npm run extension:install   # copies the overlay into extension/ and registers the native host with Chrome
+```
+
+Then, once: `chrome://extensions` → Developer mode → **Load unpacked** → the `extension/` folder. Run the install again after `server/overlay.js` changes and reload the extension.
+
+The extension finds sessions through a native messaging host (`extension/host/host.mjs`) that reads `~/.cache/claude-annotate/sessions/`. Only this extension's id may start it. Screenshots at Send still come from the session's server attaching to Chrome, so remote debugging must be allowed: open `chrome://inspect/#remote-debugging` and turn on "Allow remote debugging for this browser instance".
+
 ## Why not paste a screenshot
 
 Pasting a screenshot and describing it works, and it is what this replaces. Each round costs a screenshot, a paste, and prose like "the second toggle in the pricing card, no, the other card". Claude then guesses which file that is. Here the prose is the note, the position is the pin, and the file and line come along for free. Browser tools in the same space, as of October 2026:
