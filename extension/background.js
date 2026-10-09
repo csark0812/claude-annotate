@@ -88,7 +88,7 @@ async function mountOverlay(tabId, url, session, { freezeHover = false } = {}) {
   const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
-  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayExit });
+  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayPage });
   await addFrameHelpers(tabId);
 }
 
@@ -106,18 +106,31 @@ chrome.webNavigation.onCompleted.addListener(async ({ tabId, frameId }) => {
   await addFrameHelpers(tabId, [frameId]);
 });
 
-// Runs in the page's isolated world: Esc in the overlay (either world) fires a DOM event, and this
-// asks the worker to turn the tab off, as a click on the icon would.
-function relayExit() {
-  if (window.__claudeAnnotateExitRelay) return;
-  window.__claudeAnnotateExitRelay = true;
+// Runs in the page's isolated world and carries the overlay's DOM events (either world) to the worker:
+//  - "claude-annotate:exit" (Esc): turn the tab off, as a click on the icon would.
+//  - "claude-annotate:shoot" (Send): capture the visible tab; the answer comes back as
+//    "claude-annotate:shot" with a data URL, or "" when it could not be captured.
+function relayPage() {
+  if (window.__claudeAnnotateRelay) return;
+  window.__claudeAnnotateRelay = true;
   document.addEventListener("claude-annotate:exit", () => {
     try { chrome.runtime.sendMessage({ type: "exit" }); } catch { /* the extension was reloaded */ }
   });
+  document.addEventListener("claude-annotate:shoot", async () => {
+    let image = "";
+    try { image = (await chrome.runtime.sendMessage({ type: "shoot" }))?.image || ""; } catch { /* reloaded */ }
+    document.dispatchEvent(new CustomEvent("claude-annotate:shot", { detail: image }));
+  });
 }
 
-chrome.runtime.onMessage.addListener((msg, sender) => {
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.type === "exit" && sender.tab) turnOff(sender.tab).then(refreshMenu);
+  if (msg?.type === "shoot" && sender.tab) {
+    // JPEG keeps a retina screenshot well under the server's upload limit.
+    chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 85 })
+      .then((image) => reply({ image }), (e) => reply({ image: "", error: e.message }));
+    return true; // answered asynchronously
+  }
 });
 
 async function turnOn(tab, opts) {

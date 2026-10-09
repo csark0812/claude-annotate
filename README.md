@@ -7,7 +7,7 @@
 
 <p align="center">
   <strong>Draw on the page. Claude fixes the code.</strong><br>
-  A Claude Code plugin: mark up your running localhost site in the browser, hit <em>Send to Claude</em>, and every mark lands in the session that opened the page, with the element, its component and a screenshot under each one.
+  A Claude Code plugin: mark up your running localhost site in the browser, leave a comment, and every mark streams in the session that opened the page, with the element, its component and a screenshot under each one.
 </p>
 
 <p align="center">
@@ -86,7 +86,7 @@ Per note that is: your text, the element under the pin with its visible text and
 | **Browse** | `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. With the Chrome extension, its toolbar icon is the switch instead. |
 | **Across pages** | Marks are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
 | **Edit** | Click a pin to edit its comment or delete it (a mark's comment takes the mark with it). Pins drag in any mode. `⌘Z` and `⇧⌘Z` for undo and redo. |
-| **Send** | `⌘↵` or the button. It counts what hasn't been sent yet, so you can send, keep drawing, send again. |
+| **Streaming** | There is no Send button. A saved comment goes to Claude on its own about 1.5 s later (a few quick comments travel together); marks without a comment ride along with the next one. The pill on the bar says Live to Claude, Sending…, Claude is on it or Done. `⌘↵` sends right away. With the extension, the screenshot is what the tab shows at that moment, taken by the extension, so Chrome's remote debugging isn't needed. |
 | **Progress** | Pin spins: Claude is on that note. Green with a line: done. Grey: skipped, with why. The toolbar shows which file Claude is editing. |
 | **Clear** | Two clicks (the second one says *Sure?*). Removes every mark on every page and the temporary screenshots. |
 

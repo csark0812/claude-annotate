@@ -364,7 +364,9 @@ svg.ink g.draft { opacity: .9; }
   background: var(--ink); color: var(--ink-dark); cursor: pointer; font: 600 13px/1 inherit; font-family: inherit; letter-spacing: .005em;
   box-shadow: inset 0 1px 0 rgba(255,255,255,.35); transition: transform .15s cubic-bezier(.2,.8,.2,1), filter .15s, background .3s, color .3s;
 }
-.send:hover { filter: brightness(1.06); }
+.send { cursor: default; }
+.send.idle { background: rgba(255,255,255,.08); color: rgba(244,241,247,.75); box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+.send.idle .live { display: block; background: #4ADE80; }
 .send:active { transform: scale(.96); }
 .send:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 .send:disabled { cursor: default; filter: saturate(.6); opacity: .85; }
@@ -892,6 +894,7 @@ svg.ink g.draft { opacity: .9; }
     closePopover();
     renderPins();
     save();
+    streamSoon();
   }
   function cancelPopover(isNew) {
     if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true, true);
@@ -981,19 +984,17 @@ svg.ink g.draft { opacity: .9; }
     host.classList.toggle("link-connecting", s === "connecting");
     host.classList.toggle("link-off", s === "off");
   }
-  function sendLabel() {
-    const unsent = totals.unsent;
-    if (phase === "sending") return { label: "Sending…", cls: "sending", disabled: true };
-    if (phase === "sent" && totals.open > 0 && unsent === 0) return { label: "Claude is on it", cls: "sent", disabled: true };
-    if (phase === "done" && unsent === 0) return { label: "All done", cls: "done", disabled: true };
-    if (unsent === 0 && totals.notes + totals.shapes === 0) return { label: "Send to Claude", cls: "", disabled: true };
-    if (totals.batches > 0 && unsent > 0) return { label: `Send ${unsent} more`, cls: "", disabled: false, count: unsent };
-    return { label: "Send to Claude", cls: "", disabled: false, count: unsent };
+  // What the stream is doing. There is no Send button: comments go as they are saved.
+  function streamState() {
+    if (phase === "sending" || streamTimer) return { label: "Sending…", cls: "sending" };
+    if (phase === "sent" && totals.open > 0) return { label: "Claude is on it", cls: "sent" };
+    if (phase === "done" && totals.batches > 0) return { label: "Done", cls: "done" };
+    return { label: "Live to Claude", cls: "idle" };
   }
   let lastBar = "";
   function renderToolbar() {
     if (!bar) return;
-    const s = sendLabel();
+    const s = streamState();
     const btn = (name, title, key, extra = "") =>
       `<button class="tb ${extra}" type="button" data-${name.startsWith("act:") ? "act" : "tool"}="${name.replace("act:", "")}" aria-label="${title}">${svgIcon(name.replace("act:", "") === "undo" ? "undo" : name.replace("act:", ""))}<span class="kbd">${title}${key ? `<b>${key}</b>` : ""}</span></button>`;
     const html = `
@@ -1009,7 +1010,7 @@ svg.ink g.draft { opacity: .9; }
       <span class="sep"></span>
       <button class="tb" type="button" data-act="undo" aria-label="Undo" ${undo.length ? "" : "disabled style='opacity:.35'"}>${svgIcon("undo")}<span class="kbd">Undo<b>⌘Z</b></span></button>
       <span class="sep"></span>
-      <button class="send ${s.cls}" type="button" data-act="send" ${s.disabled ? "disabled" : ""}><span class="live"></span><span class="label">${s.label}</span>${s.count || s.cls === "done" ? `<span class="cnt"><span class="num">${s.count || ""}</span>${svgIcon("check", 13)}</span>` : ""}</button>
+      <span class="send ${s.cls}" role="status" aria-live="polite" title="Comments go to Claude as you save them"><span class="live"></span><span class="label">${s.label}</span></span>
       <button class="tb danger${clearArmed ? " armed" : ""}${phase === "done" && !clearArmed ? " glow" : ""}" type="button" data-act="clear" aria-label="Clear everything">${svgIcon("trash")}${clearArmed ? "<span>Sure?</span>" : `<span class="kbd">Clear all pages</span>`}</button>`;
     if (html !== lastBar) { lastBar = html; bar.innerHTML = html; }
   }
@@ -1070,7 +1071,6 @@ svg.ink g.draft { opacity: .9; }
       if (b.dataset.ink) { ink = INKS.find((i) => i.id === b.dataset.ink); applyInk(); if (mode !== "draw") setMode("draw"); renderToolbar(); return; }
       switch (b.dataset.act) {
         case "undo": return doUndo();
-        case "send": return send();
         case "clear": return armClear();
       }
     });
@@ -1318,7 +1318,7 @@ svg.ink g.draft { opacity: .9; }
     if (inOurs && editing) return; // our textarea handles itself
     const meta = e.metaKey || e.ctrlKey;
     if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
-    if (meta && e.key === "Enter") { e.preventDefault(); send(); return; }
+    if (meta && e.key === "Enter") { e.preventDefault(); clearTimeout(streamTimer); streamTimer = null; send(); return; } // send now
     if (meta || e.altKey) return;
     const k = e.key.toLowerCase();
     if (e.key === "Escape") {
@@ -1338,13 +1338,27 @@ svg.ink g.draft { opacity: .9; }
   // ---------------------------------------------------------------------------
   // Send / clear
   // ---------------------------------------------------------------------------
+  // Streaming: a saved comment goes to Claude on its own, STREAM_MS after the last one, so a few
+  // quick comments travel together. Marks without a comment ride along with the next comment.
+  const STREAM_MS = 1500;
+  let streamTimer = null;
+  const waitingComments = () => notes.some((n) => !n.batch && n.text);
+  function streamSoon(ms = STREAM_MS) {
+    clearTimeout(streamTimer);
+    if (!waitingComments()) return renderToolbar();
+    streamTimer = setTimeout(() => { streamTimer = null; send(); }, ms);
+    renderToolbar();
+  }
   async function send() {
     if (phase === "sending") return;
-    if (!popover.classList.contains("hidden")) commitPopover();
+    if (!popover.classList.contains("hidden")) return streamSoon(); // a comment is being written: it goes with this one
+    if (!waitingComments() && !shapes.some((sh) => !sh.batch)) return;
+    clearTimeout(streamTimer); streamTimer = null;
     phase = "sending";
     renderToolbar();
     clearTimeout(saveTimer);
     try { await req("PUT", "/state", { url: pageUrl(), shapes, notes }); } catch { /* fallthrough */ }
+    if (CFG.startMode === "draw") await uploadView(); // the extension put us up: it takes the screenshot
     try {
       const r = await req("POST", "/send");
       for (const n of notes) if (!n.batch) { n.batch = r.batch; n.status = "pending"; }
@@ -1354,18 +1368,42 @@ svg.ink g.draft { opacity: .9; }
       renderPins();
       renderToolbar();
       wigglePins();
-      rim.classList.remove("flash"); void rim.offsetWidth; rim.classList.add("flash");
-      const where = r.pages > 1 ? ` across ${r.pages} pages` : "";
-      toast(`Sent ${r.notes} note${r.notes === 1 ? "" : "s"}${where}. The pins update as Claude works.`, "ok");
+      tick(`sent ${r.notes} comment${r.notes === 1 ? "" : "s"} to Claude`);
+      if (waitingComments()) streamSoon(); // written while this one was on its way
       // The server cannot tell whether the channel is on. If nothing comes back, say what to do.
       clearTimeout(quietTimer);
       quietTimer = setTimeout(() => { if (phase === "sent") toast("Nothing from Claude yet? In the session, type /annotate pull."); }, 20000);
     } catch (e) {
       phase = "idle";
       renderToolbar();
-      toast(e.message === "Nothing to send yet." ? "Draw something or drop a note first." : e.message === "busy" ? "Still sending the last batch, one moment." : `Couldn't send: ${e.message}`);
+      if (e.message === "busy") return streamSoon(); // another tab is sending: try again shortly
+      if (e.message !== "Nothing to send yet.") toast(`Couldn't send to Claude: ${e.message}`);
     }
   }
+  // What the tab shows, marks included and the toolbar hidden, captured by the extension and
+  // uploaded so the session's server needs no connection to Chrome. Best effort: without it the
+  // server tries its own screenshot, and sends the notes without one if that fails too.
+  async function uploadView() {
+    api.capture(true);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 60))));
+    let image = null;
+    try { image = await askExtensionForShot(); } catch { /* none */ }
+    api.capture(false);
+    if (!image) return;
+    await req("POST", "/view", { url: pageUrl(), image, viewport: { w: innerWidth, h: innerHeight }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) } }).catch(() => {});
+  }
+  // The extension's isolated-world relay answers "claude-annotate:shoot" with "claude-annotate:shot"
+  // (a data URL, or "" when the tab could not be captured). DOM events reach it from either world.
+  function askExtensionForShot() {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => done(null), 4000);
+      const done = (v) => { clearTimeout(timer); document.removeEventListener("claude-annotate:shot", onShot); resolve(v); };
+      const onShot = (e) => done(typeof e.detail === "string" && e.detail.startsWith("data:image/") ? e.detail : null);
+      document.addEventListener("claude-annotate:shot", onShot);
+      document.dispatchEvent(new CustomEvent("claude-annotate:shoot"));
+    });
+  }
+
   function armClear() {
     if (clearArmed) { disarmClear(); clearAll(); return; }
     clearArmed = setTimeout(disarmClear, 2200);
