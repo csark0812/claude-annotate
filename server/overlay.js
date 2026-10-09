@@ -255,6 +255,7 @@
 .doc { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
 svg.ink { position: absolute; top: 0; left: 0; display: block; overflow: visible; pointer-events: none; touch-action: none; }
 :host(.draw) svg.ink { pointer-events: auto; cursor: var(--cursor, crosshair); }
+:host(.draw.pass) svg.ink { pointer-events: none; }
 svg.ink .hit { stroke: transparent; fill: none; stroke-width: 16; pointer-events: none; }
 :host(.dragging) svg.ink .hit, :host(.dragging) .pin .dot { cursor: grabbing !important; }
 svg.ink .halo { fill: none; stroke: rgba(10,8,14,.42); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
@@ -1110,30 +1111,51 @@ svg.ink g.draft { opacity: .9; }
   // the document) under it. The wheel goes to what would scroll under the pointer: the nearest
   // scrollable ancestor that can still move that way (body and the document included), else the
   // smallest scrollable area on screen that holds the pointer (a container beside a fixed layer).
+  // A frame from another origin (a document viewer) can't be scrolled from here: the overlay steps
+  // aside so the browser sends the wheel to it, and comes back once the wheel goes quiet.
+  const PASS_MS = 700;
+  let passTimer = null;
   function onWheel(e) {
     const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
     const dx = e.deltaX * k, dy = e.deltaY * k;
-    const target = scrollerAt(e.clientX, e.clientY, dx, dy);
-    if (!target) return;
+    const target = scrollerAt(document, e.clientX, e.clientY, dx, dy);
     e.preventDefault();
-    target.scrollBy({ left: dx, top: dy, behavior: "instant" });
+    if (target === FOREIGN_FRAME) return passThrough();
+    if (target) target.scrollBy({ left: dx, top: dy, behavior: "instant" });
   }
+  function passThrough() {
+    host.classList.add("pass");
+    clearTimeout(passTimer);
+    passTimer = setTimeout(() => host.classList.remove("pass"), PASS_MS);
+  }
+  const FOREIGN_FRAME = {}; // scrollerAt's answer for a frame we cannot reach into
   function canScroll(el, dx, dy) {
-    const root = el === document.scrollingElement;
-    const st = getComputedStyle(el);
+    const doc = el.ownerDocument;
+    const root = el === doc.scrollingElement;
+    const st = doc.defaultView.getComputedStyle(el);
     const yOk = root ? st.overflowY !== "hidden" && st.overflowY !== "clip" : /(auto|scroll|overlay)/.test(st.overflowY);
     const xOk = root ? st.overflowX !== "hidden" && st.overflowX !== "clip" : /(auto|scroll|overlay)/.test(st.overflowX);
     const moveY = dy !== 0 && yOk && (dy < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1);
     const moveX = dx !== 0 && xOk && (dx < 0 ? el.scrollLeft > 0 : el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
     return moveY || moveX;
   }
-  function scrollerAt(cx, cy, dx, dy) {
-    host.style.visibility = "hidden";
-    const hit = document.elementFromPoint(cx, cy);
-    host.style.visibility = "";
+  // What would scroll at (cx, cy) in doc: same-origin frames are searched inside, at their own coordinates.
+  function scrollerAt(doc, cx, cy, dx, dy) {
+    if (doc === document) host.style.visibility = "hidden";
+    const hit = doc.elementFromPoint(cx, cy);
+    if (doc === document) host.style.visibility = "";
+    if (hit && (hit.tagName === "IFRAME" || hit.tagName === "FRAME")) {
+      let inner = null;
+      try { inner = hit.contentDocument; } catch { /* another origin */ }
+      if (!inner) return FOREIGN_FRAME;
+      const r = hit.getBoundingClientRect();
+      const found = scrollerAt(inner, cx - r.left - hit.clientLeft, cy - r.top - hit.clientTop, dx, dy);
+      if (found) return found;
+    }
     for (let el = hit; el; el = el.parentElement) if (canScroll(el, dx, dy)) return el;
-    const root = document.scrollingElement;
+    const root = doc.scrollingElement;
     if (root && canScroll(root, dx, dy)) return root;
+    if (doc !== document) return null;
     let best = null, bestArea = Infinity;
     for (const el of document.querySelectorAll("*")) {
       if (el.scrollHeight <= el.clientHeight + 1 && el.scrollWidth <= el.clientWidth + 1) continue;
