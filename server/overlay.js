@@ -1158,6 +1158,7 @@ svg.ink g.draft { opacity: .9; }
         case "status": tick(m.text, true); break;
         case "toast": toast(m.text); break;
         case "sent": if (!draft && !popNote && !drag) hydrate(); break; // another tab sent; don't clobber work in progress
+        case "changed": if (m.url === pageUrl() && !draft && !popNote && !drag) hydrate(); break; // edited from outside the page
         case "done":
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";

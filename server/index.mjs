@@ -706,6 +706,21 @@ const server = http.createServer(async (req, res) => {
       for (const n of p.notes) if (n.n >= state.nextNote) state.nextNote = n.n + 1;
       return json(res, 200, { ok: true, totals: totals() });
     }
+    if (req.method === "GET" && url.pathname === "/overview") {
+      // Every page at once, for viewers outside the page (the Claude Code mod).
+      const pages = [];
+      for (const [page, p] of state.pages) if (p.notes.length || p.shapes.length) pages.push({ url: page, notes: p.notes, shapes: p.shapes.length });
+      const batches = state.batches.map((b) => ({ id: b.id, notes: b.notes, pages: b.pages, done: !!b.done }));
+      return json(res, 200, { ok: true, mode: state.mode, totals: totals(), pages, batches });
+    }
+    if (req.method === "POST" && url.pathname === "/note/delete") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const p = state.pages.get(String(body.url || ""));
+      if (!p || !p.notes.some((n) => n.n === Number(body.n))) return json(res, 404, { ok: false, error: "no such note" });
+      p.notes = p.notes.filter((n) => n.n !== Number(body.n));
+      broadcast({ type: "changed", url: body.url });
+      return json(res, 200, { ok: true, totals: totals() });
+    }
     if (req.method === "POST" && url.pathname === "/note/next") {
       return json(res, 200, { ok: true, n: state.nextNote++ });
     }
@@ -772,7 +787,7 @@ async function writeSessionFile() {
     if (!pid) continue;
     try { process.kill(pid, 0); } catch { await fsp.rm(path.join(SESSIONS_DIR, f), { force: true }).catch(() => {}); }
   }
-  await fsp.writeFile(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, startedAt: Date.now() }));
+  await fsp.writeFile(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, cwd: process.cwd(), startedAt: Date.now() }));
 }
 
 

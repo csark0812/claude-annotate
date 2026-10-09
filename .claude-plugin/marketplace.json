@@ -10,6 +10,12 @@
       "displayName": "Claude Annotate",
       "description": "/annotate <url> opens the page with drawing and note tools. Send to Claude pushes screenshots, notes and element context into this session; progress shows up on the page.",
       "source": "./"
+    },
+    {
+      "name": "annotations",
+      "displayName": "Annotations pane",
+      "description": "A Claude Code pane that lists this session's browser annotations and lets you send, delete or clear them. Needs the annotate plugin.",
+      "source": "./mods/annotations"
     }
   ]
 }

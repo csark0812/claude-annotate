@@ -80,6 +80,16 @@ const after = await (await fetch(`${endpoint}/state?url=${encodeURIComponent(url
 assert.equal(after.notes[0].status, "working", "progress mutates the stored note");
 console.log("✓ bridge: token gate, state round trip, note numbering, progress");
 
+// The overview lists every page for viewers outside the page; delete removes one note.
+const overview = await (await fetch(`${endpoint}/overview`, { headers: H })).json();
+assert.deepEqual(overview.pages.map((p) => [p.url, p.notes.length, p.shapes]), [[url, 1, 1]]);
+assert.equal(JSON.parse(fs.readFileSync(sessionFile, "utf8")).cwd, process.cwd(), "session file names the cwd");
+assert.equal((await fetch(`${endpoint}/note/delete`, { method: "POST", headers: H, body: JSON.stringify({ url, n: 9 }) })).status, 404, "unknown note");
+const deleted = await (await fetch(`${endpoint}/note/delete`, { method: "POST", headers: H, body: JSON.stringify({ url, n: 1 }) })).json();
+assert.equal(deleted.totals.notes, 0, "note deleted");
+await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "n", n: 1, x: 2, y: 2, color: "pink", text: "hi", status: "working" }] }) });
+console.log("✓ overview lists pages, delete removes a note");
+
 // The chat hook's long poll: a newer hook takes over and the older one is told to stop asking (204).
 const first = fetch(`${endpoint}/next`, { headers: H });
 await sleep(100);
