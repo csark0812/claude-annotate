@@ -80,6 +80,7 @@ Per note that is: your text, the element under the pin with its visible text and
 
 | | |
 |---|---|
+| **Element** | `E`, then point: the element under the pointer is outlined with its selector and size, inside iframes too (nested, and from other sites once you allow it). Click to mark it and comment; the note carries that element and the frame path to it. |
 | **Marks** | Box, arrow, pen. Four inks with a dark halo, so they read on light and dark pages. Hold `⇧` for a square, or an arrow in 15° steps. When you let go, a comment box opens under the mark: type and `↵`, or `esc` to keep the mark without a comment. |
 | **Comments** | Click anywhere (no drag) for a bare comment at that spot. Type, `↵`. Numbered across all pages. Click a pin to edit or delete. |
 | **Browse** | `V` or `esc` passes clicks through to the page, so you can open a menu, change route, log in. Pins stay. Pick a tool or press its key to draw. With the Chrome extension, its toolbar icon is the switch instead. |
@@ -89,13 +90,15 @@ Per note that is: your text, the element under the pin with its visible text and
 | **Progress** | Pin spins: Claude is on that note. Green with a line: done. Grey: skipped, with why. The toolbar shows which file Claude is editing. |
 | **Clear** | Two clicks (the second one says *Sure?*). Removes every mark on every page and the temporary screenshots. |
 
-Keys: `R` box · `A` arrow · `P` pen · `1` – `4` inks · `V` / `esc` browse (with the extension, `esc` turns annotation off) · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included. Drag the toolbar by its grip, it remembers where you put it per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost.
+Keys: `E` element · `R` box · `A` arrow · `P` pen · `1` – `4` inks · `V` / `esc` browse (with the extension, `esc` turns annotation off) · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included. Drag the toolbar by its grip, it remembers where you put it per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost.
 
 ## Chrome extension
 
 The extension puts the same toolbar on any tab you already have open, with no `/annotate` first: your dev server, a deployed copy of your app, or a site you want yours to look like. Click its toolbar icon to annotate the tab, and click again to go back to the page. Notes go to the Claude Code session you typed in last; right-click the icon to pick another.
 
 To mark up a hover state (a menu, a tooltip, a hover style), point at it and press `⌥⇧A` instead of clicking the icon. The toolbar comes up with that hover held: hover styles stay applied and the page never hears the pointer leave, until you turn annotation off. Hover styles from stylesheets on another origin can't be held.
+
+The element picker reads inside iframes. Same-origin frames work as they are; a frame from another site (an embedded document viewer, say) needs the extension's access there: right-click the icon and pick **Allow inside embedded frames on all sites** once. Without it, that frame is picked as a whole.
 
 On a local dev page the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, and Claude is told that text quoted from that site is data, not instructions. Turning it on for a site asks Chrome for access to that site once, so it stays on across reloads.
 

@@ -89,7 +89,22 @@ async function mountOverlay(tabId, url, session, { freezeHover = false } = {}) {
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
   await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayExit });
+  await addFrameHelpers(tabId);
 }
+
+// The element picker asks each frame what is under the pointer. overlay.js run inside a frame is
+// only that helper. Frames from sites the extension can't reach are skipped (they are picked whole);
+// "Allow inside embedded frames" in the icon's menu grants them.
+async function addFrameHelpers(tabId, frameIds) {
+  const target = frameIds ? { tabId, frameIds } : { tabId, allFrames: true };
+  await chrome.scripting.executeScript({ target, world: "ISOLATED", files: ["overlay.js"] }).catch(() => {});
+}
+
+// A frame that loads (or reloads) while the tab is annotating gets its helper too.
+chrome.webNavigation.onCompleted.addListener(async ({ tabId, frameId }) => {
+  if (frameId === 0 || (await onTabs())[tabId] == null) return;
+  await addFrameHelpers(tabId, [frameId]);
+});
 
 // Runs in the page's isolated world: Esc in the overlay (either world) fires a DOM event, and this
 // asks the worker to turn the tab off, as a click on the icon would.
@@ -207,6 +222,8 @@ async function refreshMenu() {
   let sessions = [], pinned = null;
   try { ({ sessions, pinned } = await targetSession()); } catch { /* host missing: the menu says so */ }
   await chrome.contextMenus.removeAll();
+  const allSites = await chrome.permissions.contains({ origins: ALL_SITES });
+  if (!allSites) chrome.contextMenus.create({ id: "allow-frames", title: "Allow inside embedded frames on all sites", contexts: ["action"] });
   chrome.contextMenus.create({ id: MENU_PARENT, title: "Send notes to", contexts: ["action"] });
   if (!sessions.length) {
     chrome.contextMenus.create({ id: "none", parentId: MENU_PARENT, title: "No Claude Code session running", enabled: false, contexts: ["action"] });
@@ -229,7 +246,16 @@ function describeSession(s) {
   return `${folder(s.cwd)} · ${s.lastPromptAt ? "typed" : "started"} ${ago}`;
 }
 
+const ALL_SITES = ["http://*/*", "https://*/*"];
+
 chrome.contextMenus.onClicked.addListener(async (info) => {
+  if (info.menuItemId === "allow-frames") {
+    // Embedded frames often come from another site (a document viewer, a payment form). Without
+    // access there, the element picker can only pick the whole frame.
+    const granted = await chrome.permissions.request({ origins: ALL_SITES }).catch(() => false);
+    if (granted) { await remountAll(); refreshMenu(); }
+    return;
+  }
   if (!String(info.menuItemId).startsWith("pid:")) return;
   const pid = info.menuItemId === "pid:auto" ? null : Number(String(info.menuItemId).slice(4));
   await chrome.storage.local.set({ pinnedPid: pid });

@@ -15,7 +15,7 @@
  * anchor each mark to the nearest scroll container of its element.
  */
 (() => {
-  if (window.top !== window) return; // never inside iframes
+  if (window.top !== window) { installFrameProbe(); return; } // inside a frame: only answer the element picker
   const CFG = window.__CLAUDE_ANNOTATE__;
   try { delete window.__CLAUDE_ANNOTATE__; } catch { window.__CLAUDE_ANNOTATE__ = undefined; } // the token never stays on the page
   if (!CFG || window.__claudeAnnotate) return;
@@ -39,14 +39,15 @@
     { id: "cyan", hex: "#35D7FF", dark: "#062530" },
     { id: "lime", hex: "#9BFF4D", dark: "#142A05" },
   ];
-  const TOOLS = ["rect", "arrow", "pen"];
-  const KEYS = { r: "rect", a: "arrow", p: "pen" };
+  const TOOLS = ["element", "rect", "arrow", "pen"];
+  const KEYS = { e: "element", r: "rect", a: "arrow", p: "pen" };
   const CLICK_SLOP = 5; // a press that moves less than this is a click: it opens a bare comment
   const ICON = {
     pen: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
     arrow: '<path d="M5 19 19 5"/><path d="M9 5h10v10"/>',
     line: '<path d="M5 19 19 5"/>',
     rect: '<rect x="3" y="5" width="18" height="14" rx="3"/>',
+    element: '<path d="M5 3a2 2 0 0 0-2 2"/><path d="M19 3a2 2 0 0 1 2 2"/><path d="M5 21a2 2 0 0 1-2-2"/><path d="M9 3h1"/><path d="M9 21h2"/><path d="M14 3h1"/><path d="M3 9v1"/><path d="M21 9v2"/><path d="M3 14v1"/><path d="m12 12 4 10 1.7-4.3L22 16Z"/>',
     note: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>',
     undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
     trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
@@ -247,7 +248,7 @@
   // ---------------------------------------------------------------------------
   // DOM scaffold
   // ---------------------------------------------------------------------------
-  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, ticker, rim;
+  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, ticker, rim, hl;
 
   const CSS = `
 :host { all: initial; position: absolute; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646; display: block; }
@@ -308,6 +309,10 @@ svg.ink g.draft { opacity: .9; }
 
 .chrome { position: fixed; inset: 0; pointer-events: none; color: #F4F1F7; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
 .chrome > * { pointer-events: auto; }
+.hl { position: fixed; pointer-events: none; border: 1.5px solid var(--ink); background: color-mix(in srgb, var(--ink) 10%, transparent); border-radius: 2px; transition: left .06s, top .06s, width .06s, height .06s; }
+.hl.hidden { display: none; }
+.hl .lab { position: absolute; left: -1.5px; bottom: calc(100% + 4px); padding: 2px 6px; border-radius: 5px; white-space: nowrap; background: var(--ink); color: var(--ink-dark); font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+:host(.draw.t-element) svg.ink { cursor: default; }
 .rim { pointer-events: none; position: fixed; inset: 0; box-shadow: inset 0 0 0 3px var(--ink); opacity: 0; }
 .rim.flash { animation: rimflash .7s cubic-bezier(.2,.8,.2,1) both; }
 
@@ -467,6 +472,8 @@ svg.ink g.draft { opacity: .9; }
     ticker = el("div", "ticker");
     ticker.setAttribute("aria-live", "polite");
     chrome.appendChild(ticker);
+    hl = el("div", "hl hidden", '<span class="lab"></span>');
+    chrome.appendChild(hl);
     popover = el("div", "pop hidden");
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "Note");
@@ -599,17 +606,73 @@ svg.ink g.draft { opacity: .9; }
   }
 
   function describe(e) {
-    if (!e || e === document.body || e === document.documentElement) return null;
+    const doc = e && e.ownerDocument;
+    if (!e || e === doc.body || e === doc.documentElement) return null;
+    const win = doc.defaultView;
     const r = e.getBoundingClientRect();
     const text = (e.innerText || e.textContent || "").trim().replace(/\s+/g, " ").slice(0, 90);
     const chain = [];
     let p = e.parentElement;
-    while (p && p !== document.body && chain.length < 3) { chain.unshift(shortSel(p)); p = p.parentElement; }
+    while (p && p !== doc.body && chain.length < 3) { chain.unshift(shortSel(p)); p = p.parentElement; }
     return {
       selector: shortSel(e), text,
-      rect: [Math.round(r.left + scrollX), Math.round(r.top + scrollY), Math.round(r.width), Math.round(r.height)],
+      rect: [Math.round(r.left + win.scrollX), Math.round(r.top + win.scrollY), Math.round(r.width), Math.round(r.height)],
       chain: chain.join(" > "), react: reactInfo(e),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Element picker, across frames
+  // ---------------------------------------------------------------------------
+  // pickIn(doc, x, y) → { rect: [left, top, w, h] in doc's viewport, ctx, frames } for the element
+  // under the point. A same-origin frame is searched directly; a frame from another origin is asked
+  // over postMessage, where the extension's frame helper (installFrameProbe) answers, forwarding
+  // to its own frames the same way. A frame with no helper is picked as a whole.
+  // hideOverlay: the top document's call, which must look past the overlay. Frames never touch it.
+  async function pickIn(doc, x, y, hideOverlay = false) {
+    if (hideOverlay) host.style.visibility = "hidden";
+    const el = doc.elementFromPoint(x, y);
+    if (hideOverlay) host.style.visibility = "";
+    if (!el || el === doc.body || el === doc.documentElement) return null;
+    if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+      const r = el.getBoundingClientRect(), ox = r.left + el.clientLeft, oy = r.top + el.clientTop;
+      let inner = null;
+      try { inner = el.contentDocument; } catch { /* another origin */ }
+      const sub = inner ? await pickIn(inner, x - ox, y - oy) : await askFrame(el.contentWindow, x - ox, y - oy);
+      if (sub) return { rect: [sub.rect[0] + ox, sub.rect[1] + oy, sub.rect[2], sub.rect[3]], ctx: sub.ctx, frames: [frameName(el), ...(sub.frames || [])] };
+    }
+    const r = el.getBoundingClientRect();
+    return { rect: [r.left, r.top, r.width, r.height], ctx: describe(el), frames: [] };
+  }
+  function frameName(el) {
+    const src = el.getAttribute("src");
+    if (!src) return el.hasAttribute("srcdoc") ? "inline frame" : "blank frame";
+    try { const u = new URL(src, el.ownerDocument.baseURI); return u.origin + u.pathname; } catch { return src.slice(0, 80); }
+  }
+  let askSeq = 0;
+  function askFrame(win, x, y) {
+    return new Promise((resolve) => {
+      const id = `${Math.random().toString(36).slice(2)}:${++askSeq}`;
+      const done = (v) => { clearTimeout(timer); removeEventListener("message", onAnswer); resolve(v); };
+      const onAnswer = (e) => { if (e.source === win && e.data && e.data.claudeAnnotate === "here" && e.data.id === id) done(e.data.pick || null); };
+      const timer = setTimeout(() => done(null), 250);
+      addEventListener("message", onAnswer);
+      try { win.postMessage({ claudeAnnotate: "at", id, x, y }, "*"); } catch { done(null); }
+    });
+  }
+  // In a frame: answer "what is at (x, y)?" with this frame's element. Only a page that contains
+  // this frame may ask (the asker can be further up when it searched a same-origin frame itself);
+  // the answer goes back to the asker alone.
+  function installFrameProbe() {
+    if (window.__claudeAnnotateProbe) return;
+    window.__claudeAnnotateProbe = true;
+    const isAncestor = (w) => { for (let a = window.parent; ; a = a.parent) { if (a === w) return true; if (a === a.parent) return false; } };
+    addEventListener("message", async (e) => {
+      if (!e.data || e.data.claudeAnnotate !== "at" || !e.source || !isAncestor(e.source)) return;
+      let pick = null;
+      try { pick = await pickIn(document, e.data.x, e.data.y); } catch { /* answer null */ }
+      e.source.postMessage({ claudeAnnotate: "here", id: e.data.id, pick }, "*");
+    });
   }
   function ctxAtPoint(x, y) { return describe(elementAt(x, y)); }
   function ctxForBox(x, y, w, h) {
@@ -851,7 +914,7 @@ svg.ink g.draft { opacity: .9; }
   function restore(json) { const s = JSON.parse(json); shapes = s.shapes; notes = s.notes; renderInk(); renderPins(); save(); renderToolbar(); }
   function doUndo() { if (!undo.length) return; redo.push(snapshot()); restore(undo.pop()); }
   function doRedo() { if (!redo.length) return; undo.push(snapshot()); restore(redo.pop()); }
-  function addShape(s) { pushUndo(); s.ctx = ctxForShape(s); shapes.push(s); renderInk(); save(); }
+  function addShape(s) { pushUndo(); if (!s.ctx) s.ctx = ctxForShape(s); shapes.push(s); renderInk(); save(); }
   // ⇧ on a line or arrow: the free end snaps to 15° steps around the fixed one, keeping its length
   function snap15(ax, ay, x, y) {
     const len = Math.hypot(x - ax, y - ay), step = Math.PI / 12;
@@ -908,6 +971,7 @@ svg.ink g.draft { opacity: .9; }
   }
   function setTool(t) {
     tool = t;
+    if (t !== "element") hideHighlight();
     setMode("draw");
     applyInk();
   }
@@ -936,6 +1000,7 @@ svg.ink g.draft { opacity: .9; }
       <span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>${frozen ? `
       <span class="frozen" title="The page's hover state is held while you annotate">Hover held</span>` : ""}
       <span class="sep"></span>
+      ${btn("element", "Element", "E", tool === "element" && mode === "draw" ? "on" : "")}
       ${btn("rect", "Box", "R", tool === "rect" && mode === "draw" ? "on" : "")}
       ${btn("arrow", "Arrow", "A", tool === "arrow" && mode === "draw" ? "on" : "")}
       ${btn("pen", "Pen", "P", tool === "pen" && mode === "draw" ? "on" : "")}
@@ -1018,6 +1083,7 @@ svg.ink g.draft { opacity: .9; }
     svg.addEventListener("pointercancel", onUp);
     svg.addEventListener("contextmenu", (e) => { if (mode === "draw") e.preventDefault(); });
     svg.addEventListener("wheel", onWheel, { passive: false });
+    svg.addEventListener("pointerleave", hideHighlight);
 
     // Pins: press opens the note, drag moves it (any mode)
     pinsLayer.addEventListener("pointerdown", (e) => {
@@ -1099,6 +1165,7 @@ svg.ink g.draft { opacity: .9; }
     if (!popover.classList.contains("hidden")) { commitPopover(); }
     const [x, y] = toDoc(e);
     e.preventDefault();
+    if (tool === "element") { pickElement(e.clientX, e.clientY); return; }
     svg.setPointerCapture(e.pointerId);
     pressAt = [x, y];
     if (tool === "pen") draft = { id: uid(), type: "pen", color: ink.id, points: [[x, y]] };
@@ -1107,6 +1174,42 @@ svg.ink g.draft { opacity: .9; }
     sizeDoc();
     renderDraft();
   }
+  // Element tool: the element under the pointer is outlined, frames included; a click marks it.
+  let hoverSeq = 0, hoverAt = null, hoverBusy = false;
+  async function hoverElement(cx, cy) {
+    hoverAt = [cx, cy];
+    if (hoverBusy) return; // one question at a time; the latest point is asked next
+    hoverBusy = true;
+    try {
+      while (hoverAt) {
+        const [x, y] = hoverAt; hoverAt = null;
+        const seq = ++hoverSeq;
+        const pick = await pickIn(document, x, y, true);
+        if (seq === hoverSeq && tool === "element" && mode === "draw") showHighlight(pick);
+      }
+    } finally { hoverBusy = false; }
+  }
+  function showHighlight(pick) {
+    if (!pick) { hl.classList.add("hidden"); return; }
+    const [l, t, w, h] = pick.rect;
+    hl.style.cssText = `left:${l}px;top:${t}px;width:${w}px;height:${h}px`;
+    hl.querySelector(".lab").textContent = `${pick.ctx ? pick.ctx.selector : "frame"} · ${Math.round(w)}×${Math.round(h)}${pick.frames.length ? " · in frame" : ""}`;
+    hl.classList.remove("hidden");
+  }
+  function hideHighlight() { hoverSeq++; if (hl) hl.classList.add("hidden"); }
+  async function pickElement(cx, cy) {
+    const pick = await pickIn(document, cx, cy, true);
+    hideHighlight();
+    if (!pick || pick.rect[2] < 2 || pick.rect[3] < 2) return;
+    const [l, t, w, h] = pick.rect;
+    const ctx = pick.ctx ? { ...pick.ctx } : { selector: "iframe", text: "", rect: [0, 0, 0, 0], chain: "", react: { components: [], source: null } };
+    if (pick.frames.length) ctx.frames = pick.frames;
+    const s = { id: uid(), type: "rect", element: true, color: ink.id, x: Math.round(l + scrollX), y: Math.round(t + scrollY), w: Math.round(w), h: Math.round(h), ctx };
+    addShape(s);
+    const [ax, ay] = commentAnchor(s);
+    createNote(ax, ay, s);
+  }
+
   // The overlay sits outside the page's elements, so the browser would scroll nothing (or only
   // the document) under it. The wheel goes to what would scroll under the pointer: the nearest
   // scrollable ancestor that can still move that way (body and the document included), else the
@@ -1116,6 +1219,7 @@ svg.ink g.draft { opacity: .9; }
   const PASS_MS = 700;
   let passTimer = null;
   function onWheel(e) {
+    hideHighlight(); // the page moves under it
     const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
     const dx = e.deltaX * k, dy = e.deltaY * k;
     const target = scrollerAt(document, e.clientX, e.clientY, dx, dy);
@@ -1169,6 +1273,7 @@ svg.ink g.draft { opacity: .9; }
   let drag = null; // { kind: "pin", ... } while a pin is being moved
   let pressAt = null, farthest = 0; // where the press began, and how far the pointer has gone since
   function onMove(e) {
+    if (!draft && tool === "element") return hoverElement(e.clientX, e.clientY);
     if (!draft) return;
     const [x, y] = toDoc(e);
     farthest = Math.max(farthest, Math.hypot(x - pressAt[0], y - pressAt[1]));

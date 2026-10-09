@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Annotate",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Toggle annotation mode on any page. Notes and marks go to your Claude Code session.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0dUFaTCfleg8nNVBiaLhLP77taKgwpqtvLTBkF4AFrSmCOEmfsHe8YuM0K5kV9bNU2buy1IB+jMWSdCG7cTXd0e44VYrDt3mlNdCFJ2F/xxc9Sg1lAYeA4hsBpNil3weA3tde4r/oAuIDWAUOzFJKyyOh34/ijtYZGRaHDDhAnk62cSvVhfE8Q+pO+Xs57EBtzWLARi+5HHHG6S3zAsF7aLF0r/D2JnZLLRbpUGTAES0l4hnVdF4ZDxWUydFgU4DVHFUZ/8qfZFFgw4OFI0SoOBunaPkeHRlAelETZZ8JRth4IYiDtNYEKbF66Na6DK+pbgke5ueGOXQXlB2aDb4LQIDAQAB",
   "minimum_chrome_version": "116",
@@ -37,7 +37,8 @@
     "scripting",
     "storage",
     "nativeMessaging",
-    "contextMenus"
+    "contextMenus",
+    "webNavigation"
   ],
   "host_permissions": [
     "http://localhost/*",

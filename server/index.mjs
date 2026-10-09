@@ -346,6 +346,7 @@ function fmtCtx(ctx, indent = "") {
   if (ctx.react && ctx.react.components && ctx.react.components.length) out += `${indent}component: ${ctx.react.components.join(" ‹ ")}\n`;
   if (ctx.react && ctx.react.source) out += `${indent}source: ${ctx.react.source}\n`;
   if (ctx.inside && ctx.inside.length) out += `${indent}contains: ${ctx.inside.join("; ")}\n`;
+  if (ctx.frames && ctx.frames.length) out += `${indent}inside frame: ${ctx.frames.join(" › ")} (the element's position is within that frame)\n`;
   return out;
 }
 function shapeWord(s) {
