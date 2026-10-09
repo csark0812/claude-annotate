@@ -39,8 +39,8 @@
     { id: "cyan", hex: "#35D7FF", dark: "#062530" },
     { id: "lime", hex: "#9BFF4D", dark: "#142A05" },
   ];
-  const TOOLS = ["pen", "arrow", "line", "rect", "ellipse", "note", "select"];
-  const KEYS = { p: "pen", a: "arrow", l: "line", r: "rect", e: "ellipse", n: "note", s: "select" };
+  const TOOLS = ["pen", "arrow", "line", "rect", "ellipse", "note"];
+  const KEYS = { p: "pen", a: "arrow", l: "line", r: "rect", e: "ellipse", n: "note" };
   const ICON = {
     pen: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
     arrow: '<path d="M5 19 19 5"/><path d="M9 5h10v10"/>',
@@ -48,7 +48,6 @@
     rect: '<rect x="3" y="5" width="18" height="14" rx="3"/>',
     ellipse: '<ellipse cx="12" cy="12" rx="9" ry="7"/>',
     note: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>',
-    select: '<path d="M4.04 4.69a.5.5 0 0 1 .65-.65l16 6.5a.5.5 0 0 1-.06.95l-6.13 1.58a2 2 0 0 0-1.43 1.43l-1.58 6.13a.5.5 0 0 1-.95.06z"/>',
     undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
     trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
     send: '<path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4 20-7z"/>',
@@ -75,7 +74,6 @@
   // draw | browse. annotate_open starts in browse, so every page stays usable until a tool is picked.
   // The extension's toolbar icon is the switch: there the overlay exists only while annotating.
   let mode = CFG.startMode === "draw" ? "draw" : "browse";
-  let selected = null;
   let draft = null;
   const undo = [];
   const redo = [];
@@ -257,19 +255,15 @@
 .doc { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
 svg.ink { position: absolute; top: 0; left: 0; display: block; overflow: visible; pointer-events: none; touch-action: none; }
 :host(.draw) svg.ink { pointer-events: auto; cursor: var(--cursor, crosshair); }
-:host(.draw.t-select) svg.ink { cursor: default; }
 svg.ink .hit { stroke: transparent; fill: none; stroke-width: 16; pointer-events: none; }
-:host(.draw.t-select) svg.ink .hit { pointer-events: stroke; cursor: grab; }
-:host(.draw.t-select) svg.ink rect.hit, :host(.draw.t-select) svg.ink ellipse.hit { pointer-events: all; }
 :host(.dragging) svg.ink .hit, :host(.dragging) .pin .dot { cursor: grabbing !important; }
-:host(.draw.t-select) svg.ink g.shape:hover .halo { stroke: rgba(255,255,255,.55); }
-svg.ink g.shape.selected .halo { stroke: #fff; stroke-dasharray: 5 4; stroke-width: 5; }
 svg.ink .halo { fill: none; stroke: rgba(10,8,14,.42); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
 svg.ink .box { stroke-dasharray: 7 5; stroke-linecap: butt; stroke-linejoin: miter; } /* a box reads as a selection */
-svg.ink .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+svg.ink .line:not(.box) { fill: none; }
+svg.ink .line { stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 svg.ink .head { stroke: rgba(10,8,14,.42); stroke-width: 2; stroke-linejoin: round; }
 svg.ink g.draft { opacity: .9; }
-:host(.capturing) svg.ink .hit, :host(.capturing) .chrome, :host(.capturing) .pop, :host(.capturing) g.shape.selected .halo { display: none !important; }
+:host(.capturing) svg.ink .hit, :host(.capturing) .chrome, :host(.capturing) .pop { display: none !important; }
 :host(.capturing) .pin .tag { white-space: normal; width: max-content; max-width: 260px; border-radius: 12px; }
 :host(.capturing) .pin .dot { animation: none; }
 
@@ -399,32 +393,25 @@ svg.ink g.draft { opacity: .9; }
 .toast .ic { flex: none; margin-top: 1px; color: var(--ink); }
 .toast.ok .ic { color: #4ADE80; }
 
-.pop { position: fixed; width: min(292px, calc(100vw - 24px)); padding: 10px 10px 8px; border-radius: 14px; background: rgba(20,17,26,.92); color: #F4F1F7;
-  backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 0 0 1px rgba(255,255,255,.08), 0 24px 60px -20px rgba(0,0,0,.75);
-  transform-origin: var(--ox, 0) var(--oy, 0); animation: popin .22s cubic-bezier(.34,1.56,.64,1) both; }
+.pop { position: fixed; width: min(340px, calc(100vw - 24px)); display: flex; align-items: center; gap: 6px; padding: 5px 5px 5px 7px; border-radius: 999px;
+  background: rgba(24,22,28,.96); color: #F4F1F7; backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 1px rgba(255,255,255,.08), 0 16px 40px -16px rgba(0,0,0,.7);
+  transform-origin: var(--ox, 0) var(--oy, 0); animation: popin .18s cubic-bezier(.34,1.56,.64,1) both; }
+.pop.multi { border-radius: 16px; align-items: flex-end; }
 .pop.hidden { display: none; }
-.pop .head { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
-.pop .num { width: 22px; height: 22px; border-radius: 999px; display: grid; place-items: center; background: var(--ink); color: var(--ink-dark); font-weight: 700; font-size: 12px; }
-.pop .title { font-weight: 600; font-size: 12.5px; color: rgba(244,241,247,.72); flex: 1; }
-.pop .del { width: 26px; height: 26px; }
-.pop textarea { width: 100%; min-height: 60px; max-height: 180px; resize: none; border: 0; outline: 0; border-radius: 9px; padding: 9px 10px; margin: 0;
-  background: rgba(255,255,255,.06); color: #F4F1F7; font: 500 13.5px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); transition: box-shadow .15s; }
-.pop textarea:focus { box-shadow: inset 0 0 0 1.5px var(--ink); }
-.pop textarea::placeholder { color: rgba(244,241,247,.4); }
-.pop .hint { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; padding: 0 2px; font-size: 10.5px; color: rgba(244,241,247,.45); font-weight: 500; white-space: nowrap; }
-.pop .hint kbd { font: inherit; color: rgba(244,241,247,.7); }
-.pop .ok { height: 28px; padding: 0 12px; border: 0; border-radius: 999px; background: var(--ink); color: var(--ink-dark); font: 600 12px/1 inherit; font-family: inherit; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: transform .15s, filter .15s; }
-.pop .ok:hover { filter: brightness(1.06); }
-.pop .ok:active { transform: scale(.96); }
+.pop .num { flex: none; width: 20px; height: 20px; border-radius: 999px; display: grid; place-items: center; background: var(--ink); color: var(--ink-dark); font-weight: 700; font-size: 11px; font-variant-numeric: tabular-nums; }
+.pop.multi .num { margin-bottom: 4px; }
+.pop textarea { flex: 1; min-width: 0; height: 22px; max-height: 140px; resize: none; border: 0; outline: 0; padding: 2px 2px; margin: 0; background: transparent;
+  color: #F4F1F7; font: 500 13px/18px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.pop textarea::placeholder { color: rgba(244,241,247,.42); }
+.pop .ok, .pop .del { flex: none; width: 26px; height: 26px; border: 0; padding: 0; border-radius: 999px; display: grid; place-items: center; cursor: pointer; transition: transform .15s, filter .15s, background .15s; }
+.pop .ok { background: var(--ink); color: var(--ink-dark); }
+.pop .ok:hover { filter: brightness(1.08); }
+.pop .ok:active, .pop .del:active { transform: scale(.92); }
+.pop .del { background: transparent; color: rgba(244,241,247,.5); }
+.pop .del:hover { background: rgba(255,92,92,.16); color: #FF8A8A; }
+.pop .ok:focus-visible, .pop .del:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
 
-.sel { position: absolute; pointer-events: none; }
-.sel .del { position: absolute; right: -14px; top: -44px; width: 28px; height: 28px; border-radius: 999px; border: 0; padding: 0; display: grid; place-items: center; cursor: pointer; pointer-events: auto;
-  background: rgba(20,17,26,.92); color: #FF8A8A; box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 0 0 1px rgba(255,255,255,.08), 0 10px 24px -12px rgba(0,0,0,.7); animation: pop .2s cubic-bezier(.34,1.56,.64,1) both; }
-.sel .del:hover { background: rgba(255,92,92,.2); }
-.sel .hdl { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 999px; background: #fff; box-shadow: 0 0 0 2px rgba(10,8,14,.6), 0 2px 6px rgba(0,0,0,.4); pointer-events: auto; cursor: move; }
-.sel .hdl.nw, .sel .hdl.se { cursor: nwse-resize; }
-.sel .hdl.ne, .sel .hdl.sw { cursor: nesw-resize; }
 
 @keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes slide { from { transform: translateX(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
@@ -706,7 +693,7 @@ svg.ink g.draft { opacity: .9; }
       hit = `<path class="hit" d="${d}"/>`;
     } else if (s.type === "rect") {
       const a = `x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}"`;
-      body = `<rect class="halo box" ${a}/><rect class="line box" stroke="${hex}" ${a}/>`;
+      body = `<rect class="halo box" ${a}/><rect class="line box" stroke="${hex}" fill="${hex}" fill-opacity=".07" ${a}/>`;
       hit = `<rect class="hit" ${a}/>`;
     } else if (s.type === "ellipse") {
       const a = `cx="${s.x + s.w / 2}" cy="${s.y + s.h / 2}" rx="${s.w / 2}" ry="${s.h / 2}"`;
@@ -721,68 +708,35 @@ svg.ink g.draft { opacity: .9; }
       body = `<path class="halo" d="${d}"/><path class="line" stroke="${hex}" d="${d}"/>`;
       hit = `<path class="hit" d="${d}"/>`;
     }
-    return `<g class="${cls}${selected === s.id ? " selected" : ""}" data-id="${s.id}">${body}${hit}</g>`;
+    return `<g class="${cls}" data-id="${s.id}">${body}${hit}</g>`;
   }
   function renderInk() {
     shapesG.innerHTML = shapes.map((s) => shapeSvg(s)).join("");
     renderDraft();
-    renderSelection();
   }
   function renderDraft() { draftG.innerHTML = draft ? shapeSvg(draft, "draft") : ""; }
-  function renderShape(s) { // one committed shape, while it is being moved
-    const g = shapesG.querySelector(`g.shape[data-id="${s.id}"]`);
-    if (g) g.outerHTML = shapeSvg(s); else renderInk();
-    renderSelection();
-  }
-  let selBox = null;
-  function renderSelection() {
-    if (selBox) { selBox.remove(); selBox = null; }
-    const s = shapes.find((x) => x.id === selected);
-    if (!s || mode !== "draw") return;
-    const b = bbox(s);
-    selBox = el("div", "sel");
-    selBox.style.cssText = `left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px`;
-    const del = el("button", "del", svgIcon("x", 15));
-    del.title = "Delete (⌫)";
-    del.addEventListener("click", (e) => { e.stopPropagation(); deleteSelected(); });
-    selBox.appendChild(del);
-    for (const [k, hx, hy] of handlesOf(s)) {
-      const h = el("span", `hdl ${k}`);
-      h.style.left = hx - b.x + "px"; h.style.top = hy - b.y + "px";
-      h.addEventListener("pointerdown", (e) => {
-        if (e.button !== 0) return;
-        e.stopPropagation(); e.preventDefault();
-        const [x, y] = toDoc(e);
-        drag = { kind: "shape", handle: k, s, orig: JSON.parse(JSON.stringify(s)), x, y, before: snapshot(), moved: false };
-        svg.setPointerCapture(e.pointerId); // onMove/onUp on the svg take it from here
-      });
-      selBox.appendChild(h);
-    }
-    pinsLayer.appendChild(selBox);
-  }
-
   // ---------------------------------------------------------------------------
   // Pins
   // ---------------------------------------------------------------------------
   function renderPins() {
-    const keep = selBox;
     pinsLayer.innerHTML = "";
     for (const n of notes) {
       const inkDef = INKS.find((i) => i.id === n.color) || INKS[0];
       const p = el("div", `pin ${n.status || "draft"}`);
       p.dataset.id = n.id;
       p.style.cssText = `left:${n.x}px;top:${n.y}px;--ink:${inkDef.hex};--ink-dark:${inkDef.dark};--ink-soft:${inkDef.hex}55`;
-      p.innerHTML = `<span class="ring"></span><button class="dot" type="button" aria-label="Note ${n.n}"><span class="n">${n.n}</span>${svgIcon("check", 15)}</button><span class="tag" title="${esc(n.text)}">${tagHtml(n)}</span>`;
+      p.innerHTML = `<span class="ring"></span><button class="dot" type="button" aria-label="Note ${n.n}"><span class="n">${n.n}</span>${svgIcon("check", 15)}</button>${n.text ? `<span class="tag" title="${esc(n.text)}">${tagHtml(n)}</span>` : ""}`;
       pinsLayer.appendChild(p);
     }
-    if (keep) pinsLayer.appendChild(keep);
   }
   function tagHtml(n) { return `<span class="txt">${esc(n.text || "…")}</span>${n.result ? `<span class="res">${esc(n.result)}</span>` : ""}`; }
   function updatePin(n) {
     const p = pinsLayer.querySelector(`.pin[data-id="${n.id}"]`);
     if (!p) return renderPins();
     p.className = `pin ${n.status || "draft"}`;
-    p.querySelector(".tag").innerHTML = tagHtml(n);
+    const tag = p.querySelector(".tag");
+    if (tag) tag.innerHTML = tagHtml(n);
+    else renderPins();
   }
   function wigglePins(stagger = 50) {
     [...pinsLayer.querySelectorAll(".pin .dot")].forEach((d, i) => {
@@ -810,14 +764,19 @@ svg.ink g.draft { opacity: .9; }
     popover.style.setProperty("--ink", inkDef.hex);
     popover.style.setProperty("--ink-dark", inkDef.dark);
     popover.innerHTML = `
-      <div class="head"><span class="num">${note.n}</span><span class="title">${isNew ? "What should change here?" : "Note " + note.n}</span>
-        <button class="tb del" type="button" title="Delete note">${svgIcon("trash", 15)}</button></div>
-      <textarea placeholder="e.g. make this less loud, same style as the card on the left" rows="2" maxlength="600"></textarea>
-      <div class="hint"><span><kbd>↵</kbd> save · <kbd>⇧↵</kbd> line · <kbd>esc</kbd> ${isNew ? "discard" : "close"}</span><button class="ok" type="button">${svgIcon("check", 13)} Save</button></div>`;
+      <span class="num">${note.n}</span>
+      <textarea placeholder="Add a comment…" rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
+      ${isNew ? "" : `<button class="del" type="button" title="Delete">${svgIcon("trash", 14)}</button>`}
+      <button class="ok" type="button" title="Save (↵)">${svgIcon("send", 13)}</button>`;
     const ta = popover.querySelector("textarea");
     ta.value = text || "";
     popover.classList.remove("hidden");
-    const grow = () => { ta.style.height = "auto"; ta.style.height = Math.min(180, ta.scrollHeight) + "px"; };
+    // One line, like a chat field; it grows, and turns from a pill into a card, past one.
+    const grow = () => {
+      ta.style.height = "auto";
+      ta.style.height = Math.min(140, ta.scrollHeight) + "px";
+      popover.classList.toggle("multi", ta.scrollHeight > 26);
+    };
     ta.addEventListener("input", grow);
     const url = pageUrl();
     ta.addEventListener("input", () => stashDraft({ url, note, isNew, text: ta.value }));
@@ -831,12 +790,25 @@ svg.ink g.draft { opacity: .9; }
       if (e.key === "Escape") { e.preventDefault(); cancelPopover(isNew); }
     });
     popover.querySelector(".ok").addEventListener("click", commitPopover);
-    popover.querySelector(".del").addEventListener("click", () => { deleteNote(note.id); closePopover(); });
+    const del = popover.querySelector(".del");
+    if (del) del.addEventListener("click", () => { deleteNote(note.id); closePopover(); });
   }
   function placePopover() {
     if (!popNote || popover.classList.contains("hidden")) return;
+    const w = popover.offsetWidth || 320, h = popover.offsetHeight || 44;
+    // A mark's comment sits centred under the mark, or above it when there is no room below.
+    const shape = popNote.shape && shapes.find((s) => s.id === popNote.shape);
+    if (shape) {
+      const b = bbox(shape);
+      const below = b.y + b.h - scrollY + 10;
+      const top = below + h > innerHeight - 12 ? b.y - scrollY - h - 10 : below;
+      popover.style.left = clamp(b.x + b.w / 2 - scrollX - w / 2, 12, innerWidth - w - 12) + "px";
+      popover.style.top = clamp(top, 12, innerHeight - h - 12) + "px";
+      popover.style.setProperty("--ox", "50%");
+      popover.style.setProperty("--oy", "0");
+      return;
+    }
     const px = popNote.x - scrollX, py = popNote.y - scrollY;
-    const w = popover.offsetWidth || 292, h = popover.offsetHeight || 150;
     let left = px + 24, top = py - 14;
     let ox = "0", oy = "0";
     if (left + w > innerWidth - 12) { left = px - 24 - w; ox = "100%"; }
@@ -850,7 +822,7 @@ svg.ink g.draft { opacity: .9; }
     if (!popNote) return;
     const ta = popover.querySelector("textarea");
     const t = (ta.value || "").trim();
-    if (!t) { deleteNote(popNote.id); closePopover(); return; }
+    if (!t) { deleteNote(popNote.id, false, true); closePopover(); return; }
     pushUndo();
     popNote.text = t;
     closePopover();
@@ -858,7 +830,7 @@ svg.ink g.draft { opacity: .9; }
     save();
   }
   function cancelPopover(isNew) {
-    if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true);
+    if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true, true);
     closePopover();
   }
   function closePopover() {
@@ -875,56 +847,36 @@ svg.ink g.draft { opacity: .9; }
   // ---------------------------------------------------------------------------
   function snapshot() { return JSON.stringify({ shapes, notes }); }
   function pushUndo() { undo.push(snapshot()); if (undo.length > 60) undo.shift(); redo.length = 0; renderToolbar(); }
-  function restore(json) { const s = JSON.parse(json); shapes = s.shapes; notes = s.notes; selected = null; renderInk(); renderPins(); save(); renderToolbar(); }
+  function restore(json) { const s = JSON.parse(json); shapes = s.shapes; notes = s.notes; renderInk(); renderPins(); save(); renderToolbar(); }
   function doUndo() { if (!undo.length) return; redo.push(snapshot()); restore(undo.pop()); }
   function doRedo() { if (!redo.length) return; undo.push(snapshot()); restore(redo.pop()); }
   function addShape(s) { pushUndo(); s.ctx = ctxForShape(s); shapes.push(s); renderInk(); save(); }
-  function translateShape(s, o, dx, dy) {
-    if (s.type === "pen") s.points = o.points.map(([x, y]) => [x + dx, y + dy]);
-    else if (s.type === "arrow" || s.type === "line") { s.x1 = o.x1 + dx; s.y1 = o.y1 + dy; s.x2 = o.x2 + dx; s.y2 = o.y2 + dy; }
-    else { s.x = o.x + dx; s.y = o.y + dy; }
-  }
-  function handlesOf(s) {
-    if (s.type === "arrow" || s.type === "line") return [["p1", s.x1, s.y1], ["p2", s.x2, s.y2]];
-    if (s.type === "rect" || s.type === "ellipse") return [["nw", s.x, s.y], ["ne", s.x + s.w, s.y], ["sw", s.x, s.y + s.h], ["se", s.x + s.w, s.y + s.h]];
-    return []; // pen strokes only move
-  }
   // ⇧ on a line or arrow: the free end snaps to 15° steps around the fixed one, keeping its length
   function snap15(ax, ay, x, y) {
     const len = Math.hypot(x - ax, y - ay), step = Math.PI / 12;
     const a = Math.round(Math.atan2(y - ay, x - ax) / step) * step;
     return [Math.round(ax + Math.cos(a) * len), Math.round(ay + Math.sin(a) * len)];
   }
-  function resizeShape(s, o, h, x, y, square) {
-    if (h === "p1") { [s.x1, s.y1] = square ? snap15(o.x2, o.y2, x, y) : [x, y]; return; }
-    if (h === "p2") { [s.x2, s.y2] = square ? snap15(o.x1, o.y1, x, y) : [x, y]; return; }
-    const ax = h.includes("w") ? o.x + o.w : o.x, ay = h.includes("n") ? o.y + o.h : o.y; // the opposite corner stays put
-    let w = Math.max(8, Math.abs(x - ax)), hh = Math.max(8, Math.abs(y - ay));
-    if (square) w = hh = Math.max(w, hh);
-    s.x = x < ax ? ax - w : ax; s.y = y < ay ? ay - hh : ay; s.w = w; s.h = hh;
-  }
-  function deleteSelected() {
-    if (!selected) return;
-    pushUndo();
-    shapes = shapes.filter((s) => s.id !== selected);
-    selected = null;
-    renderInk();
-    save();
-  }
-  function deleteNote(id, silent = false) {
+  // Deleting a mark's comment deletes the mark (keepShape: the comment was only dismissed).
+  function deleteNote(id, silent = false, keepShape = false) {
     if (!silent) pushUndo();
+    const note = notes.find((n) => n.id === id);
     notes = notes.filter((n) => n.id !== id);
+    if (note && note.shape && !keepShape) { shapes = shapes.filter((s) => s.id !== note.shape); renderInk(); }
     renderPins();
     save();
   }
   let creating = false;
-  async function createNote(x, y) {
+  // A comment on a mark (shape) is a note pinned to it: it reports what the mark covers, and
+  // deleting it deletes the mark. Left empty, the note goes and the mark stays.
+  async function createNote(x, y, shape = null) {
     if (creating) return;
     creating = true;
     try {
       let n;
       try { n = (await req("POST", "/note/next")).n; } catch { n = Math.max(0, ...notes.map((k) => k.n)) + 1; }
-      const note = { id: uid(), n, x, y, color: ink.id, text: "", status: "draft", ctx: ctxAtPoint(x, y), batch: null };
+      const note = { id: uid(), n, x, y, color: shape ? shape.color : ink.id, text: "", status: "draft", ctx: shape ? shape.ctx : ctxAtPoint(x, y), batch: null };
+      if (shape) note.shape = shape.id;
       notes.push(note);
       renderPins();
       openPopover(note, true);
@@ -932,7 +884,7 @@ svg.ink g.draft { opacity: .9; }
   }
   async function clearAll() {
     pushUndo();
-    shapes = []; notes = []; selected = null; phase = "idle";
+    shapes = []; notes = []; phase = "idle";
     renderInk(); renderPins(); renderToolbar();
     try { await req("POST", "/clear"); toast("Cleared. Fresh page.", "ok"); } catch (e) { toast(e.message === "busy" ? "Still sending, clear again in a moment." : `Couldn't clear: ${e.message}`); }
   }
@@ -951,12 +903,10 @@ svg.ink g.draft { opacity: .9; }
     host.classList.toggle("draw", m === "draw");
     host.classList.toggle("browse", m === "browse");
     for (const t of TOOLS) host.classList.toggle("t-" + t, m === "draw" && tool === t);
-    if (m === "browse") { selected = null; renderSelection(); }
     renderToolbar();
   }
   function setTool(t) {
     tool = t;
-    if (t !== "select") { selected = null; renderSelection(); }
     setMode("draw");
     applyInk();
   }
@@ -991,7 +941,6 @@ svg.ink g.draft { opacity: .9; }
       ${btn("rect", "Box", "R", tool === "rect" && mode === "draw" ? "on" : "")}
       ${btn("ellipse", "Circle", "E", tool === "ellipse" && mode === "draw" ? "on" : "")}
       ${btn("note", "Note", "N", tool === "note" && mode === "draw" ? "on" : "")}
-      ${btn("select", "Select", "S", tool === "select" && mode === "draw" ? "on" : "")}
       <span class="sep"></span>
       <span class="inks">${INKS.map((i, idx) => `<button class="inkb${ink.id === i.id ? " on" : ""}" type="button" data-ink="${i.id}" style="--c:${i.hex}" aria-label="${i.id} ink" title="${i.id} (${idx + 1})"></button>`).join("")}</span>
       <span class="sep"></span>
@@ -1070,6 +1019,7 @@ svg.ink g.draft { opacity: .9; }
     svg.addEventListener("pointerup", onUp);
     svg.addEventListener("pointercancel", onUp);
     svg.addEventListener("contextmenu", (e) => { if (mode === "draw") e.preventDefault(); });
+    svg.addEventListener("wheel", onWheel, { passive: false });
 
     // Pins: press opens the note, drag moves it (any mode)
     pinsLayer.addEventListener("pointerdown", (e) => {
@@ -1143,7 +1093,6 @@ svg.ink g.draft { opacity: .9; }
     if (off.signal.aborted || location.href === currentUrl) return;
     currentUrl = location.href;
     closePopover();
-    selected = null;
     hydrate();
   }
 
@@ -1152,18 +1101,6 @@ svg.ink g.draft { opacity: .9; }
     if (!popover.classList.contains("hidden")) { commitPopover(); }
     const [x, y] = toDoc(e);
     if (tool === "note") { e.preventDefault(); createNote(x, y); return; }
-    if (tool === "select") {
-      const g = e.composedPath().find((n) => n instanceof Element && n.classList && n.classList.contains("shape"));
-      selected = g ? g.dataset.id : null;
-      renderInk();
-      if (selected) {
-        const s = shapes.find((k) => k.id === selected);
-        drag = { kind: "shape", s, orig: JSON.parse(JSON.stringify(s)), x, y, before: snapshot(), moved: false };
-        svg.setPointerCapture(e.pointerId);
-        e.preventDefault();
-      }
-      return;
-    }
     e.preventDefault();
     svg.setPointerCapture(e.pointerId);
     if (tool === "pen") draft = { id: uid(), type: "pen", color: ink.id, points: [[x, y]] };
@@ -1172,19 +1109,31 @@ svg.ink g.draft { opacity: .9; }
     sizeDoc();
     renderDraft();
   }
-  let drag = null; // { kind: "shape"|"pin", ... } while something is being moved
-  function onMove(e) {
-    if (drag && drag.kind === "shape") {
-      const [x, y] = toDoc(e);
-      const dx = x - drag.x, dy = y - drag.y;
-      if (!drag.moved && Math.hypot(dx, dy) < 3) return;
-      drag.moved = true;
-      host.classList.add("dragging");
-      if (drag.handle) resizeShape(drag.s, drag.orig, drag.handle, x, y, e.shiftKey);
-      else translateShape(drag.s, drag.orig, dx, dy);
-      renderShape(drag.s);
-      return;
+  // The overlay covers the page, so a wheel over it would scroll only the document. Pages that
+  // scroll an inner container (an app shell) get the wheel passed to that container.
+  function onWheel(e) {
+    const target = scrollerAt(e.clientX, e.clientY, e.deltaX, e.deltaY);
+    if (!target) return; // the document itself: the browser scrolls it
+    e.preventDefault();
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+    target.scrollBy({ left: e.deltaX * k, top: e.deltaY * k, behavior: "instant" });
+  }
+  function scrollerAt(cx, cy, dx, dy) {
+    host.style.visibility = "hidden";
+    let el = document.elementFromPoint(cx, cy);
+    host.style.visibility = "";
+    for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const st = getComputedStyle(el);
+      const canY = /(auto|scroll|overlay)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 1;
+      const canX = /(auto|scroll|overlay)/.test(st.overflowX) && el.scrollWidth > el.clientWidth + 1;
+      const moves = (canY && (dy < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1)) ||
+        (canX && (dx < 0 ? el.scrollLeft > 0 : el.scrollLeft + el.clientWidth < el.scrollWidth - 1));
+      if (moves) return el;
     }
+    return null;
+  }
+  let drag = null; // { kind: "pin", ... } while a pin is being moved
+  function onMove(e) {
     if (!draft) return;
     const [x, y] = toDoc(e);
     if (draft.type === "pen") {
@@ -1199,19 +1148,22 @@ svg.ink g.draft { opacity: .9; }
     renderDraft();
   }
   function onUp() {
-    if (drag && drag.kind === "shape") {
-      const d = drag; drag = null;
-      host.classList.remove("dragging");
-      if (d.moved) { undo.push(d.before); if (undo.length > 60) undo.shift(); redo.length = 0; d.s.ctx = ctxForShape(d.s); renderInk(); save(); renderToolbar(); }
-      return;
-    }
     if (!draft) return;
     const d = draft; draft = null;
     let ok = false;
     if (d.type === "pen") ok = d.points.length >= 3;
     else if (d.type === "arrow" || d.type === "line") ok = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) >= 12;
     else { ok = d.w >= 8 && d.h >= 8; delete d._ox; delete d._oy; }
-    if (ok) addShape(d); else renderDraft();
+    if (!ok) { renderDraft(); return; }
+    addShape(d);
+    const [ax, ay] = commentAnchor(d);
+    createNote(ax, ay, d);
+  }
+  // Where a mark's comment pin sits: the end an arrow or line points to, else the box's lower right.
+  function commentAnchor(s) {
+    if (s.type === "arrow" || s.type === "line") return [s.x2, s.y2];
+    const b = bbox(s);
+    return [Math.round(b.x + b.w), Math.round(b.y + b.h)];
   }
   function onKey(e) {
     if (RENDER_ONLY) return;
@@ -1230,7 +1182,6 @@ svg.ink g.draft { opacity: .9; }
     if (k === "v") { setMode(mode === "draw" ? "browse" : "draw"); return; }
     if (k in KEYS) { setTool(KEYS[k]); return; }
     if (/^[1-4]$/.test(k)) { ink = INKS[Number(k) - 1]; applyInk(); renderToolbar(); return; }
-    if ((e.key === "Backspace" || e.key === "Delete") && selected) { e.preventDefault(); deleteSelected(); }
   }
 
   // ---------------------------------------------------------------------------
@@ -1333,7 +1284,7 @@ svg.ink g.draft { opacity: .9; }
           wigglePins(70);
           break;
         case "clear":
-          shapes = []; notes = []; selected = null; phase = "idle"; undo.length = 0; redo.length = 0;
+          shapes = []; notes = []; phase = "idle"; undo.length = 0; redo.length = 0;
           totals = { notes: 0, shapes: 0, pages: 0, unsent: 0, open: 0, batches: 0 };
           closePopover(); renderInk(); renderPins(); renderToolbar();
           break;
@@ -1344,7 +1295,7 @@ svg.ink g.draft { opacity: .9; }
   // ---------------------------------------------------------------------------
   // Public hooks for the server
   // ---------------------------------------------------------------------------
-  api.capture = (on) => { if (!host) return; host.classList.toggle("capturing", !!on); if (on) { selected = null; renderSelection(); } };
+  api.capture = (on) => { if (!host) return; host.classList.toggle("capturing", !!on); };
 
   // Removes the overlay and everything it hooked into the page. Unsaved edits are saved first.
   api.unmount = async () => {
