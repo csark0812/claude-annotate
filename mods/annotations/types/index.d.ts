@@ -6,6 +6,8 @@ export type Note = {
   status?: NoteStatus
   result?: string
   batch?: number
+  /** The overlay's ink: pink, sun, cyan or lime. */
+  color?: string
 }
 
 export type Page = { url: string; notes: Note[]; shapes: number }
@@ -19,6 +21,6 @@ export type Overview =
 
 declare module 'claude-code' {
   interface PluginState {
-    annotations: { overview: Overview; error: string | null }
+    annotations: { overview: Overview; error: string | null; confirmClear: boolean }
   }
 }

@@ -45,9 +45,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
 
     const ui = await $.ui.mount({ plugin: 'annotations', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
-    expect((await ui.find({ text: /make this blue/ }))?.text).toContain('1. make this blue')
+    expect((await ui.find({ text: /make this blue/ }))?.text).toContain('1make this blueDone')
     expect((await ui.find({ text: /changed to blue/ }))).toBeDefined()
-    expect((await ui.find({ key: 'send' }))?.props.label).toBe('Send 1')
+    expect((await ui.find({ key: 'send' }))?.props.label).toBe('Send 1 to Claude')
+    expect((await ui.find({ text: /Unsent/ }))).toBeDefined()
 
     await ui.press({ key: `delete:${PAGE}#2` })
 
@@ -93,7 +94,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(out.text).toContain('1. make this blue')
   })
 
-  test(`${surface}: /annotations lists the notes as text even when the pane is placed`, async ($, on) => {
+  test(`${surface}: /annotations prints nothing when the pane opens`, async ($, on) => {
     on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n4242\n', stderr: '' } }) as never)
     on('fs.exists', (_$, e) => ({ value: e.path === SESSIONS || e.path === `${SESSIONS}/4242.json` }))
     on('fs.read', () => ({ value: JSON.stringify(BRIDGE) }))
@@ -119,7 +120,52 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
     const out = await $.command.run({ command: 'annotations', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
 
-    expect(out.text).not.toContain('No pane here')
-    expect(out.text).toContain('1. make this blue')
+    expect(out.text).toBeUndefined()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: Clear all asks first, then clears through the bridge`, async ($, on) => {
+    let notes = [{ n: 1, text: 'make this blue', color: 'cyan' }]
+    const posted: string[] = []
+
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n4242\n', stderr: '' } }) as never)
+    on('fs.exists', (_$, e) => ({ value: e.path === SESSIONS || e.path === `${SESSIONS}/4242.json` }))
+    on('fs.read', () => ({ value: JSON.stringify(BRIDGE) }))
+    on('fs.list', () => ({ value: [] }))
+    on('clock.every', () => ({ value: undefined }))
+    on('command.register', () => ({ value: { command: 'annotations' } }))
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('ui.status', () => ({ value: undefined }))
+    on('http.fetch', (_$, e) => {
+      posted.push(e.url)
+      if (e.url.endsWith('/clear')) {
+        notes = []
+        return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+      }
+      return { value: {
+        status: 200,
+        ok: true,
+        headers: {},
+        text: JSON.stringify({
+          ok: true,
+          mode: 'chat',
+          totals: { notes: notes.length, shapes: 0, pages: notes.length ? 1 : 0, unsent: notes.length, open: 0, batches: 0 },
+          pages: notes.length ? [{ url: PAGE, notes, shapes: 0 }] : [],
+          batches: [],
+        }),
+      } }
+    })
+
+    await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
+    const ui = await $.ui.mount({ plugin: 'annotations', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
+
+    await ui.press({ key: 'clear' })
+    expect(posted.some(u => u.endsWith('/clear'))).toBe(false)
+    expect(await ui.find({ text: /Clear every note/ })).toBeDefined()
+
+    await ui.press({ key: 'clear-yes' })
+    expect(posted.some(u => u.endsWith('/clear'))).toBe(true)
+    expect(await ui.find({ text: /No annotations yet/ })).toBeDefined()
   })
 }

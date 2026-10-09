@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Color, EngineInterface, Register } from 'claude-code'
 
 import type { Note, Overview, Page } from '../types'
 
@@ -8,11 +8,26 @@ const POLL_MS = 2000
 
 const overview = atom({ plugin: 'annotations', key: 'overview' } as const, { kind: 'no-server' } as Overview)
 const lastError = atom({ plugin: 'annotations', key: 'error' } as const, null as string | null)
+const confirmClear = atom({ plugin: 'annotations', key: 'confirmClear' } as const, false)
 
 /** The annotate server this session started: its HTTP bridge and token. */
 type Bridge = { endpoint: string; token: string }
 
 const STATUS_MARK: Record<string, string> = { pending: '○', working: '◐', done: '●', skipped: '⊘' }
+
+/** Where a note stands, the unsent ones included. */
+type NoteState = 'unsent' | 'pending' | 'working' | 'done' | 'skipped'
+const STATUS: Record<NoteState, { label: string; color: Color }> = {
+  unsent: { label: 'Unsent', color: 'subtle' },
+  pending: { label: 'Queued', color: 'inactive' },
+  working: { label: 'Working', color: 'claude' },
+  done: { label: 'Done', color: 'success' },
+  skipped: { label: 'Skipped', color: 'warning' },
+}
+const noteStatus = (note: Note): NoteState => (!note.batch ? 'unsent' : note.status ?? 'pending')
+
+/** The overlay's ink colors. */
+const INK: Record<string, Color> = { pink: '#FF4D8D', sun: '#FFD23F', cyan: '#35D7FF', lime: '#9BFF4D' }
 
 // Module variables: a hot reload starts them over, and the next poll finds the server again.
 let bridge: Bridge | null = null
@@ -32,70 +47,117 @@ export const register: Register = on => {
   on('command.run', { command: 'annotations' }, async $ => {
     await refresh($, cwd)
     const opened = await $.ui.open({ id: PANE, title: 'Annotations' })
+    if (opened.isPlaced) return {}
+
+    // No pane on this surface: say why, and list the notes here instead.
     const now = await read($, overview)
-    if (now.kind !== 'linked') return { text: 'Annotations: no annotate server in this session yet.' }
-    // The notes go in the text too: a headless host (the desktop app's Code tab) reports the pane
-    // as placed but draws nothing, and an older desktop says it placed none.
-    const head = `Annotations: ${statusLine(now.totals)}.${opened.isPlaced ? '' : ` No pane here: ${opened.reason}`}`
-    return { text: [head, ...noteLines(now.pages)].join('\n') }
+    if (now.kind !== 'linked') return { text: 'Annotations: the annotate plugin is not running in this session.' }
+    return { text: [`Annotations: ${statusLine(now.totals)}. No pane here: ${opened.reason}`, ...noteLines(now.pages)].join('\n') }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Link } = $.ui.resolve(e)
     const now = await read($, overview)
     const error = await read($, lastError)
+    const confirming = await read($, confirmClear)
+    const width = e.props.bodyColumns
 
     if (now.kind === 'no-server') {
       return (
-        <Box flexDirection="column">
-          <Text dimColor>No annotate server in this session.</Text>
-          <Text dimColor>Ask Claude to open a page with annotate, then come back.</Text>
+        <Box flexDirection="column" gap={1}>
+          <Text>
+            <Text color="error">●</Text> Not connected
+          </Text>
+          <Text dimColor wrap="wrap">
+            The annotate plugin isn't running in this session. Start a new session after installing or updating it.
+          </Text>
         </Box>
       )
     }
 
     const { totals } = now
-    const notesOf = (page: Page) =>
-      page.notes.map((note: Note) => (
-        <Box key={`${page.url}#${note.n}`} flexDirection="row">
-          <Box flexGrow={1} flexDirection="column">
-            <Text>
-              {STATUS_MARK[note.status ?? ''] ?? '·'} {note.n}. {clip(note.text || '(no text)', 160)}
-            </Text>
-            {note.result && <Text dimColor>  → {clip(note.result, 160)}</Text>}
+    const hasAnything = totals.notes + totals.shapes > 0
+
+    const header = (
+      <Box flexDirection="column">
+        <Text>
+          <Text color="success">●</Text> Connected <Text dimColor>· {now.mode} delivery</Text>
+        </Text>
+        {hasAnything && <Text dimColor wrap="wrap">{summary(totals)}</Text>}
+      </Box>
+    )
+
+    const actions = !hasAnything ? null : confirming ? (
+      <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+        <Text color="warning">Clear every note and mark on every page?</Text>
+        <Button key="clear-yes" label="Clear all" variant="primary" onPress={() => clearAll($)} />
+        <Button key="clear-no" label="Cancel" onPress={() => update($, confirmClear, () => false)} />
+      </Box>
+    ) : (
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        {totals.unsent > 0 && (
+          <Button key="send" label={`Send ${totals.unsent} to Claude`} variant="primary" onPress={() => act($, cwd, 'POST', '/send')} />
+        )}
+        <Button key="clear" label="Clear all" onPress={() => update($, confirmClear, () => true)} />
+      </Box>
+    )
+
+    const noteRow = (page: Page, note: Note) => {
+      const st = STATUS[noteStatus(note)]
+      return (
+        <Box key={`${page.url}#${note.n}`} flexDirection="column" paddingLeft={1}>
+          <Box flexDirection="row" gap={1}>
+            <Text color={INK[note.color ?? ''] ?? 'text'}>●</Text>
+            <Text bold>{note.n}</Text>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text wrap="wrap">{note.text || '(no text)'}</Text>
+            </Box>
+            <Text color={st.color}>{st.label}</Text>
+            <Button
+              key={`delete:${page.url}#${note.n}`}
+              label="×"
+              plain
+              dimColor
+              hover={{ dimColor: false, color: 'error' }}
+              onPress={() => act($, cwd, 'POST', '/note/delete', { url: page.url, n: note.n })}
+            />
           </Box>
-          <Button
-            key={`delete:${page.url}#${note.n}`}
-            label="Delete"
-            plain
-            onPress={() => act($, cwd, 'POST', '/note/delete', { url: page.url, n: note.n })}
-          />
+          {note.result && (
+            <Box paddingLeft={4}>
+              <Text dimColor wrap="wrap">→ {note.result}</Text>
+            </Box>
+          )}
         </Box>
-      ))
+      )
+    }
+
+    const pageBlock = (page: Page) => (
+      <Box key={page.url} flexDirection="column" marginTop={1}>
+        <Box flexDirection="row" gap={1} flexWrap="wrap">
+          <Link href={page.url} label={clip(shortUrl(page.url), Math.max(24, width - 24))} />
+          <Text dimColor>
+            · {plural(page.notes.length, 'note')}
+            {page.shapes > 0 ? ` · ${plural(page.shapes, 'mark')}` : ''}
+          </Text>
+        </Box>
+        {[...page.notes].sort((a, b) => a.n - b.n).map(note => noteRow(page, note))}
+      </Box>
+    )
 
     return (
-      <Box flexDirection="column">
-        <Text dimColor>
-          {statusLine(totals)} · delivery: {now.mode}
-        </Text>
-        <Box flexDirection="row">
-          {totals.unsent > 0 && (
-            <Button key="send" label={`Send ${totals.unsent}`} variant="primary" onPress={() => act($, cwd, 'POST', '/send')} />
-          )}
-          {totals.notes + totals.shapes > 0 && (
-            <Button key="clear" label="Clear all" onPress={() => act($, cwd, 'POST', '/clear')} />
-          )}
-          <Button key="refresh" label="Refresh" onPress={() => refresh($, cwd)} />
-        </Box>
-        {error && <Text color="red">{error}</Text>}
-        {now.pages.length === 0 && <Text dimColor>No annotations yet. Draw on the page, then come back.</Text>}
-        {now.pages.map(page => (
-          <Box key={page.url} flexDirection="column" marginTop={1}>
-            <Text bold>{clip(page.url, 80)}</Text>
-            {page.notes.length === 0 && <Text dimColor>{page.shapes} marks, no notes</Text>}
-            {notesOf(page)}
+      <Box flexDirection="column" gap={1}>
+        {header}
+        {actions}
+        {error && <Text color="error" wrap="wrap">{error}</Text>}
+        {!hasAnything && (
+          <Box flexDirection="column" gap={1}>
+            <Text bold>No annotations yet</Text>
+            <Text dimColor wrap="wrap">
+              In Chrome, turn on annotation mode from the Claude Annotate toolbar button (⌥⇧A), or ask Claude to /annotate a URL. Notes you pin show up here.
+            </Text>
           </Box>
-        ))}
+        )}
+        {now.pages.map(pageBlock)}
       </Box>
     )
   })
@@ -175,6 +237,30 @@ function noteLines(pages: Page[]) {
     page.url,
     ...page.notes.map(note => `  ${STATUS_MARK[note.status ?? ''] ?? '·'} ${note.n}. ${clip(note.text || '(no text)', 160)}`),
   ])
+}
+
+async function clearAll($: EngineInterface) {
+  await update($, confirmClear, () => false)
+  await act($, cwd, 'POST', '/clear')
+}
+
+function summary(t: { notes: number; pages: number; unsent: number; open: number; shapes: number }) {
+  const parts = [plural(t.notes, 'note'), plural(t.pages, 'page')]
+  if (t.shapes) parts.push(plural(t.shapes, 'mark'))
+  if (t.unsent) parts.push(`${t.unsent} unsent`)
+  if (t.open) parts.push(`${t.open} in progress`)
+  return parts.join(' · ')
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+function shortUrl(url: string) {
+  try {
+    const u = new URL(url)
+    return `${u.host}${u.pathname === '/' ? '' : u.pathname}${u.search}`
+  } catch {
+    return url
+  }
 }
 
 function clip(text: string, max: number) {
