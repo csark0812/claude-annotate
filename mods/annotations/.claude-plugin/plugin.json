@@ -1,6 +1,0 @@
-{
-  "name": "annotations",
-  "version": "0.1.0",
-  "description": "See, send, delete and clear this session's browser annotations from a Claude Code pane.",
-  "types": "./types/index.d.ts"
-}

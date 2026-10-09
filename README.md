@@ -199,13 +199,12 @@ Not there yet: marks inside iframes, pages that scroll a wrapper instead of the 
 
 To have an agent do the setup, point it at [INSTALL.md](INSTALL.md).
 
-### Annotations pane (Claude Code mod)
+### Annotations pane
 
-`mods/annotations` is a Claude Code mod that shows this session's annotations in a pane, in the terminal and in the desktop app. It lists each page's notes with their status and Claude's reply, and has Send, Clear all and a Delete per note. Run `/annotations` to open it; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
+The plugin includes a pane that shows this session's annotations, in the terminal and in the desktop app (`hooks/pane.tsx`, a Claude Code hooks module next to the plugin's classic hooks). It lists each page's notes with their status and Claude's reply, and has Send, Clear all and a Delete per note. Run `/annotations` to open it; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
 
 ```sh
-/plugin install annotations --marketplace csark0812/claude-annotate
-claude plugin test mods/annotations             # the mod's own tests
+claude plugin test .             # the pane's tests (tests/pane.test.tsx)
 ```
 
 ## Credits

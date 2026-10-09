@@ -6,9 +6,9 @@ import type { Note, Overview, Page } from '../types'
 const PANE = 'annotations'
 const POLL_MS = 2000
 
-const overview = atom({ plugin: 'annotations', key: 'overview' } as const, { kind: 'no-server' } as Overview)
-const lastError = atom({ plugin: 'annotations', key: 'error' } as const, null as string | null)
-const confirmClear = atom({ plugin: 'annotations', key: 'confirmClear' } as const, false)
+const overview = atom({ plugin: 'annotate', key: 'overview' } as const, { kind: 'no-server' } as Overview)
+const lastError = atom({ plugin: 'annotate', key: 'error' } as const, null as string | null)
+const confirmClear = atom({ plugin: 'annotate', key: 'confirmClear' } as const, false)
 
 /** The annotate server this session started: its HTTP bridge and token. */
 type Bridge = { endpoint: string; token: string }

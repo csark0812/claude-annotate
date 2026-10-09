@@ -44,7 +44,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
 
-    const ui = await $.ui.mount({ plugin: 'annotations', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
+    const ui = await $.ui.mount({ plugin: 'annotate', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
     expect((await ui.find({ text: /make this blue/ }))?.text).toContain('1make this blueDone')
     expect((await ui.find({ text: /changed to blue/ }))).toBeDefined()
     expect((await ui.find({ key: 'send' }))?.props.label).toBe('Send 1 to Claude')
@@ -158,7 +158,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     })
 
     await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
-    const ui = await $.ui.mount({ plugin: 'annotations', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
+    const ui = await $.ui.mount({ plugin: 'annotate', surface, component: 'Pane', props: {} as never, requestId: 'annotations' })
 
     await ui.press({ key: 'clear' })
     expect(posted.some(u => u.endsWith('/clear'))).toBe(false)

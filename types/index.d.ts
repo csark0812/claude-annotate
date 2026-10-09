@@ -21,6 +21,6 @@ export type Overview =
 
 declare module 'claude-code' {
   interface PluginState {
-    annotations: { overview: Overview; error: string | null; confirmClear: boolean }
+    annotate: { overview: Overview; error: string | null; confirmClear: boolean }
   }
 }
