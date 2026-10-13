@@ -1,6 +1,6 @@
 {
   "name": "claude-annotate-plugin",
-  "version": "0.5.3-local",
+  "version": "0.6.0-local",
   "private": true,
   "type": "module",
   "description": "Channel server, browser driver and overlay for the Annotate plugin.",
@@ -13,6 +13,7 @@
   },
   "scripts": {
     "test": "node test/smoke.mjs",
-    "extension:install": "node scripts/install-extension.mjs"
+    "extension:install": "node scripts/install-extension.mjs",
+    "test:journeys": "node test/journeys.mjs"
   }
 }

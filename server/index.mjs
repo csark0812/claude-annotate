@@ -68,7 +68,9 @@ const state = {
   shotWaiters: new Map(), // annotate_screenshot through the extension: request id -> resolve(image data URL | null)
 };
 const EXT_SHOT_MS = 4000; // how long annotate_screenshot waits for an annotating tab before it tries Chrome's debugging port
-const VIDEO_MAX_FRAMES = 12; // a recording reaches Claude as at most this many stills
+const VIDEO_MAX_FRAMES = 24; // a recording reaches Claude as at most this many stills
+const VIDEO_SCAN_FPS = 2; // stills are cut at this rate, then the telling ones kept
+const VIDEO_AFTER_S = 0.7; // a still this long after each action shows what it did
 const VIEW_FRESH_MS = 30 * 60000; // the page's Add to chat uploads its view; the notes may wait in the chat's bar this long before they go
 const TAB_SEND_MS = 5000; // how long a Send from the sidebar waits for the visible tab before it builds without it
 
@@ -386,8 +388,11 @@ function renderContent(batch, sections) {
       if (cluster) out += `crop: ${cluster.path}  (region ${cluster.clip.x},${cluster.clip.y} → ${cluster.clip.width}×${cluster.clip.height})\n`;
       if (sec.previews.has(note.id)) out += `crop: ${sec.previews.get(note.id)}  (the tab around this note when it was written)\n`;
       if (note.video && note.video.file) {
-        out += `video: ${note.video.file}  (${Math.round(note.video.duration || 0)} s screen recording of the tab; the note is about what happens in it)\n`;
-        if (note.video.frames && note.video.frames.length) out += `frames (in order, read them all): ${note.video.frames.join(" ")}\n`;
+        out += `video: ${note.video.file}  (${Math.round(note.video.duration || 0)} s recording of the tab while the user used it; the note is about what happens in it. The red edge and the Recording pill are the recorder's own, not the page's)\n`;
+        if (Array.isArray(note.video.timeline) && note.video.timeline.length) {
+          out += `timeline (what the user did, with stills; read every still):\n${note.video.timeline.map((l) => `  ${l}`).join("\n")}\n`;
+        } else if (note.video.frames && note.video.frames.length) out += `frames (in order, read them all): ${note.video.frames.join(" ")}\n`;
+        if (note.video.noStills) out += `no stills (${note.video.noStills}): read the video file directly if you can.\n`;
       }
       out += `pin at ${Math.round(note.x)},${Math.round(note.y)} · ${note.color}\n`;
       out += fmtCtx(note.ctx);
@@ -607,9 +612,47 @@ async function shotFromTab(args) {
   return m ? { buf: Buffer.from(m[2], "base64"), ext: m[1] === "jpeg" ? "jpg" : "png" } : null;
 }
 
-// A screen recording from the page: kept as a file, and cut into stills Claude can read.
-const run = (cmd, argv) => new Promise((resolve, reject) => execFile(cmd, argv, { timeout: 60000 }, (e, out) => (e ? reject(e) : resolve(out))));
-async function saveVideo(dataUrl, duration) {
+// A screen recording from the page: kept as a file, and cut into stills Claude can read. The stills
+// are the first and last moments, one just after each thing the user did, and evenly spaced ones
+// between; the timeline puts what the user did and the stills in one order.
+const run = (cmd, argv) => new Promise((resolve, reject) => execFile(cmd, argv, { timeout: 120000 }, (e, out) => (e ? reject(e) : resolve(out))));
+const EVENT_KINDS = new Set(["click", "change", "type", "key", "submit", "navigate", "reload", "error"]);
+function cleanEvents(events, secs) {
+  if (!Array.isArray(events)) return [];
+  const str = (v, n) => (v == null ? undefined : String(v).replace(/\s+/g, " ").slice(0, n));
+  return events
+    .filter((e) => e && EVENT_KINDS.has(e.kind) && Number.isFinite(Number(e.t)))
+    .map((e) => ({ t: Math.max(0, Math.min(secs, Number(e.t))), kind: e.kind, on: str(e.on, 200), url: str(e.url, 300), key: str(e.key, 30), value: str(e.value, 80), text: str(e.text, 200) }))
+    .sort((a, b) => a.t - b.t)
+    .slice(0, 300);
+}
+// Which of `count` scanned stills (one every 1/fps s) to keep: index → why.
+function pickStills(count, events) {
+  const keep = new Map();
+  if (!count) return keep;
+  const at = (t) => Math.max(0, Math.min(count - 1, Math.round(t * VIDEO_SCAN_FPS)));
+  keep.set(0, "start");
+  keep.set(count - 1, "end");
+  const after = events.filter((e) => e.kind !== "error").map((e) => at(e.t + VIDEO_AFTER_S));
+  for (const i of after) if (!keep.has(i)) keep.set(i, "after");
+  // Too many actions: keep an even spread of them.
+  if (keep.size > VIDEO_MAX_FRAMES) {
+    const actions = [...keep.keys()].filter((i) => keep.get(i) === "after").sort((a, b) => a - b);
+    const room = VIDEO_MAX_FRAMES - 2;
+    const kept = new Set(Array.from({ length: room }, (_, k) => actions[Math.floor((k * actions.length) / room)]));
+    for (const i of actions) if (!kept.has(i)) keep.delete(i);
+  }
+  // Room left: fill the longest gaps.
+  while (keep.size < Math.min(VIDEO_MAX_FRAMES, count)) {
+    const sorted = [...keep.keys()].sort((a, b) => a - b);
+    let best = -1, gap = 1;
+    for (let k = 1; k < sorted.length; k++) if (sorted[k] - sorted[k - 1] > gap) { gap = sorted[k] - sorted[k - 1]; best = k; }
+    if (best < 0) break;
+    keep.set(Math.round((sorted[best] + sorted[best - 1]) / 2), "between");
+  }
+  return keep;
+}
+async function saveVideo(dataUrl, duration, events) {
   const m = /^data:video\/(webm|mp4)[^,]*;base64,(.+)$/.exec(String(dataUrl || ""));
   if (!m) throw new Error("a webm or mp4 data URL is required");
   const id = crypto.randomBytes(4).toString("hex");
@@ -618,15 +661,44 @@ async function saveVideo(dataUrl, duration) {
   const file = path.join(dir, `recording.${m[1]}`);
   await fsp.writeFile(file, Buffer.from(m[2], "base64"));
   const secs = Math.max(1, Number(duration) || 1);
-  const fps = Math.min(2, VIDEO_MAX_FRAMES / secs);
-  let frames = [];
+  const actions = cleanEvents(events, secs);
+  const stills = [];
+  let noStills = null;
+  const scan = path.join(dir, "scan");
   try {
-    await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-vf", `fps=${fps.toFixed(3)},scale='min(1280,iw)':-2`, "-frames:v", String(VIDEO_MAX_FRAMES), path.join(dir, "frame-%02d.jpg")]);
-    frames = (await fsp.readdir(dir)).filter((f) => f.startsWith("frame-")).sort().map((f) => path.join(dir, f));
+    await fsp.mkdir(scan);
+    await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-vf", `fps=${VIDEO_SCAN_FPS},scale='min(1280,iw)':-2`, "-q:v", "4", path.join(scan, "%05d.jpg")]);
+    const all = (await fsp.readdir(scan)).filter((f) => f.endsWith(".jpg")).sort();
+    const keep = pickStills(all.length, actions);
+    let n = 0;
+    for (const i of [...keep.keys()].sort((a, b) => a - b)) {
+      const t = Math.min(secs, i / VIDEO_SCAN_FPS);
+      const out = path.join(dir, `frame-${String(++n).padStart(2, "0")}-${t.toFixed(1)}s.jpg`);
+      await fsp.rename(path.join(scan, all[i]), out);
+      stills.push({ t, path: out });
+    }
   } catch (e) {
-    log(`video stills: none (${e.code === "ENOENT" ? "ffmpeg is not installed" : "ffmpeg could not read the recording"})`);
+    noStills = e.code === "ENOENT" ? "ffmpeg is not installed" : "ffmpeg could not read the recording";
+    log(`video stills: none (${noStills})`);
   }
-  return { id, file, frames, duration: secs };
+  await fsp.rm(scan, { recursive: true, force: true }).catch(() => {});
+  return { id, file, frames: stills.map((f) => f.path), duration: secs, timeline: timelineOf(actions, stills), noStills };
+}
+// One line per action and still, in time order: "0:03.2  click <button.save> "Save"".
+function timelineOf(actions, stills) {
+  const clock = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+  const what = (e) => {
+    if (e.kind === "navigate" || e.kind === "reload") return `${e.kind} ${e.url}`;
+    if (e.kind === "error") return `page error: ${e.text}`;
+    if (e.kind === "key") return `key ${e.key}${e.on ? ` in ${e.on}` : ""}`;
+    if (e.kind === "type") return `typed in ${e.on} (the text is not recorded)`;
+    if (e.kind === "change") return `changed ${e.on}${e.value ? ` → ${e.value}` : ""}`;
+    return `${e.kind} ${e.on || ""}`.trim();
+  };
+  return [
+    ...actions.map((e) => ({ t: e.t, o: 0, line: what(e) })),
+    ...stills.map((f) => ({ t: f.t, o: 1, line: `still ${f.path}` })),
+  ].sort((a, b) => a.t - b.t || a.o - b.o).map((x) => `${clock(x.t)}  ${x.line}`);
 }
 
 // The chat open in Claude Code may have changed (the desktop app rewrites its record of a chat when
@@ -971,7 +1043,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/video") {
       const body = JSON.parse((await readBody(req, 60e6)) || "{}");
-      try { return json(res, 200, { ok: true, video: await saveVideo(body.data, body.duration) }); }
+      try { return json(res, 200, { ok: true, video: await saveVideo(body.data, body.duration, body.events) }); }
       catch (e) { return json(res, 400, { ok: false, error: e.message }); }
     }
     if (req.method === "POST" && url.pathname === "/send") {

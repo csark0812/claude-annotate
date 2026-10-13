@@ -80,21 +80,25 @@ Per note that is: your text, the element under the pin with its visible text and
 | **Click** | Marks the element under the pointer. Pointing outlines it, inside iframes too (nested, and from other sites once you allow it), and a pin follows the pointer. The pin drops where you click; the note carries that element and the frame path to it. |
 | **Drag** | Selects an area. The pin drops where you let go; the area keeps a faint fill. |
 | **Comment** | A pill opens beside the pin: `↵` saves, `⇧↵` breaks the line, `esc` drops it while it is empty. Hover a pin to read its comment; click it to retype, delete, Cancel or Save. Pins drag. `⌘Z` and `⇧⌘Z` undo and redo. |
-| **Space** | Hold it to use the page (open a menu, scroll, type), let go to annotate again. |
+| **Held page** | While annotating, the page stays as it was when you turned annotating on: hover and focus styles stay applied, and the page never hears the pointer, focus or keys leave. A hover menu, a tooltip, a focused field and its suggestions stay open while you click and comment on them. The bar says *Hover held* or *Focus held*. |
+| **Space** | Hold it to use the page (open a menu, scroll, type), let go to annotate again: the page is held as it is at that moment. |
 | **Across pages** | Notes are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
-| **Bar** | At the bottom: *Annotating · N*, Take a screenshot (the view in front of you becomes a note), Record the tab (up to a minute; Claude gets the video and stills from it), Hide markers, Discard annotations (asks first), the chat the notes go to, **Add to chat**, and `×` to leave annotation mode. Drag it by its grip; it remembers where per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost. |
+| **Bar** | At the bottom: *Annotating · N*, Take a screenshot (the view in front of you becomes a note), Record the tab (see **Record**), Hide markers, Discard annotations (asks first), the chat the notes go to, **Add to chat**, and `×` to leave annotation mode. Drag it by its grip; it remembers where per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost. |
+| **Record** | Records the tab while you use it as normal: no pen, no pins, nothing held. A red edge around the tab, a *Recording 0:12* pill with **Stop** and a trash, and a red *REC* on the extension's icon say it is recording. It goes on across page loads, for up to 3 minutes. Stop it with the pill, the icon or `⌥⇧R`; it becomes a note on the page with the comment box open. Claude gets the video, stills cut just after each thing you did, and a timeline: clicks, choices, keys, page loads and page errors with the element and source line each one was on. What you type is not recorded. `⌥⇧R` also starts a recording from any tab. |
 | **Add to chat** | Puts the notes in the bar above the prompt in Claude Code, with a picture of the tab; they go to Claude with the next message you send there. `⌘↵` does the same. |
 | **Which chat** | The chat open in the Claude desktop app, following you as you switch (outside the app: the one you typed in last). The bar says which, *To Annotations · applications*; click it to pin another chat for this tab, or to follow the open chat again. |
 | **Prompt bar** | Above the chat box, one chip says how many annotations wait for your next message, with small pictures of their pages and, under it, what they say (two lines). **Send** sends them with nothing typed; or type a message and they go with it. Press the chip to list them, each with its picture, the element it is on and a trash; its `✕` discards them all after asking. `/annotations` lists the notes as text. |
 | **Progress** | The page shows which note Claude is on and which file it is editing. |
 
-Keys: hold `Space` to use the page · `esc` leaves annotation mode · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included.
+Keys: hold `Space` to use the page · `⌥⇧R` records the tab, again to stop · `esc` leaves annotation mode · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included.
 
 ## Chrome extension
 
 The extension is how you annotate: it puts the toolbar on any tab you already have open, your dev server, a deployed copy of your app, or a site you want yours to look like. Click its toolbar icon to annotate the tab, and click again to go back to the page. Notes go to the chat open in the Claude desktop app (outside it, the session you typed in last); the bar's **To** pill says which, and picks another.
 
-To mark up a hover state (a menu, a tooltip, a hover style), point at it and press `⌥⇧A` instead of clicking the icon. The toolbar comes up with that hover held: hover styles stay applied and the page never hears the pointer leave, until you turn annotation off. Hover styles from stylesheets on another origin can't be held.
+To mark up a hover state (a menu, a tooltip, a hover style), point at it and press `⌥⇧A` instead of clicking the icon: the toolbar comes up with that hover held. Whatever has focus is held too, either way. Or turn annotating on, hold Space, open the menu, and let go. Hover and focus styles from stylesheets on another origin, or inside a page's own shadow roots, can't be held.
+
+Recording uses Chrome's tab capture, so there is no share picker and it goes on across page loads. Chrome allows that on a tab after you used the icon or a shortcut on that site there; otherwise the page records itself through Chrome's share prompt, and a full page load ends that recording. The extension asks for the `tabCapture` and `offscreen` permissions for this. If `⌥⇧R` does nothing, set it at `chrome://extensions/shortcuts`.
 
 The element picker reads inside iframes. Same-origin frames work as they are; a frame from another site (an embedded document viewer, say) needs the extension's access there: right-click the icon and pick **Allow inside embedded frames on all sites** once. Without it, that frame is picked as a whole.
 
@@ -186,6 +190,7 @@ The bridge listens on `127.0.0.1` only and every request needs the session token
 ```sh
 npm install                                     # only for a checkout; an installed plugin gets its packages from Claude Code
 npm test                                        # syntax, MCP handshake, bridge, hook, cleanup. No browser.
+npm run test:journeys                           # the extension in Playwright's Chromium: held page, recording. HEADED=1 to watch, ONLY=2 for one
 claude --plugin-dir . --dangerously-load-development-channels plugin:annotate@claude-annotate
 ```
 

@@ -9,6 +9,8 @@
 //  - Any other page: in this extension's isolated world. The page's scripts can't see it, and
 //    its requests go through this worker (the "annotate" port), so the token never enters the page.
 // Off: unmount it. A tab that is on stays on across reloads and navigations.
+// Recording: one tab at a time is recorded with tabCapture into an offscreen document while the user
+// uses the page; the overlay shows that it is recording and gets the video as a note when it stops.
 
 const HOST = "com.claude_annotate.host";
 const INSTALL_HINT = "Run `npm run extension:install` in the claude-annotate repo, then reload this extension.";
@@ -100,15 +102,20 @@ async function unmountOverlay(tabId) {
 }
 
 // Records the tab's session first: an isolated overlay asks for it over the port as soon as it runs.
-// freezeHover: hold what the pointer rests on hovered (turned on from the keyboard).
 // carry: unsent marks and comments brought over from the chat the tab sent to before.
-async function mountOverlay(tabId, url, session, { freezeHover = false, carry = null, automatic = true } = {}) {
+// A tab being recorded gets the overlay in recording mode; one whose recording was saved while its
+// page was loading gets the video to make a note of.
+async function mountOverlay(tabId, url, session, { carry = null, automatic = true } = {}) {
   await unmountOverlay(tabId); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
   const version = chrome.runtime.getManifest().version;
   const local = isLocalUrl(url);
   const world = local ? "MAIN" : "ISOLATED";
-  const common = { renderOnly: false, version, startMode: "draw", freezeHover, sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry };
+  const rec = await getRecording();
+  const recording = rec?.tabId === tabId ? { startedAt: rec.startedAt, phase: rec.phase } : null;
+  const recordingSaved = recording ? null : (await savedVideos())[tabId] ?? null;
+  if (recording) await showRecording(tabId, true); // a page load clears the tab's badge
+  const common = { renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved };
   const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
@@ -165,9 +172,39 @@ function relayPage() {
     try { choice = JSON.parse(e.detail); } catch { return; }
     try { chrome.runtime.sendMessage({ type: "choose", pid: choice.pid ?? null, carry: choice.carry ?? null, auto: !!choice.auto, follow: !!choice.follow }); } catch { /* reloaded */ }
   });
+  // Recording: "rec-start" is answered by "rec-started", JSON { ok, startedAt } or { ok: false, error, code }.
+  document.addEventListener("claude-annotate:rec-start", async () => {
+    let answer = "";
+    try { answer = JSON.stringify(await chrome.runtime.sendMessage({ type: "rec-start" })); } catch { /* reloaded */ }
+    document.dispatchEvent(new CustomEvent("claude-annotate:rec-started", { detail: answer }));
+  });
+  document.addEventListener("claude-annotate:rec-stop", (e) => {
+    let cancel = false;
+    try { cancel = !!JSON.parse(e.detail).cancel; } catch { /* stop */ }
+    try { chrome.runtime.sendMessage({ type: "rec-stop", cancel }); } catch { /* reloaded */ }
+  });
+  document.addEventListener("claude-annotate:rec-event", (e) => {
+    try { chrome.runtime.sendMessage({ type: "rec-event", event: JSON.parse(e.detail) }); } catch { /* reloaded */ }
+  });
+  document.addEventListener("claude-annotate:rec-taken", () => {
+    try { chrome.runtime.sendMessage({ type: "rec-taken" }); } catch { /* reloaded */ }
+  });
+  // How this tab's recording goes, from the background: to the overlay, in either world.
+  chrome.runtime.onMessage.addListener((m) => {
+    if (m?.type === "rec-state") document.dispatchEvent(new CustomEvent("claude-annotate:rec-state", { detail: JSON.stringify(m) }));
+  });
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (msg?.target === "offscreen") return; // the recorder's
+  if (msg?.type === "rec-start" && sender.tab) {
+    startRecording(sender.tab).then((r) => reply({ ok: true, startedAt: r.startedAt }), (e) => reply({ ok: false, error: e.message, code: e.code ?? "failed" }));
+    return true;
+  }
+  if (msg?.type === "rec-stop" && sender.tab) recordingOf(sender.tab.id).then((r) => r && stopRecording({ cancel: !!msg.cancel }));
+  if (msg?.type === "rec-event" && sender.tab && sender.frameId === 0) logRecording(sender.tab.id, msg.event);
+  if (msg?.type === "rec-taken" && sender.tab) forgetSavedVideo(sender.tab.id);
+  if (msg?.type === "rec-autostop") autostopRecording(msg.reason);
   if (msg?.type === "exit" && sender.tab) turnOff(sender.tab).then(refreshMenu);
   if (msg?.type === "shoot" && sender.tab) {
     // JPEG keeps a retina screenshot well under the server's upload limit.
@@ -244,9 +281,164 @@ async function remountAll() {
 }
 
 // ---------------------------------------------------------------------------
+// Recording a tab
+// ---------------------------------------------------------------------------
+// This worker owns the recording: { tabId, startedAt, phase: "recording" | "saving", events } in
+// session storage, so it outlives the worker sleeping and the tab loading other pages (the overlay
+// that comes back reads it). The offscreen document holds the stream and the MediaRecorder. Stop
+// comes from the overlay's pill, the icon, ⌥⇧R, the time limit or the tab closing; the video goes
+// to the session the tab sends to at that moment, and back to the tab as a note to describe. A video
+// saved while the tab had no overlay to take it waits in `savedVideos` until the next one does.
+const REC_MAX_MS = 180000; // in step with the overlay's limit
+const REC_EVENTS_MAX = 300;
+const OFFSCREEN_URL = "offscreen.html";
+
+async function getRecording() {
+  return (await chrome.storage.session.get("recording")).recording ?? null;
+}
+async function setRecording(r) {
+  if (r) await chrome.storage.session.set({ recording: r });
+  else await chrome.storage.session.remove("recording");
+}
+async function recordingOf(tabId) {
+  const r = await getRecording();
+  return r?.tabId === tabId ? r : null;
+}
+async function savedVideos() {
+  return (await chrome.storage.session.get("savedVideos")).savedVideos ?? {};
+}
+async function forgetSavedVideo(tabId) {
+  const saved = await savedVideos();
+  if (!(tabId in saved)) return;
+  delete saved[tabId];
+  await chrome.storage.session.set({ savedVideos: saved });
+}
+
+class RecordingError extends Error {
+  constructor(message, code) { super(message); this.code = code; }
+}
+
+let offscreenReady = null;
+function ensureOffscreen() {
+  offscreenReady ??= (async () => {
+    const open = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
+    if (!open.length) await chrome.offscreen.createDocument({ url: OFFSCREEN_URL, reasons: ["USER_MEDIA"], justification: "Records the tab the user asked to record." });
+  })().finally(() => { offscreenReady = null; });
+  return offscreenReady;
+}
+async function closeOffscreen() {
+  await chrome.offscreen.closeDocument().catch(() => {}); // none open
+}
+
+// The overlay in the tab hears how its recording goes (no overlay mid-load: it reads the state when it mounts).
+function tellTab(tabId, state) {
+  chrome.tabs.sendMessage(tabId, { type: "rec-state", ...state }, { frameId: 0 }).catch(() => {});
+}
+// The icon says so too: a red REC badge, and the tooltip says how to stop.
+async function showRecording(tabId, on) {
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#E5484D" }).catch(() => {});
+  await chrome.action.setBadgeTextColor?.({ tabId, color: "#FFFFFF" }).catch(() => {});
+  await chrome.action.setBadgeText({ tabId, text: on ? "REC" : "" }).catch(() => {});
+  await chrome.action.setTitle({ tabId, title: on ? "Claude Annotate: recording this tab. Click to stop (⌥⇧R)." : "Claude Annotate" }).catch(() => {});
+}
+
+async function startRecording(tab) {
+  const now = await getRecording();
+  if (now) throw new RecordingError(now.tabId === tab.id ? "this tab is already being recorded" : "another tab is being recorded. Stop that one first.", "busy");
+  if (!isWebUrl(tab.url)) throw new RecordingError("Chrome doesn't let extensions record this page.", "failed");
+  let streamId;
+  try {
+    streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+  } catch (e) {
+    // Chrome allows it only after the icon or a shortcut was used on this site in this tab.
+    const notInvoked = /invoked|activeTab/i.test(e.message);
+    throw new RecordingError(notInvoked ? "press ⌥⇧R (or click the icon) on this tab first" : e.message, notInvoked ? "not-invoked" : "failed");
+  }
+  await ensureOffscreen();
+  const size = await viewportOf(tab); // the video keeps the page's shape: no black bars
+  const started = await chrome.runtime.sendMessage({ target: "offscreen", type: "start", streamId, size, maxMs: REC_MAX_MS }).catch((e) => ({ ok: false, error: e.message }));
+  if (!started?.ok) {
+    await closeOffscreen();
+    throw new RecordingError(`the recorder didn't start: ${started?.error ?? "no answer"}`, "failed");
+  }
+  const rec = { tabId: tab.id, pid: (await onTabs())[tab.id] ?? null, startedAt: started.startedAt, phase: "recording", events: [] };
+  await setRecording(rec);
+  await showRecording(tab.id, true);
+  tellTab(tab.id, { state: "recording", startedAt: rec.startedAt });
+  return rec;
+}
+
+// What the tab shows of the page, in CSS pixels; the tab's own size counts its window, not the page.
+async function viewportOf(tab) {
+  const [hit] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => ({ w: innerWidth, h: innerHeight }) }).catch(() => []);
+  return hit?.result?.w > 0 ? hit.result : { w: tab.width || 1280, h: tab.height || 800 };
+}
+
+// One stop at a time: the pill, the icon and the time limit can all ask at once.
+let stopping = null;
+function stopRecording(opts) {
+  stopping ??= finishRecording(opts).finally(() => { stopping = null; });
+  return stopping;
+}
+async function finishRecording({ cancel = false } = {}) {
+  const rec = await getRecording();
+  if (!rec || rec.phase !== "recording") return;
+  await setRecording({ ...rec, phase: "saving" });
+  tellTab(rec.tabId, { state: "saving" });
+  // The chat the tab sends to now; else the one it sent to when recording began (a page load to a
+  // site the extension can't draw on turns annotating off, not the recording).
+  const { sessionsByPid = {} } = await chrome.storage.session.get("sessionsByPid");
+  const session = cancel ? null : (await sessionForTab(rec.tabId)) ?? sessionsByPid[rec.pid] ?? null;
+  const result = await chrome.runtime.sendMessage({
+    target: "offscreen", type: "stop", cancel: !session, events: rec.events,
+    upload: session ? { endpoint: session.endpoint, token: session.token } : null,
+  }).catch((e) => ({ ok: false, error: e.message }));
+  await setRecording(null);
+  await closeOffscreen();
+  await showRecording(rec.tabId, false);
+  if (cancel) return tellTab(rec.tabId, { state: "cancelled" });
+  if (!session) return tellTab(rec.tabId, { state: "failed", error: "no Claude Code chat to send it to" });
+  if (!result?.ok) return tellTab(rec.tabId, { state: "failed", error: result?.error ?? "the recorder didn't answer" });
+  const saved = await savedVideos();
+  saved[rec.tabId] = result.video;
+  await chrome.storage.session.set({ savedVideos: saved });
+  tellTab(rec.tabId, { state: "saved", video: result.video });
+}
+
+// The recorder stopped by itself: the time limit keeps the video; a capture that ended means the tab
+// closed or crashed, and nobody is left to describe it.
+async function autostopRecording(reason) {
+  const rec = await getRecording();
+  if (!rec) return;
+  const tabAlive = await chrome.tabs.get(rec.tabId).then(() => true, () => false);
+  await stopRecording({ cancel: reason === "ended" && !tabAlive });
+}
+
+// What the user did, in order: from the overlay (clicks, keys, typing) and from here (page loads).
+let logChain = Promise.resolve();
+function logRecording(tabId, event) {
+  logChain = logChain.then(async () => {
+    const rec = await getRecording();
+    if (rec?.tabId !== tabId || rec.phase !== "recording" || rec.events.length >= REC_EVENTS_MAX) return;
+    rec.events.push(event);
+    await setRecording(rec);
+  }).catch(() => {});
+}
+async function logNavigation({ tabId, frameId, url, transitionType }, kind) {
+  if (frameId !== 0) return;
+  const rec = await recordingOf(tabId);
+  if (!rec) return;
+  logRecording(tabId, { t: Math.round((Date.now() - rec.startedAt) / 100) / 10, kind: transitionType === "reload" ? "reload" : kind, url });
+}
+chrome.webNavigation.onCommitted.addListener((d) => logNavigation(d, "navigate"));
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => logNavigation(d, "navigate"));
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => logNavigation(d, "navigate"));
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (info.status === "loading" && (await recordingOf(tabId))) await showRecording(tabId, true); // a page load clears the badge
   if (info.status !== "complete") return;
   if ((await onTabs())[tabId] == null) return;
   if (!isWebUrl(tab.url)) return setTabSession(tabId, null);
@@ -260,6 +452,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  if ((await getRecording())?.tabId === tabId) await stopRecording({ cancel: true });
+  await forgetSavedVideo(tabId);
   await chooseForTab(tabId, null);
   const tabs = await onTabs();
   if (tabs[tabId] == null) return;
@@ -274,11 +468,14 @@ async function toggleFromUser(tab, opts) {
     await chrome.action.setBadgeText({ tabId: tab.id, text: "" });
     await chrome.action.setTitle({ tabId: tab.id, title: "Claude Annotate" });
   } catch (e) {
-    await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: "#FF4D8D" }).catch(() => {});
-    await chrome.action.setBadgeText({ tabId: tab.id, text: "!" }).catch(() => {});
-    await chrome.action.setTitle({ tabId: tab.id, title: `Claude Annotate: ${e.message}` }).catch(() => {});
+    await flagIcon(tab.id, e.message);
   }
   refreshMenu();
+}
+async function flagIcon(tabId, message) {
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#FF4D8D" }).catch(() => {});
+  await chrome.action.setBadgeText({ tabId, text: "!" }).catch(() => {});
+  await chrome.action.setTitle({ tabId, title: `Claude Annotate: ${message}` }).catch(() => {});
 }
 
 // Asks for the site so the toolbar comes back after a reload there. Called before any await, while
@@ -288,18 +485,42 @@ function askForSite(tab) {
   chrome.permissions.request({ origins: [`${new URL(tab.url).origin}/*`] }).catch(() => {});
 }
 
-// The toolbar icon is the switch.
-chrome.action.onClicked.addListener((tab) => {
+// The toolbar icon is the switch; on a tab being recorded, it stops the recording.
+async function onIconClick(tab) {
   askForSite(tab);
-  toggleFromUser(tab, { freezeHover: false });
-});
+  if ((await getRecording())?.tabId === tab.id) return stopRecording();
+  return toggleFromUser(tab);
+}
+chrome.action.onClicked.addListener(onIconClick);
 
-// The keyboard switch also holds the hover state: the pointer is still where the user left it.
-chrome.commands.onCommand.addListener((command, tab) => {
-  if (command !== "toggle-annotate" || !tab) return;
-  askForSite(tab);
-  toggleFromUser(tab, { freezeHover: true });
-});
+// ⌥⇧A: annotate. The pointer is still where the user left it, so what it hovers is held.
+// ⌥⇧R: record the tab, annotating it first if it isn't; again to stop.
+async function onShortcut(command, tab) {
+  if (!tab) return;
+  if (command === "toggle-annotate") {
+    askForSite(tab);
+    if ((await getRecording())?.tabId === tab.id) return stopRecording();
+    return toggleFromUser(tab);
+  }
+  if (command === "toggle-record") {
+    askForSite(tab);
+    if ((await getRecording())?.tabId === tab.id) return stopRecording();
+    try {
+      if ((await onTabs())[tab.id] == null) await turnOn(tab);
+      await startRecording(tab);
+    } catch (e) {
+      await flagIcon(tab.id, e.message);
+    }
+  }
+}
+chrome.commands.onCommand.addListener(onShortcut);
+
+// The icon and the shortcuts by hand, for the journey tests and the worker's DevTools console:
+// claudeAnnotate.click(tabId), claudeAnnotate.shortcut("toggle-record", tabId).
+self.claudeAnnotate = {
+  click: async (tabId) => onIconClick(await chrome.tabs.get(tabId)),
+  shortcut: async (command, tabId) => onShortcut(command, await chrome.tabs.get(tabId)),
+};
 
 // ---------------------------------------------------------------------------
 // Right-click on the icon: which session the notes go to

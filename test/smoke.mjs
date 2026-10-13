@@ -178,6 +178,11 @@ console.log("✓ overview lists pages, delete removes a note");
   const r = await (await fetch(`${endpoint}/video`, { method: "POST", headers: H, body: JSON.stringify({ data: "data:video/webm;base64,GkXfo0AgQoaBAUL3gQFC8oEEQvOBCEKCQAR3ZWJtQoeBAkKFgQIYU4BnQI0VSalmQCgq17FAAw9CQE2AQAZ3aGFtbXlXQUAGd2hhbW15RIlACECPQAAAAAAAFlSua0AxrkAu14EBY8WBAZyBACK1nEADdW5khkAFVl9WUDglhohAA1ZQOIOBAeBABrCBCLqBCB9DtnVAIueBAKNAHIEAAIAwAQCdASoIAAgAAUAmJaQAA3AA/vz0AAA=", duration: 1 }) })).json();
   assert.ok(r.ok && r.video.file.endsWith(".webm") && fs.existsSync(r.video.file), "recording kept");
   assert.ok(Array.isArray(r.video.frames), "stills listed (empty without ffmpeg)");
+  // What the user did comes back as a timeline in time order; junk events are dropped.
+  const events = [{ t: 0.4, kind: "click", on: '<button> "Save"' }, { t: 0.2, kind: "navigate", url: "http://localhost:5173/next" }, { t: 0.3, kind: "nonsense" }, { t: "x", kind: "click" }];
+  const v = await (await fetch(`${endpoint}/video`, { method: "POST", headers: H, body: JSON.stringify({ data: "data:video/webm;base64,GkXfo0AgQoaBAUL3gQFC8oEEQvOBCEKCQAR3ZWJtQoeBAkKFgQIYU4BnQI0VSalmQCgq17FAAw9CQE2AQAZ3aGFtbXlXQUAGd2hhbW15RIlACECPQAAAAAAAFlSua0AxrkAu14EBY8WBAZyBACK1nEADdW5khkAFVl9WUDglhohAA1ZQOIOBAeBABrCBCLqBCB9DtnVAIueBAKNAHIEAAIAwAQCdASoIAAgAAUAmJaQAA3AA/vz0AAA=", duration: 1, events }) })).json();
+  const actions = v.video.timeline.filter((l) => !/  still /.test(l));
+  assert.deepEqual(actions, ["0:00.2  navigate http://localhost:5173/next", '0:00.4  click <button> "Save"'], "timeline of what the user did");
 }
 console.log("✓ screenshot through the tab, recording kept");
 

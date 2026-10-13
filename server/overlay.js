@@ -77,9 +77,10 @@
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
   const ink = INKS[0];
-  // draw ("Annotating") | browse. annotate_open starts in browse, so every page stays usable until Annotate is pressed.
-  // The extension's toolbar icon is the switch: there the overlay exists only while annotating.
-  let mode = CFG.startMode === "draw" ? "draw" : "browse";
+  // draw ("Annotating") | browse | record. annotate_open starts in browse, so every page stays usable
+  // until Annotate is pressed. The extension's toolbar icon is the switch: there the overlay exists
+  // only while annotating, or while the tab is being recorded (the page is the page then).
+  let mode = CFG.recording ? "record" : CFG.startMode === "draw" ? "draw" : "browse";
   let draft = null;
   const undo = [];
   const redo = [];
@@ -92,68 +93,145 @@
   let sse = null;
   let quietTimer = null; // fires the "ask Claude to pull" hint when a Send gets no reaction
   const off = new AbortController(); // aborted by unmount(): the extension's toggle turns the overlay off
-  // Turned on with the keyboard while the pointer rests on something: keep that hovered.
-  const frozen = CFG.freezeHover && !RENDER_ONLY ? freezeHover() : null;
 
   // ---------------------------------------------------------------------------
-  // Hover freeze
+  // The page holds still while annotating
   // ---------------------------------------------------------------------------
-  // Once the overlay covers the page, the browser moves :hover to it and the page hears the
-  // pointer leave, so menus and hover styles vanish. This holds both while the overlay is up:
-  //  - CSS: every rule with :hover gets a twin that matches [data-claude-annotate-hover]
-  //    instead, and the elements hovered right now get that attribute.
-  //  - JS: pointer leave/out/move events never reach the page, and presses, focus and keys in
-  //    the overlay stop at its host, so "click outside" and "focus outside" handlers stay quiet.
-  // Stylesheets from other origins can't be read; their hover styles are not held.
-  function freezeHover() {
-    const ATTR = "data-claude-annotate-hover";
-    const hovered = [...document.querySelectorAll(":hover")].filter((e) => e !== document.documentElement && e !== document.body);
-    if (!hovered.length) return null;
-    for (const e of hovered) e.setAttribute(ATTR, "");
+  // Once the overlay covers the page, the browser moves :hover to it and focus into its comment
+  // box, and the page hears the pointer and focus leave: menus, tooltips, focus rings and open
+  // dropdowns vanish before they can be marked. While annotating (not while Space is held, and
+  // never while recording) the page is held as it was when annotating began:
+  //  - CSS: each rule with :hover, :focus, :focus-visible or :focus-within gets a twin, right after
+  //    it, that matches a data attribute instead; the held elements get that attribute.
+  //  - JS: pointer leave/over/move and focus-loss events stop at the window before the page's
+  //    listeners see them, and keys go to the overlay only.
+  // Stylesheets from other origins and inside the page's own shadow roots can't be read; their
+  // hover and focus styles are not held.
+  const HOLD_ATTR = { hover: "data-claude-annotate-hover", focus: "data-claude-annotate-focus", "focus-visible": "data-claude-annotate-focus-visible", "focus-within": "data-claude-annotate-focus-within" };
+  const HELD_PSEUDO = /:(hover|focus-visible|focus-within|focus)(?![\w-])/;
+  const HELD_PSEUDOS = new RegExp(HELD_PSEUDO.source, "g");
+  const NEGATED_PSEUDO = /:(not|has)\([^)]*:(hover|focus)/; // a twin of :not(:hover) would match the opposite
+  let held = null; // { marked: [[el, attr]], twins: [[container, rule]], hover: Element[], focus: Element | null }
 
-    const twins = []; // [container, rule]
+  function holdPage() {
+    if (held || RENDER_ONLY) return;
+    const hover = [...document.querySelectorAll(":hover")].filter((e) => e !== document.documentElement && e !== document.body && e !== host);
+    const focus = pageFocus();
+    const marked = [];
+    const mark = (e, attr) => { e.setAttribute(attr, ""); marked.push([e, attr]); };
+    for (const e of hover) mark(e, HOLD_ATTR.hover);
+    if (focus) {
+      mark(focus, HOLD_ATTR.focus);
+      if (focus.matches(":focus-visible")) mark(focus, HOLD_ATTR["focus-visible"]);
+      for (let p = focus; p && p !== document.documentElement; p = p.parentElement) mark(p, HOLD_ATTR["focus-within"]);
+    }
+    held = { marked, twins: marked.length ? twinHeldRules() : [], hover, focus };
+    renderToolbar();
+  }
+  // Lets the page go: styles back to the real pointer and focus, focus back where the page had it
+  // (a comment may have taken it), and what is no longer under the pointer hears it leave on the next move.
+  function releasePage() {
+    if (!held) return;
+    const h = held;
+    held = null;
+    for (const [container, rule] of h.twins) {
+      const i = [...container.cssRules].indexOf(rule);
+      if (i >= 0) container.deleteRule(i);
+    }
+    for (const [e, attr] of h.marked) e.removeAttribute(attr);
+    if (h.focus && h.focus.isConnected && host && document.activeElement === host) h.focus.focus({ preventScroll: true });
+    settleHoverLater(h.hover);
+    renderToolbar();
+  }
+  // The element the page has focused, never the overlay.
+  function pageFocus() {
+    const a = document.activeElement;
+    return !a || a === document.body || a === document.documentElement || a === host ? null : a;
+  }
+  function twinHeldRules() {
+    const twins = [];
     const visit = (container) => {
       let rules;
-      try { rules = [...container.cssRules]; } catch { return; } // another origin's sheet
-      for (const r of rules) {
-        if (r.selectorText && /:hover\b/.test(r.selectorText)) {
-          const text = r.cssText.replace(r.selectorText, r.selectorText.replace(/:hover\b/g, `[${ATTR}]`));
-          try {
-            const at = container.insertRule(text, container.cssRules.length);
-            twins.push([container, container.cssRules[at]]);
-          } catch { /* a selector this browser won't take twice */ }
-        }
-        if (r.cssRules && !r.selectorText) visit(r); // @media, @supports, @layer
+      try { rules = container.cssRules; } catch { return; } // another origin's sheet
+      // Backwards: a twin goes in right after its rule, so the cascade order holds and the indexes
+      // still to visit don't move.
+      for (let i = rules.length - 1; i >= 0; i--) {
+        const r = rules[i];
+        if (r.cssRules && r.cssRules.length) visit(r); // @media, @supports, @layer, nesting
+        if (!r.selectorText || !HELD_PSEUDO.test(r.selectorText) || NEGATED_PSEUDO.test(r.selectorText)) continue;
+        const selector = r.selectorText.replace(HELD_PSEUDOS, (_, p) => `[${HOLD_ATTR[p]}]`);
+        try {
+          container.insertRule(r.cssText.replace(r.selectorText, selector), i + 1);
+          twins.push([container, container.cssRules[i + 1]]);
+        } catch { /* a selector this browser won't take twice */ }
       }
     };
-    for (const sheet of [...document.styleSheets]) visit(sheet);
-
-    const LEAVE = ["pointerout", "pointerleave", "mouseout", "mouseleave", "pointerover", "pointerenter", "mouseover", "mouseenter", "pointermove", "mousemove"];
-    const ours = (e) => host && e.composedPath().includes(host);
-    const holdPage = (e) => { if (!ours(e)) e.stopImmediatePropagation(); };
-    for (const t of LEAVE) window.addEventListener(t, holdPage, { capture: true, signal: off.signal });
-
-    off.signal.addEventListener("abort", () => {
-      for (const [container, rule] of twins) {
-        const i = [...container.cssRules].indexOf(rule);
-        if (i >= 0) container.deleteRule(i);
-      }
-      for (const e of hovered) e.removeAttribute(ATTR);
-      // The page never heard the pointer leave: tell it now. If the pointer is still there, the
-      // browser sends enter again on its next move.
-      const deepest = hovered[hovered.length - 1];
-      for (const [type, Ev, bubbles] of [["pointerout", PointerEvent, true], ["mouseout", MouseEvent, true]]) deepest.dispatchEvent(new Ev(type, { bubbles, composed: true }));
-      for (const e of [...hovered].reverse()) {
-        e.dispatchEvent(new PointerEvent("pointerleave"));
-        e.dispatchEvent(new MouseEvent("mouseleave"));
-      }
-    });
-    return { elements: hovered.length, rules: twins.length };
+    for (const sheet of [...document.styleSheets, ...(document.adoptedStyleSheets || [])]) visit(sheet);
+    return twins;
   }
-  // While frozen, what happens in the overlay stays there: the page's bubbling listeners never see it.
-  function sealHost() {
-    const QUIET = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "contextmenu", "focusin", "focusout", "keydown", "keyup", "keypress", "wheel"];
-    for (const t of QUIET) host.addEventListener(t, (e) => e.stopPropagation(), { signal: off.signal });
+  // The page never heard the pointer leave the held elements. On the first move over the page,
+  // those no longer under the pointer hear it now; one still under it stays hovered.
+  function settleHoverLater(hovered) {
+    if (!hovered.length) return;
+    const quit = new AbortController();
+    const settle = (e) => {
+      const path = new Set(e.composedPath());
+      if (host && host.isConnected && path.has(host)) return; // still over the overlay
+      quit.abort();
+      const gone = hovered.filter((x) => x.isConnected && !path.has(x));
+      const deepest = gone[gone.length - 1]; // :hover lists ancestors first
+      if (deepest) {
+        deepest.dispatchEvent(new PointerEvent("pointerout", { bubbles: true, composed: true, relatedTarget: e.target }));
+        deepest.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, composed: true, relatedTarget: e.target }));
+      }
+      for (const x of [...gone].reverse()) {
+        x.dispatchEvent(new PointerEvent("pointerleave", { relatedTarget: e.target }));
+        x.dispatchEvent(new MouseEvent("mouseleave", { relatedTarget: e.target }));
+      }
+    };
+    addEventListener("pointermove", settle, { capture: true, signal: quit.signal });
+    setTimeout(() => quit.abort(), 120000);
+  }
+  const POINTER_BOUNDARY = ["pointerover", "pointerenter", "pointerout", "pointerleave", "pointermove", "mouseover", "mouseenter", "mouseout", "mouseleave", "mousemove"];
+  // While held, the page hears nothing of the pointer moving and nothing of focus leaving.
+  function bindHold(signal) {
+    const quiet = (e) => { if (held && !fromOverlay(e)) e.stopImmediatePropagation(); };
+    for (const t of POINTER_BOUNDARY) addEventListener(t, quiet, { capture: true, signal });
+    for (const t of ["blur", "focusout"]) addEventListener(t, (e) => { if (e.target !== window) quiet(e); }, { capture: true, signal });
+  }
+  const fromOverlay = (e) => !!host && e.composedPath().includes(host);
+
+  // ---------------------------------------------------------------------------
+  // The overlay's own events never reach the page
+  // ---------------------------------------------------------------------------
+  // A press, a key or a scroll in the toolbar would otherwise reach the page's window and document
+  // listeners as an event on <claude-annotate>: "click outside" and "focus outside" handlers would
+  // close the very menu being marked, and the page's shortcuts would fire while typing a comment.
+  // The window sees each such event first and stops it there; a copy that can't leave the shadow
+  // root goes to the overlay's own listeners, and what they prevent is prevented on the original.
+  // Presses in the overlay never take focus from the page, except into its own text box.
+  const SHIELD_COPY = ["pointerdown", "pointermove", "pointerup", "pointercancel", "pointerleave", "click", "contextmenu", "wheel", "keydown", "input"];
+  const SHIELD_STOP = ["pointerover", "pointerenter", "pointerout", "mouseover", "mouseenter", "mouseout", "mouseleave", "mousedown", "mouseup", "mousemove", "dblclick", "auxclick", "keyup", "keypress", "beforeinput", "focusin", "focusout", "focus", "blur", "touchstart", "touchmove", "touchend", "touchcancel", "dragstart", "selectstart", "copy", "cut", "paste", "compositionstart", "compositionupdate", "compositionend", "gotpointercapture", "lostpointercapture"];
+  const copies = new WeakSet();
+  function bindShield(signal) {
+    const shield = (e) => {
+      if (copies.has(e) || !fromOverlay(e)) return;
+      e.stopImmediatePropagation();
+      const target = e.composedPath()[0];
+      if ((e.type === "pointerdown" || e.type === "mousedown") && !isTextField(target)) e.preventDefault(); // focus stays where the page had it
+      if (!SHIELD_COPY.includes(e.type)) return;
+      const copy = copyEvent(e);
+      copies.add(copy);
+      target.dispatchEvent(copy);
+      if (copy.defaultPrevented) e.preventDefault();
+    };
+    for (const t of [...SHIELD_COPY, ...SHIELD_STOP]) addEventListener(t, shield, { capture: true, passive: false, signal });
+  }
+  function copyEvent(e) {
+    const init = {};
+    for (const k in e) if (typeof e[k] !== "function") init[k] = e[k];
+    Object.assign(init, { bubbles: e.bubbles, cancelable: e.cancelable, composed: false });
+    return new e.constructor(e.type, init);
   }
 
   // ---------------------------------------------------------------------------
@@ -503,9 +581,18 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
 .bar .to .auto { flex: none; padding: 2px 6px; border-radius: 999px; font-size: 10.5px; font-weight: 600; color: #4ADE80; background: rgba(74,222,128,.12); }
 .bar .to .ic { flex: none; opacity: .6; transform: rotate(180deg); }
 .bar .to:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-.bar .count.rec { color: #FF8A8A; display: flex; align-items: center; gap: 7px; }
-.bar .recdot { width: 8px; height: 8px; border-radius: 999px; background: #FF5C5C; animation: pulse 1.2s ease-in-out infinite; }
-.tb.recb { color: #FF8A8A; background: rgba(255,92,92,.16); }
+/* Recording: the page is the page. Only the red edge and the pill are ours, and they let the pointer through. */
+:host(.rec) svg.ink { pointer-events: none; }
+:host(.rec:not(.capturing)) svg.ink .shapes, :host(.rec:not(.capturing)) .pins, :host(.rec) .hl, :host(.rec) .ghost, :host(.rec) .pop { visibility: hidden; }
+.recframe { position: fixed; inset: 0; pointer-events: none !important; display: none; box-shadow: inset 0 0 0 3px #FF5C5C, inset 0 0 24px rgba(255,92,92,.35); }
+:host(.rec) .recframe { display: block; animation: recedge 2.4s ease-in-out infinite; }
+.bar.recbar { box-shadow: inset 0 1px 0 rgba(255,255,255,.10), 0 0 0 1px rgba(255,92,92,.55), 0 24px 60px -24px rgba(0,0,0,.7); }
+.bar .count.rec { color: #FFB4B4; display: flex; align-items: center; gap: 7px; font-weight: 600; }
+.bar .count.rec .time { font-variant-numeric: tabular-nums; min-width: 34px; color: #F4F1F7; }
+.bar .recdot { width: 9px; height: 9px; border-radius: 999px; background: #FF5C5C; box-shadow: 0 0 0 3px rgba(255,92,92,.25); animation: pulse 1.2s ease-in-out infinite; }
+.bar .count.saving { display: flex; align-items: center; gap: 8px; padding-right: 10px; }
+.bar .spin { width: 12px; height: 12px; border-radius: 999px; border: 2px solid rgba(244,241,247,.25); border-top-color: #F4F1F7; animation: spin .8s linear infinite; }
+.go.stop { background: #FF5C5C; color: #fff; padding: 0 12px 0 10px; }
 /* Discard all pending annotations? */
 .confirm { position: fixed; left: 0; right: 0; top: 32%; margin: 0 auto; width: min(320px, calc(100vw - 32px)); padding: 16px; border-radius: 14px;
   background: rgba(30,30,33,.98); color: #F4F1F7; box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 1px rgba(255,255,255,.08), 0 24px 60px -20px rgba(0,0,0,.8);
@@ -541,6 +628,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
+@keyframes recedge { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 @keyframes rimflash { 0% { opacity: 0; } 20% { opacity: .9; } 100% { opacity: 0; } }
 @keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(255,138,138,0); } 50% { box-shadow: 0 0 0 4px rgba(255,138,138,.35); } }
 @keyframes wiggle { 0% { transform: none; } 30% { transform: translateY(-6px) scale(1.12); } 60% { transform: translateY(0) scale(.96); } 100% { transform: none; } }
@@ -579,6 +667,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     chrome = el("div", "chrome");
     rim = el("div", "rim");
     chrome.appendChild(rim);
+    chrome.appendChild(el("div", "recframe")); // the red edge of a tab being recorded
     toasts = el("div", "toasts");
     toasts.setAttribute("aria-live", "polite");
     chrome.appendChild(toasts);
@@ -607,11 +696,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     chrome.appendChild(bar);
     root.appendChild(chrome);
 
+    if (mode === "draw") holdPage(); // before the overlay is in the page and takes the pointer
+    else if (CFG.recording) resumeRecording(CFG.recording);
     document.documentElement.appendChild(host);
-    if (frozen) sealHost();
-    // Turned on to draw: the tool keys must not type into a search box the page focused. Not while
-    // holding a hover state, where moving focus could close the very menu being held.
-    else if (mode === "draw" && isTextField(document.activeElement)) document.activeElement.blur();
     if (RENDER_ONLY) host.classList.add("capturing");
     applyInk();
     setMode(mode);
@@ -619,8 +706,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     sizeDoc();
     bindEvents();
     restoreBarPos();
-    hydrate().finally(() => { api.ready = true; }); // the server screenshots temp pages once ready
+    firstLoad = hydrate().finally(() => { api.ready = true; }); // the server screenshots temp pages once ready
     connectSse();
+    if (CFG.recordingSaved) attachRecording(CFG.recordingSaved); // stopped while the page was loading
   }
 
   function isTextField(e) {
@@ -1052,7 +1140,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     popover.style.setProperty("--ink-dark", inkDef.dark);
     popover.classList.toggle("card", !isNew);
     popover.innerHTML = isNew
-      ? `<textarea placeholder="Add a comment…" rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
+      ? `<textarea placeholder="${note.video ? "What should Claude look at in this recording?" : "Add a comment…"}" rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
       <button class="ok hidden" type="button" title="Save (↵)" aria-label="Save">${svgIcon("check", 14)}</button>`
       : `<textarea rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
       <div class="row"><button class="del" type="button" title="Delete" aria-label="Delete">${svgIcon("trash", 14)}</button><span class="sp"></span>
@@ -1132,7 +1220,11 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     stashDraft(null);
     pinsLayer.querySelector(".pin.editing")?.classList.remove("editing");
     if (was && was.shape) renderInk();
-    if (was) { const d = pinsLayer.querySelector(`.pin[data-id="${was.id}"] .dot`); if (d) d.focus({ preventScroll: true }); }
+    // Focus goes back to what the held page had focused, so Space, Esc and ⌘Z work at once; with
+    // nothing held there, to the note's pin.
+    if (!was) return;
+    if (held && held.focus && held.focus.isConnected) held.focus.focus({ preventScroll: true });
+    else if (!held || !held.focus) pinsLayer.querySelector(`.pin[data-id="${was.id}"] .dot`)?.focus({ preventScroll: true });
   }
 
   // ---------------------------------------------------------------------------
@@ -1189,18 +1281,27 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   // Annotate on or off. On: every click marks. Off: the page is the page again; the pins hide but
   // stay, as in Codex, and come back when Annotate is pressed again.
+  // Annotating holds the page still; browsing and recording leave it to the user.
   function setMode(m) {
     mode = m;
     host.classList.toggle("draw", m === "draw");
     host.classList.toggle("browse", m === "browse");
-    if (m !== "draw") { hideHighlight(); setSpace(false); if (popNote) commitPopover(); }
+    host.classList.toggle("rec", m === "record");
+    if (m !== "draw") {
+      hideHighlight(); setSpace(false); if (popNote) commitPopover();
+      closeChatMenu(); if (confirmDiscard) closeDiscard();
+      releasePage();
+    } else if (!spaceHeld) holdPage();
     renderToolbar();
   }
-  // Space held: the page takes the pointer (to open a menu, scroll, type) until it is let go.
+  // Space held: the page takes the pointer (to open a menu, scroll, type) until it is let go, and
+  // is held again as it is then.
   function setSpace(on) {
+    if (spaceHeld === on) return;
     spaceHeld = on;
     host.classList.toggle("space", on);
-    if (on) hideHighlight();
+    if (on) { hideHighlight(); releasePage(); }
+    else if (mode === "draw") holdPage();
   }
   function setMarkersHidden(on) {
     markersHidden = on;
@@ -1223,83 +1324,221 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     return { label: "Nothing to send", cls: "idle" };
   }
   // Off: one Annotate button. On: grip · Annotating · N · screenshot · record · hide markers ·
-  // discard · the chat the notes go to · Add to chat · ×.
+  // discard · the chat the notes go to · Add to chat · ×. Recording: grip · Recording 0:12 · Stop · discard.
   let lastBar = "";
   function renderToolbar() {
     if (!bar) return;
     const waiting = waitingComments();
-    const tb = (act, icon, title, extra = "", attrs = "") =>
-      `<button class="tb ${extra}" type="button" data-act="${act}" aria-label="${title}" ${attrs}>${svgIcon(icon)}<span class="kbd">${title}</span></button>`;
+    const tb = (act, icon, title, extra = "", attrs = "", kbd = "") =>
+      `<button class="tb ${extra}" type="button" data-act="${act}" aria-label="${title}" ${attrs}>${svgIcon(icon)}<span class="kbd">${title}${kbd ? `<b>${kbd}</b>` : ""}</span></button>`;
     const grip = `<span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>`;
-    const secs = recorder ? Math.floor((Date.now() - recStart) / 1000) : 0;
-    const status = recorder
-      ? `<span class="count rec" role="status"><span class="recdot"></span>Recording ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}</span>`
-      : `<span class="count" role="status" aria-live="polite">Annotating · ${waiting}</span>`;
+    if (mode === "record") {
+      const html = !rec || rec.phase === "saving"
+        ? `${grip}<span class="count saving" role="status"><span class="spin" aria-hidden="true"></span>Saving the recording…</span>`
+        : `${grip}<span class="count rec" role="status" aria-label="Recording this tab"><span class="recdot" aria-hidden="true"></span>Recording <span class="time" aria-hidden="true">${recClock()}</span></span>
+      <button class="go stop" type="button" data-act="rec-stop" title="Stop and describe what Claude should look at${rec.via === "tab" ? " (⌥⇧R)" : ""}">${svgIcon("stop", 14)}<span>Stop</span></button>
+      ${tb("rec-cancel", "trash", "Discard the recording")}`;
+      if (html !== lastBar) { lastBar = html; bar.innerHTML = html; bar.classList.remove("off"); bar.classList.add("recbar"); }
+      return;
+    }
+    bar.classList.remove("recbar");
+    const status = `<span class="count" role="status" aria-live="polite">Annotating · ${waiting}</span>`;
+    const heldWhat = held && [held.hover.length ? "Hover" : "", held.focus ? "focus" : ""].filter(Boolean).join(" & ");
+    const heldBadge = heldWhat ? `<span class="frozen" title="The page is held as it was: hover and focus styles stay, and the page doesn't hear the pointer or focus leave. Hold Space to use the page.">${heldWhat[0].toUpperCase() + heldWhat.slice(1)} held</span>` : "";
+    const canRecord = CFG.startMode === "draw" || !!navigator.mediaDevices?.getDisplayMedia;
     const to = CHOOSES_CHAT
       ? `<button class="to" type="button" data-act="chats" aria-haspopup="menu" aria-expanded="${chatMenuOpen}" title="${esc(CFG.sendsPrompt ? `Last message there: ${CFG.sendsPrompt}` : "Click to pick another chat")}"><span class="lbl">To</span><span class="name">${esc(chatLabel())}</span>${CFG.automatic ? '<span class="auto">open chat</span>' : ""}${svgIcon("chevron", 13)}</button>`
       : "";
     const html = mode !== "draw"
       ? `${grip}<button class="go start" type="button" data-act="annotate" aria-label="Annotate">${svgIcon("annotate", 15)}<span>Annotate</span></button>`
-      : `${grip}${frozen ? `
-      <span class="frozen" title="The page's hover state is held while you annotate">Hover held</span>` : ""}
+      : `${grip}${heldBadge}
       ${status}
       ${tb("shot", "shot", "Take a screenshot")}
-      ${recorder ? tb("record", "stop", "Stop recording", "on recb") : tb("record", "video", "Record the tab", "", navigator.mediaDevices?.getDisplayMedia ? "" : "disabled")}
+      ${tb("record", "video", "Record the tab", "", canRecord ? "" : "disabled", CFG.startMode === "draw" ? "⌥⇧R" : "")}
       ${tb("hide", markersHidden ? "eye" : "eyeoff", markersHidden ? "Show markers" : "Hide markers", markersHidden ? "on" : "", `aria-pressed="${markersHidden}"`)}
       ${tb("discard", "trash", "Discard annotations", "", shapes.length || notes.length ? "" : "disabled")}
       <span class="sep"></span>${to}
-      <button class="go" type="button" data-act="add" title="The notes wait above the prompt in Claude Code and go with your next message (⌘↵)" ${!waiting || recorder ? "disabled" : ""}><span>Add to chat</span></button>
+      <button class="go" type="button" data-act="add" title="The notes wait above the prompt in Claude Code and go with your next message (⌘↵)" ${!waiting ? "disabled" : ""}><span>Add to chat</span></button>
       ${tb("exit", "x", "Exit annotation mode")}`;
     if (html !== lastBar) { lastBar = html; bar.innerHTML = html; bar.classList.toggle("off", mode !== "draw"); }
   }
 
   // ---------------------------------------------------------------------------
-  // Recording the tab: a note whose subject is a short screen recording
+  // Recording the tab: a note whose subject is a screen recording of the user using the page
   // ---------------------------------------------------------------------------
-  const REC_MAX_MS = 60000;
-  let recorder = null, recStart = 0, recTimer = null, recChunks = [];
+  // While recording the page is the page: no pen, no pins, nothing held. A red edge around the tab,
+  // the Recording pill and a REC badge on the extension's icon say it is recording.
+  //  - via "tab": the extension records the tab (tabCapture, in its offscreen document). No share
+  //    picker, and the recording goes on across page loads: the overlay that comes back after one
+  //    picks it up from CFG.recording. The extension owns its state and says how it goes with
+  //    "claude-annotate:rec-state" events; the icon, ⌥⇧R and the pill's Stop all stop it.
+  //  - via "page": without the extension, or where Chrome won't let it capture this tab, the page
+  //    records itself through the browser's share picker. A full page load ends it unsaved.
+  // What the user does (clicks, typing, keys, errors) is written down with the time, so Claude gets
+  // a timeline with stills cut at those moments. Typed text is not.
+  const REC_MAX_MS = 180000; // in step with the extension's limit
+  let firstLoad = Promise.resolve();
+  let rec = null; // { via, phase: "recording" | "saving", startedAt, events, stream?, recorder?, chunks?, type?, cancel? }
+  let recTimer = null;
+  let modeBeforeRec = CFG.startMode === "draw" ? "draw" : "browse";
+
   async function startRecording() {
-    if (recorder) return;
+    if (rec) return;
     if (popNote) commitPopover();
+    if (CFG.startMode === "draw") {
+      let r = null;
+      try { r = JSON.parse((await askExtension("claude-annotate:rec-start", "claude-annotate:rec-started", 10000)) || "null"); } catch { /* below */ }
+      if (r && r.ok) return enterRecording({ via: "tab", startedAt: r.startedAt });
+      // Chrome lets the extension capture a tab only after its icon or shortcut was used on that
+      // site; otherwise the page records itself.
+      if (!r || r.code !== "not-invoked") return toast(`Couldn't start recording: ${(r && r.error) || "the extension didn't answer. Reload it and try again."}`);
+    }
+    return startPageRecording();
+  }
+  async function startPageRecording() {
+    if (!navigator.mediaDevices?.getDisplayMedia) return toast("This browser can't record the tab.");
     let stream;
     try {
-      // The browser asks which tab, window or screen; this tab is offered first.
-      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false, preferCurrentTab: true, selfBrowserSurface: "include", surfaceSwitching: "exclude" });
-    } catch { return; } // declined
+      // The browser asks what to share; this tab is offered first.
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false, preferCurrentTab: true, selfBrowserSurface: "include", surfaceSwitching: "exclude", monitorTypeSurfaces: "exclude" });
+    } catch (e) {
+      if (e.name !== "NotAllowedError" && e.name !== "AbortError") toast(`Couldn't start recording: ${e.message}`);
+      return; // declined
+    }
     const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
-    recChunks = [];
-    recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 1500000 });
-    recorder.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
-    recorder.onstop = () => finishRecording(stream, type);
-    stream.getVideoTracks()[0]?.addEventListener("ended", stopRecording); // "Stop sharing" in the browser's bar
+    const chunks = [];
+    const recorder = new MediaRecorder(stream, { mimeType: type || undefined, videoBitsPerSecond: 1200000 });
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => finishPageRecording();
+    stream.getVideoTracks()[0]?.addEventListener("ended", () => stopRecording()); // "Stop sharing" in the browser's bar
     recorder.start(1000);
-    recStart = Date.now();
-    recTimer = setInterval(() => { renderToolbar(); if (Date.now() - recStart >= REC_MAX_MS) stopRecording(); }, 500);
-    renderToolbar();
+    enterRecording({ via: "page", startedAt: Date.now(), stream, recorder, chunks, type });
+    if (CFG.startMode === "draw") toast("Recording through the browser's picker: a full page load ends it. Press ⌥⇧R next time to record across pages.");
   }
-  function stopRecording() {
-    if (recorder && recorder.state !== "inactive") recorder.stop();
+  // A page load during a recording: the extension says when it began.
+  function resumeRecording(r) {
+    rec = { via: "tab", phase: r.phase === "saving" ? "saving" : "recording", startedAt: r.startedAt, events: [] };
+    recTimer = setInterval(tickRecording, 250);
   }
-  async function finishRecording(stream, type) {
-    clearInterval(recTimer); recTimer = null;
-    for (const t of stream.getTracks()) t.stop();
-    const duration = (Date.now() - recStart) / 1000;
-    recorder = null;
+  function enterRecording(r) {
+    if (rec && rec.via === r.via) { rec.startedAt = r.startedAt; rec.phase = "recording"; return renderToolbar(); }
+    rec = { phase: "recording", events: [], ...r };
+    if (mode !== "record") modeBeforeRec = mode;
+    setMode("record");
+    clearInterval(recTimer);
+    recTimer = setInterval(tickRecording, 250);
+  }
+  function tickRecording() {
+    if (!rec) return;
+    const t = bar.querySelector(".time");
+    if (t) t.textContent = recClock(); // the pill is not rebuilt: a focused Stop keeps its focus
+    if (rec.via === "page" && rec.phase === "recording" && Date.now() - rec.startedAt >= REC_MAX_MS) stopRecording();
+  }
+  function recClock() {
+    const secs = rec ? Math.max(0, Math.floor((Date.now() - rec.startedAt) / 1000)) : 0;
+    return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  }
+  // Stop: the recording is saved and becomes a note to describe. Discard: it is thrown away.
+  function stopRecording(cancel = false) {
+    if (!rec || rec.phase !== "recording") return;
+    rec.phase = "saving";
     renderToolbar();
-    const blob = new Blob(recChunks, { type: type || "video/webm" });
-    recChunks = [];
-    if (blob.size < 1000) return;
-    tick("saving the recording…");
+    if (rec.via === "tab") {
+      document.dispatchEvent(new CustomEvent("claude-annotate:rec-stop", { detail: JSON.stringify({ cancel }) }));
+      return;
+    }
+    rec.cancel = cancel;
+    if (rec.recorder.state !== "inactive") rec.recorder.stop();
+    else finishPageRecording();
+  }
+  async function finishPageRecording() {
+    const r = rec;
+    if (!r || r.via !== "page") return;
+    for (const t of r.stream.getTracks()) t.stop();
+    if (r.phase === "recording") { r.phase = "saving"; renderToolbar(); } // the browser's "Stop sharing"
+    const duration = (Date.now() - r.startedAt) / 1000;
+    const blob = new Blob(r.chunks, { type: r.type || "video/webm" });
+    if (r.cancel) { leaveRecording(); return toast("Recording discarded.", "ok"); }
+    if (blob.size < 1000) { leaveRecording(); return toast("The recording came out empty."); }
     let video;
     try {
-      const data = await new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(blob); });
-      video = (await req("POST", "/video", { data: String(data).replace(/^data:video\/webm;[^,]*,/, "data:video/webm;base64,"), duration })).video;
-    } catch (e) { return toast(`Couldn't keep the recording: ${e.message}`); }
-    // The view in front of you, marked as a recording; its comment says what to look at.
+      const data = await new Promise((resolve, reject) => { const fr = new FileReader(); fr.onload = () => resolve(fr.result); fr.onerror = () => reject(fr.error); fr.readAsDataURL(blob); });
+      video = (await req("POST", "/video", { data, duration, events: r.events })).video;
+    } catch (e) { leaveRecording(); return toast(`Couldn't keep the recording: ${e.message}`); }
+    leaveRecording();
+    attachRecording(video);
+  }
+  function leaveRecording() {
+    clearInterval(recTimer); recTimer = null;
+    rec = null;
+    setMode(modeBeforeRec === "browse" ? "browse" : "draw");
+  }
+  // What the extension's recorder says, about this tab's recording.
+  function onRecState(m) {
+    switch (m.state) {
+      case "recording": return enterRecording({ via: "tab", startedAt: m.startedAt });
+      case "saving": if (rec) { rec.phase = "saving"; renderToolbar(); } return;
+      case "saved": if (rec) leaveRecording(); return attachRecording(m.video);
+      case "cancelled": if (rec) leaveRecording(); return toast("Recording discarded.", "ok");
+      case "failed": if (rec) leaveRecording(); return toast(`Couldn't keep the recording: ${m.error}`);
+    }
+  }
+  // The recording becomes a note on the view in front of you; its comment says what to look at.
+  async function attachRecording(video) {
+    if (!video || !video.file) return;
+    await firstLoad; // the page's notes first, or loading them would drop this one
+    if (mode !== "draw") setMode("draw");
     const s = { id: uid(), type: "rect", shot: true, color: ink.id, x: Math.round(scrollX + 1), y: Math.round(scrollY + 1), w: innerWidth - 2, h: innerHeight - 2 };
-    s.ctx = { selector: "recording", text: `${Math.round(duration)} s`, rect: [s.x, s.y, s.w, s.h], chain: "", react: { components: [], source: null } };
+    s.ctx = { selector: "recording", text: `${Math.round(video.duration || 0)} s`, rect: [s.x, s.y, s.w, s.h], chain: "", react: { components: [], source: null } };
     addShape(s);
     createNote(Math.round(scrollX + innerWidth / 2), Math.round(scrollY + innerHeight / 2), s, { video });
+    if (CFG.startMode === "draw") document.dispatchEvent(new CustomEvent("claude-annotate:rec-taken"));
+  }
+  // What the user does while recording, with the time: the timeline Claude reads beside the stills.
+  // Page navigations are the extension's to write down (it sees them across page loads).
+  function bindRecordingLog(signal) {
+    const log = (kind, extra) => {
+      if (!rec || rec.phase !== "recording") return;
+      const ev = { t: Math.round((Date.now() - rec.startedAt) / 100) / 10, kind, ...extra };
+      if (rec.via === "tab") document.dispatchEvent(new CustomEvent("claude-annotate:rec-event", { detail: JSON.stringify(ev) }));
+      else if (rec.events.length < 300) rec.events.push(ev);
+    };
+    const pageEvent = (e) => rec && !fromOverlay(e);
+    addEventListener("click", (e) => { if (pageEvent(e)) log("click", { on: actionLabel(e.target) }); }, { capture: true, passive: true, signal });
+    addEventListener("change", (e) => { // a choice; a text field's change is its typing, logged below
+      const value = pageEvent(e) && choiceValue(e.target);
+      if (value) log("change", { on: actionLabel(e.target), value });
+    }, { capture: true, passive: true, signal });
+    addEventListener("keydown", (e) => {
+      if (!pageEvent(e) || e.repeat || !/^(Enter|Escape|Tab|Backspace|Delete|ArrowUp|ArrowDown|ArrowLeft|ArrowRight)$/.test(e.key)) return;
+      log("key", { key: [e.metaKey && "⌘", e.ctrlKey && "Ctrl", e.altKey && "⌥", e.shiftKey && "⇧", e.key].filter(Boolean).join(""), on: actionLabel(e.target) });
+    }, { capture: true, passive: true, signal });
+    let typing = null; // one "typed" entry per field and burst, not one per key
+    addEventListener("input", (e) => {
+      if (!pageEvent(e) || e.target === typing || choiceValue(e.target)) return;
+      typing = e.target;
+      setTimeout(() => { if (typing === e.target) typing = null; }, 2000);
+      log("type", { on: actionLabel(e.target) });
+    }, { capture: true, passive: true, signal });
+    addEventListener("submit", (e) => { if (pageEvent(e)) log("submit", { on: actionLabel(e.target) }); }, { capture: true, passive: true, signal });
+    addEventListener("error", (e) => { if (rec && e.message) log("error", { text: String(e.message).slice(0, 200) }); }, { signal });
+    addEventListener("unhandledrejection", (e) => { if (rec) log("error", { text: `unhandled rejection: ${String((e.reason && e.reason.message) || e.reason).slice(0, 200)}` }); }, { signal });
+  }
+  // The thing acted on, as a person would name it: the control around the target, its text, its source.
+  function actionLabel(t) {
+    if (!t || t.nodeType !== 1) return "";
+    const e = t.closest("a,button,input,select,textarea,label,summary,[role=button],[role=link],[role=menuitem],[role=tab],[role=option],[role=checkbox],[role=switch],[contenteditable=true]") || t;
+    const text = (e.getAttribute("aria-label") || (/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName) ? e.getAttribute("placeholder") || e.getAttribute("name") || "" : e.innerText || e.textContent || "")).trim().replace(/\s+/g, " ").slice(0, 60);
+    const src = reactInfo(e).source;
+    return `<${shortSel(e)}>${text ? ` "${text}"` : ""}${src ? ` (${src})` : ""}`;
+  }
+  // A choice is not private the way typed text may be: which option, whether it is checked.
+  function choiceValue(t) {
+    if (!t || t.nodeType !== 1) return undefined;
+    if (t.tagName === "SELECT") return [...t.selectedOptions].map((o) => o.textContent.trim()).join(", ").slice(0, 60);
+    if (t.type === "checkbox" || t.type === "radio") return t.checked ? "checked" : "unchecked";
+    if (t.type === "range" || t.type === "color" || t.type === "date" || t.type === "time") return String(t.value).slice(0, 40);
+    return undefined;
   }
 
   // ---------------------------------------------------------------------------
@@ -1425,7 +1664,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "hide": return setMarkersHidden(!markersHidden);
         case "discard": return openDiscard();
         case "add": return addToChat();
-        case "record": return recorder ? stopRecording() : startRecording();
+        case "record": return startRecording();
+        case "rec-stop": return stopRecording();
+        case "rec-cancel": return stopRecording(true);
         case "exit": return exitAnnotating();
         case "chats": return chatMenuOpen ? closeChatMenu() : openChatMenu();
       }
@@ -1478,6 +1719,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
 
     // Window-level listeners go through `off` so unmount() removes them all at once.
     const { signal } = off;
+    bindHold(signal);
+    bindRecordingLog(signal);
+    document.addEventListener("claude-annotate:rec-state", (e) => { try { onRecState(JSON.parse(e.detail)); } catch { /* not ours */ } }, { signal });
     // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
     document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
 
@@ -1513,6 +1757,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     }
     window.addEventListener("popstate", fire, { signal });
     window.addEventListener("hashchange", fire, { signal });
+    bindShield(signal); // after onKey: the overlay's keys reach onKey before the shield stops them
   }
   let currentUrl = location.href;
   function onUrlChange() {
@@ -1713,14 +1958,16 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   // Keys while annotating: Space held lets the page have the pointer; Esc backs out one step
   // (the discard dialog, the chat list, then annotation mode); ⌘Z / ⇧⌘Z undo and redo; ⌘↵ sends.
+  // While the page is held, its focused field and its shortcuts hear none of it.
   function onKey(e) {
     if (RENDER_ONLY) return;
     const target = e.composedPath()[0];
     const inOurs = host && (target === host || host.shadowRoot.contains(target));
     const editing = target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
-    if (editing && !inOurs) return; // the page's own inputs
     if (inOurs && editing) return; // our textarea handles itself
     if (mode !== "draw") return;
+    if (held && !inOurs) holdKey(e);
+    else if (editing) return; // the page's own inputs, while Space lets the page have them
     const meta = e.metaKey || e.ctrlKey;
     if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
     if (meta && e.key === "Enter") { e.preventDefault(); addToChat(); return; }
@@ -1739,7 +1986,14 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     }
   }
   function onKeyUp(e) {
-    if (e.key === " " && spaceHeld) { e.preventDefault(); setSpace(false); }
+    if (e.key === " " && spaceHeld) { e.preventDefault(); e.stopImmediatePropagation(); setSpace(false); return; }
+    if (held && mode === "draw" && !fromOverlay(e)) e.stopImmediatePropagation();
+  }
+  // A key aimed at the held page goes nowhere: no typing into its focused field, no Tab moving focus,
+  // no shortcut of its own. The browser's own ⌘ shortcuts still work.
+  function holdKey(e) {
+    e.stopImmediatePropagation();
+    if (!e.metaKey && !e.ctrlKey) e.preventDefault();
   }
 
   // ---------------------------------------------------------------------------
@@ -1819,7 +2073,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // The chat open in Claude Code changed: a tab on Automatic follows it, unsent notes and all.
   // Not mid-comment or mid-recording: the next change looks again.
   async function followOpenChat() {
-    if (!CHOOSES_CHAT || !CFG.automatic || popNote || draft || recorder || phase === "sending") return;
+    if (!CHOOSES_CHAT || !CFG.automatic || popNote || draft || rec || phase === "sending") return;
     const pid = Number(await askExtension("claude-annotate:recheck", "claude-annotate:retarget"));
     if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) chooseChat(pid, { auto: true });
   }
@@ -2079,9 +2333,12 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       clearTimeout(saveTimer);
       await req("PUT", "/state", { url: pageUrl(), shapes, notes }).catch(() => {});
     }
+    releasePage();
+    if (rec && rec.via === "page") { rec.cancel = true; rec.recorder.onstop = null; for (const t of rec.stream.getTracks()) t.stop(); }
     off.abort();
     if (sse) sse.close();
-    for (const t of [quietTimer, tickerTimer, recTimer]) clearTimeout(t);
+    for (const t of [quietTimer, tickerTimer]) clearTimeout(t);
+    clearInterval(recTimer);
     if (host) host.remove();
     if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;
   };
