@@ -8,7 +8,7 @@
     {
       "name": "annotate",
       "displayName": "Claude Annotate",
-      "description": "/annotate <url> opens the page with drawing and note tools. Send to Claude pushes screenshots, notes and element context into this session; progress shows up on the page.",
+      "description": "Turn annotating on in Chrome with the extension, click an element or drag over an area, comment, and Add to chat: the notes, screenshots and element context wait above the prompt of your open Claude Code chat and go with your next message.",
       "source": "./"
     }
   ]

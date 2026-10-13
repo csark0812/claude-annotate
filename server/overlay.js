@@ -8,11 +8,10 @@
  *  - { state, renderOnly }: no server at all. The marks to draw for a screenshot.
  * Everything lives in a
  * Shadow DOM on a host appended to <html>, so the page's CSS never touches it and ours
- * never leaks out. Document coordinates everywhere, so marks stay put while scrolling.
- *
- * ponytail: marks assume the window is the scroller. A page that scrolls <body> or a wrapper
- * instead of the viewport keeps scrollX/Y at 0 and pins stick to the viewport. Upgrade path:
- * anchor each mark to the nearest scroll container of its element.
+ * never leaks out. Document coordinates everywhere, so marks stay put while the window scrolls.
+ * A mark drawn over a scroll container (an app shell's pane) is anchored to it and moves, and is
+ * clipped, as that container scrolls. Anchors live in memory: after a reload a mark stays where it
+ * was last saved.
  */
 (() => {
   if (window.top !== window) { installFrameProbe(); return; } // inside a frame: only answer the element picker
@@ -33,15 +32,15 @@
   // ---------------------------------------------------------------------------
   // Constants
   // ---------------------------------------------------------------------------
+  // One ink, as in Codex. The others stay so marks saved by an older overlay still draw.
   const INKS = [
+    { id: "blue", hex: "#3B82F6", dark: "#FFFFFF" },
     { id: "pink", hex: "#FF4D8D", dark: "#2A0A17" },
     { id: "sun", hex: "#FFD23F", dark: "#2B2206" },
     { id: "cyan", hex: "#35D7FF", dark: "#062530" },
     { id: "lime", hex: "#9BFF4D", dark: "#142A05" },
   ];
-  const TOOLS = ["element", "rect", "arrow", "pen"];
-  const KEYS = { e: "element", r: "rect", a: "arrow", p: "pen" };
-  const CLICK_SLOP = 5; // a press that moves less than this is a click: it opens a bare comment
+  const CLICK_SLOP = 5; // a press that moves less than this is a click: it marks the element under it
   const ICON = {
     pen: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
     arrow: '<path d="M5 19 19 5"/><path d="M9 5h10v10"/>',
@@ -53,7 +52,14 @@
     trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
     send: '<path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4 20-7z"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
+    chevron: '<path d="m6 15 6-6 6 6"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    video: '<rect x="2" y="6" width="14" height="12" rx="2"/><path d="m16 10 6-3v10l-6-3z"/>',
+    stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+    annotate: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h5"/>',
+    shot: '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/>',
+    eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    eyeoff: '<path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 8 10 8a17.6 17.6 0 0 1-2.16 3.19"/><path d="M6.6 6.6A17.4 17.4 0 0 0 2 12s3.5 8 10 8a9.7 9.7 0 0 0 5.4-1.6"/><path d="M14.1 14.1a3 3 0 1 1-4.2-4.2"/><path d="m2 2 20 20"/>',
     grip: '<circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none"/>',
   };
   const svgIcon = (name, size = 18) => `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name]}</svg>`;
@@ -70,9 +76,8 @@
   const pageUrl = () => location.href;
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
-  let tool = "element";
-  let ink = INKS[0];
-  // draw | browse. annotate_open starts in browse, so every page stays usable until a tool is picked.
+  const ink = INKS[0];
+  // draw ("Annotating") | browse. annotate_open starts in browse, so every page stays usable until Annotate is pressed.
   // The extension's toolbar icon is the switch: there the overlay exists only while annotating.
   let mode = CFG.startMode === "draw" ? "draw" : "browse";
   let draft = null;
@@ -81,9 +86,11 @@
   let totals = { notes: 0, shapes: 0, pages: 0, unsent: 0, open: 0, batches: 0 };
   let linkState = "connecting"; // connecting | on | off
   let phase = "idle"; // idle | sending | sent | done
-  let clearArmed = null;
+  let confirmDiscard = false; // the "Discard all pending annotations?" dialog is up
+  let markersHidden = false; // Hide markers: the pins and marks step aside, annotating goes on
+  let spaceHeld = false; // Space held: the page takes the pointer until it is let go
   let sse = null;
-  let quietTimer = null; // fires the "/annotate pull" hint when a Send gets no reaction
+  let quietTimer = null; // fires the "ask Claude to pull" hint when a Send gets no reaction
   const off = new AbortController(); // aborted by unmount(): the extension's toggle turns the overlay off
   // Turned on with the keyboard while the pointer rests on something: keep that hovered.
   const frozen = CFG.freezeHover && !RENDER_ONLY ? freezeHover() : null;
@@ -248,7 +255,7 @@
   // ---------------------------------------------------------------------------
   // DOM scaffold
   // ---------------------------------------------------------------------------
-  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, ticker, rim, hl;
+  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, ticker, rim, hl, ghost, confirmBox, chatMenu;
 
   const CSS = `
 :host { all: initial; position: absolute; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646; display: block; }
@@ -271,19 +278,20 @@ svg.ink g.draft { opacity: .9; }
 
 .pins { position: absolute; top: 0; left: 0; pointer-events: none; }
 .pin { position: absolute; width: 0; height: 0; pointer-events: none; }
+.pin.out { visibility: hidden; }
 .pin .dot {
-  pointer-events: auto; position: absolute; left: -15px; top: -15px; width: 30px; height: 30px; border-radius: 999px;
+  pointer-events: auto; position: absolute; left: -11px; top: -11px; width: 22px; height: 22px; border-radius: 999px;
   display: grid; place-items: center; cursor: grab; border: 0; padding: 0; touch-action: none;
   background: var(--ink); color: var(--ink-dark);
-  font: 700 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums;
-  box-shadow: 0 0 0 2.5px rgba(20,17,26,.9), 0 8px 22px -8px rgba(0,0,0,.7);
+  font: 700 11px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px rgba(20,17,26,.9), 0 6px 16px -6px rgba(0,0,0,.7);
   transition: transform .15s cubic-bezier(.2,.8,.2,1);
   animation: pop .3s cubic-bezier(.34,1.56,.64,1) both;
 }
 .pin .dot:hover { transform: scale(1.1); }
 .pin .dot:active { transform: scale(.94); }
 .pin .dot:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-.pin .ring { position: absolute; left: -19px; top: -19px; width: 38px; height: 38px; border-radius: 999px; border: 2px solid transparent; border-top-color: var(--ink); opacity: 0; pointer-events: none; }
+.pin .ring { position: absolute; left: -15px; top: -15px; width: 30px; height: 30px; border-radius: 999px; border: 2px solid transparent; border-top-color: var(--ink); opacity: 0; pointer-events: none; }
 .pin.working .ring { opacity: 1; animation: spin 1s linear infinite; }
 .pin.working .dot { animation: pulse 1.4s ease-in-out infinite; }
 .pin.done .dot { background: #4ADE80; color: #06240F; }
@@ -291,21 +299,20 @@ svg.ink g.draft { opacity: .9; }
 .pin.done .dot .ic { display: block; }
 .pin .dot .ic { display: none; }
 .pin.skipped .dot { background: #6B6775; color: #F4F1F7; }
-.pin.pending .dot { box-shadow: 0 0 0 2.5px rgba(20,17,26,.9), 0 0 0 5px var(--ink-soft), 0 8px 22px -8px rgba(0,0,0,.7); }
+.pin.pending .dot { box-shadow: 0 0 0 2px rgba(20,17,26,.9), 0 0 0 4px var(--ink-soft), 0 6px 16px -6px rgba(0,0,0,.7); }
 .pin .tag {
-  position: absolute; left: 20px; top: -13px; max-width: 220px; padding: 5px 10px 6px; border-radius: 999px;
+  position: absolute; left: 16px; top: -11px; max-width: 220px; padding: 4px 9px 5px; border-radius: 999px;
   background: rgba(20,17,26,.86); color: #F4F1F7; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 0 0 1px rgba(255,255,255,.07), 0 10px 24px -12px rgba(0,0,0,.7);
-  font: 500 12.5px/1.25 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: .005em;
+  font: 500 12px/1.2 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: .005em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: auto; cursor: pointer;
   animation: slide .3s cubic-bezier(.2,.8,.2,1) both;
 }
 .pin.done .tag .txt { text-decoration: line-through; color: rgba(244,241,247,.55); }
 .pin.skipped .tag .txt { color: rgba(244,241,247,.6); }
-.pin .tag .res { display: block; color: #4ADE80; margin-top: 3px; font-size: 11.5px; }
-.pin.skipped .tag .res { color: #C9C4D2; }
-.pin .tag .res:empty { display: none; }
-.pin:has(.res:not(:empty)) .tag { white-space: normal; width: max-content; max-width: 260px; border-radius: 12px; padding: 7px 11px 8px; top: -15px; }
+/* Send: what went out shrinks away from the page. */
+.pin.flushed { animation: flush .38s cubic-bezier(.4,0,.2,1) both; }
+svg.ink g.flushed { transform-box: fill-box; transform-origin: center; animation: flush .38s cubic-bezier(.4,0,.2,1) both; }
 
 .chrome { position: fixed; inset: 0; pointer-events: none; color: #F4F1F7; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
 .chrome > * { pointer-events: auto; }
@@ -381,6 +388,25 @@ svg.ink g.draft { opacity: .9; }
 .send.done .cnt { background: rgba(6,36,15,.85); }
 .send.done .cnt .ic { display: block; }
 .send.done .cnt .num { display: none; }
+/* The chat pill: which chat the notes go to, and how that chat is doing (the dot). */
+.send.chat { cursor: pointer; padding: 0 10px 0 14px; max-width: 260px; }
+.send.chat .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.send.chat .live { flex: none; }
+.send.chat .ic { flex: none; opacity: .7; }
+.send.chat.idle:hover, .send.chat[aria-expanded="true"] { background: rgba(255,255,255,.14); color: #F4F1F7; }
+.chats { position: fixed; width: min(340px, calc(100vw - 24px)); max-height: min(420px, calc(100vh - 120px)); overflow: auto; padding: 6px; border-radius: 16px;
+  background: rgba(24,22,28,.97); color: #F4F1F7; backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 1px rgba(255,255,255,.08), 0 16px 40px -16px rgba(0,0,0,.7);
+  font: 13px/1.35 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; transform-origin: 50% 100%; animation: popin .18s cubic-bezier(.34,1.56,.64,1) both; }
+.chats.hidden { display: none; }
+.chats .hd { padding: 6px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .02em; color: rgba(244,241,247,.5); }
+.chats .msg { padding: 10px; color: rgba(244,241,247,.65); }
+.chats button { width: 100%; display: grid; grid-template-columns: 1fr 18px; align-items: center; gap: 2px 8px; padding: 8px 10px; border: 0; border-radius: 10px;
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.chats button:hover, .chats button:focus-visible { background: rgba(255,255,255,.08); outline: none; }
+.chats .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chats .s { grid-column: 1; font-size: 11.5px; color: rgba(244,241,247,.5); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chats .ic { grid-column: 2; grid-row: 1 / span 2; color: #4ADE80; }
 .danger { color: rgba(244,241,247,.55); }
 .danger:hover { color: #FF8A8A; background: rgba(255,92,92,.14); }
 .danger.armed { width: auto; padding: 0 12px; gap: 6px; display: flex; align-items: center; color: #FF8A8A; background: rgba(255,92,92,.16); box-shadow: inset 0 0 0 1px rgba(255,92,92,.4); font-weight: 600; }
@@ -421,12 +447,97 @@ svg.ink g.draft { opacity: .9; }
 .pop .ok:focus-visible, .pop .del:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
 
 
+/* ---- Annotating, as Codex does it ---------------------------------------------------------- */
+/* One blue. Pins are small numbered dots; the comment shows on hover. */
+.pin .dot { left: -9px; top: -9px; width: 18px; height: 18px; font-size: 10px; color: #fff;
+  box-shadow: 0 0 0 1.5px rgba(255,255,255,.9), 0 4px 12px -4px rgba(0,0,0,.6); }
+.pin .ring { left: -13px; top: -13px; width: 26px; height: 26px; }
+.pin.pending .dot { box-shadow: 0 0 0 1.5px rgba(255,255,255,.9), 0 4px 12px -4px rgba(0,0,0,.6); }
+.pin .tag { left: 14px; top: -12px; opacity: 0; transform: translateX(-4px); pointer-events: none; animation: none;
+  transition: opacity .12s, transform .12s cubic-bezier(.2,.8,.2,1); background: rgba(24,24,27,.94); }
+.pin:hover .tag, .pin.peek .tag { opacity: 1; transform: none; }
+:host(.capturing) .pin .tag { opacity: 1; transform: none; }
+.pin.editing .tag { display: none; }
+/* An element mark shows only while its comment is open (and in screenshots); an area keeps a faint fill. */
+svg.ink .shape.el .halo, svg.ink .shape.el .line { display: none; }
+svg.ink .shape.el.active .line, :host(.capturing) svg.ink .shape.el .line { display: inline; stroke-dasharray: none; fill-opacity: .06; }
+svg.ink .shape.shot { display: none; }
+svg.ink .shape.region .halo { display: none; }
+svg.ink .shape.region .line { stroke-opacity: 0; fill-opacity: .1; }
+svg.ink .shape.region.active .line, svg.ink g.draft .line, :host(.capturing) svg.ink .shape.region .line { stroke-opacity: 1; }
+svg.ink g.draft .halo { display: none; }
+svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
+:host(.hidemarks:not(.capturing)) svg.ink .shapes, :host(.hidemarks:not(.capturing)) .pins,
+:host(.browse:not(.capturing)) svg.ink .shapes, :host(.browse:not(.capturing)) .pins { visibility: hidden; }
+/* Hover: the element is outlined and a pin follows the pointer. */
+.hl { border-width: 2px; background: color-mix(in srgb, var(--ink) 6%, transparent); border-radius: 3px; }
+.hl .lab { display: none; }
+.ghost { position: fixed; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 999px; background: var(--ink); pointer-events: none;
+  box-shadow: 0 0 0 1.5px rgba(255,255,255,.9), 0 4px 12px -4px rgba(0,0,0,.6); opacity: .95; }
+.ghost.hidden { display: none; }
+:host(.space) svg.ink { pointer-events: none; }
+:host(.space) .hl, :host(.space) .ghost { display: none; }
+/* The bar at the bottom: grip · Annotating · N · screenshot · hide markers · discard · Send · ×. */
+.bar { gap: 4px; padding: 5px 6px; border-radius: 14px; background: rgba(24,24,27,.94); }
+.bar .grip { padding: 0 4px; }
+.bar .count { padding: 0 8px 0 2px; font-size: 13px; font-weight: 500; color: #F4F1F7; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tb { width: 32px; height: 32px; border-radius: 9px; }
+.tb.on { background: rgba(255,255,255,.12); color: #F4F1F7; box-shadow: none; }
+.tb[disabled] { opacity: .35; cursor: default; }
+.tb .kbd { bottom: calc(100% + 10px); }
+.go { height: 30px; padding: 0 14px; border: 0; border-radius: 9px; background: var(--ink); color: #fff; cursor: pointer;
+  font: 600 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; transition: filter .15s, transform .15s; display: flex; align-items: center; gap: 6px; }
+.go:hover { filter: brightness(1.1); }
+.go:active { transform: scale(.96); }
+.go[disabled] { opacity: .45; cursor: default; filter: none; }
+.go:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.go .live { width: 7px; height: 7px; border-radius: 999px; background: #fff; animation: pulse 1.2s ease-in-out infinite; }
+.go.chat { padding: 0 6px; margin-left: -2px; }
+.go.start { padding: 0 12px 0 10px; }
+.bar.off { padding: 5px; }
+.bar .to { height: 30px; max-width: 320px; display: flex; align-items: center; gap: 6px; padding: 0 8px 0 10px; border: 0; border-radius: 9px; cursor: pointer;
+  background: rgba(255,255,255,.07); color: #F4F1F7; font: 500 12.5px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.bar .to:hover, .bar .to[aria-expanded="true"] { background: rgba(255,255,255,.13); }
+.bar .to .lbl { color: rgba(244,241,247,.5); }
+.bar .to .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.bar .to .auto { flex: none; padding: 2px 6px; border-radius: 999px; font-size: 10.5px; font-weight: 600; color: #4ADE80; background: rgba(74,222,128,.12); }
+.bar .to .ic { flex: none; opacity: .6; transform: rotate(180deg); }
+.bar .to:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.bar .count.rec { color: #FF8A8A; display: flex; align-items: center; gap: 7px; }
+.bar .recdot { width: 8px; height: 8px; border-radius: 999px; background: #FF5C5C; animation: pulse 1.2s ease-in-out infinite; }
+.tb.recb { color: #FF8A8A; background: rgba(255,92,92,.16); }
+/* Discard all pending annotations? */
+.confirm { position: fixed; left: 0; right: 0; top: 32%; margin: 0 auto; width: min(320px, calc(100vw - 32px)); padding: 16px; border-radius: 14px;
+  background: rgba(30,30,33,.98); color: #F4F1F7; box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 1px rgba(255,255,255,.08), 0 24px 60px -20px rgba(0,0,0,.8);
+  animation: popin .16s cubic-bezier(.34,1.56,.64,1) both; }
+.confirm.hidden { display: none; }
+.confirm h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.confirm p { margin: 0 0 14px; font-size: 12.5px; color: rgba(244,241,247,.6); }
+.confirm .row { display: flex; justify-content: flex-end; gap: 8px; }
+.confirm button { height: 30px; padding: 0 14px; border: 0; border-radius: 9px; font: 600 13px/1 ui-sans-serif, system-ui, -apple-system, sans-serif; cursor: pointer; }
+.confirm .no { background: rgba(255,255,255,.1); color: #F4F1F7; }
+.confirm .yes { background: rgba(255,92,92,.18); color: #FF8A8A; }
+.confirm button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+/* The comment: a pill beside the pin; editing a saved one, a card with Cancel and Save. */
+.pop { width: min(300px, calc(100vw - 24px)); padding: 4px 4px 4px 12px; background: rgba(24,24,27,.96); }
+.pop .ok { width: 24px; height: 24px; background: #F4F1F7; color: #18181B; }
+.pop .ok.hidden { display: none; }
+.pop.card { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 10px 8px 12px; border-radius: 14px; }
+.pop.card textarea { min-height: 20px; }
+.pop .row { display: flex; align-items: center; gap: 6px; }
+.pop .row .sp { flex: 1; }
+.pop .txt { height: 26px; padding: 0 10px; border: 0; border-radius: 999px; font: 600 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif; cursor: pointer; }
+.pop .cancel { background: rgba(255,255,255,.08); color: #F4F1F7; }
+.pop .save { background: #F4F1F7; color: #18181B; }
+.pop .txt:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+
 @keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes slide { from { transform: translateX(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes rise { from { transform: translate(-50%, 12px); opacity: 0; } to { transform: translate(-50%, 0); opacity: 1; } }
 @keyframes drop { from { transform: translateY(-10px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes lift { to { transform: translateY(-8px); opacity: 0; } }
 @keyframes popin { from { transform: scale(.85); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes flush { to { transform: scale(.5); opacity: 0; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
@@ -476,6 +587,16 @@ svg.ink g.draft { opacity: .9; }
     chrome.appendChild(ticker);
     hl = el("div", "hl hidden", '<span class="lab"></span>');
     chrome.appendChild(hl);
+    ghost = el("div", "ghost hidden");
+    chrome.appendChild(ghost);
+    confirmBox = el("div", "confirm hidden");
+    confirmBox.setAttribute("role", "alertdialog");
+    confirmBox.setAttribute("aria-label", "Discard annotations");
+    chrome.appendChild(confirmBox);
+    chatMenu = el("div", "chats hidden");
+    chatMenu.setAttribute("role", "menu");
+    chatMenu.setAttribute("aria-label", "Send notes to");
+    chrome.appendChild(chatMenu);
     popover = el("div", "pop hidden");
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "Note");
@@ -774,10 +895,18 @@ svg.ink g.draft { opacity: .9; }
       body = `<path class="halo" d="${d}"/><path class="line" stroke="${hex}" d="${d}"/>`;
       hit = `<path class="hit" d="${d}"/>`;
     }
-    return `<g class="${cls}" data-id="${s.id}">${body}${hit}</g>`;
+    // An element mark, an area, or a screenshot of the view; "active" while its comment is open.
+    const kind = s.type !== "rect" ? "" : s.shot ? " shot" : s.element ? " el" : " region";
+    const active = popNote && popNote.shape === s.id ? " active" : "";
+    return `<g class="${cls}${kind}${active}" data-id="${s.id}">${body}${hit}</g>`;
   }
+  // An anchored mark is drawn inside a nested <svg> the size of its scroll container's visible
+  // area: the viewBox keeps document coordinates, and the nested viewport clips what scrolled out.
   function renderInk() {
-    shapesG.innerHTML = shapes.map((s) => shapeSvg(s)).join("");
+    shapesG.innerHTML = shapes.map((s) => {
+      const c = clipRect(s.id);
+      return c ? `<svg x="${c.x}" y="${c.y}" width="${c.w}" height="${c.h}" viewBox="${c.x} ${c.y} ${c.w} ${c.h}" overflow="hidden">${shapeSvg(s)}</svg>` : shapeSvg(s);
+    }).join("");
     renderDraft();
   }
   function renderDraft() { draftG.innerHTML = draft ? shapeSvg(draft, "draft") : ""; }
@@ -791,11 +920,13 @@ svg.ink g.draft { opacity: .9; }
       const p = el("div", `pin ${n.status || "draft"}`);
       p.dataset.id = n.id;
       p.style.cssText = `left:${n.x}px;top:${n.y}px;--ink:${inkDef.hex};--ink-dark:${inkDef.dark};--ink-soft:${inkDef.hex}55`;
-      p.innerHTML = `<span class="ring"></span><button class="dot" type="button" aria-label="Note ${n.n}"><span class="n">${n.n}</span>${svgIcon("check", 15)}</button>${n.text ? `<span class="tag" title="${esc(n.text)}">${tagHtml(n)}</span>` : ""}`;
+      if (scrolledOut(n)) p.classList.add("out");
+      if (popNote && popNote.id === n.id) p.classList.add("editing");
+      p.innerHTML = `<span class="ring"></span><button class="dot" type="button" aria-label="Note ${n.n}"><span class="n">${n.n}</span>${svgIcon("check", 12)}</button>${n.text ? `<span class="tag" title="${esc(n.text)}">${tagHtml(n)}</span>` : ""}`;
       pinsLayer.appendChild(p);
     }
   }
-  function tagHtml(n) { return `<span class="txt">${esc(n.text || "…")}</span>${n.result ? `<span class="res">${esc(n.result)}</span>` : ""}`; }
+  function tagHtml(n) { return `<span class="txt">${esc(n.text || "…")}</span>`; } // Claude's reply stays in Claude Code
   function updatePin(n) {
     const p = pinsLayer.querySelector(`.pin[data-id="${n.id}"]`);
     if (!p) return renderPins();
@@ -808,6 +939,93 @@ svg.ink g.draft { opacity: .9; }
     [...pinsLayer.querySelectorAll(".pin .dot")].forEach((d, i) => {
       setTimeout(() => { d.classList.remove("wiggle"); void d.offsetWidth; d.classList.add("wiggle"); }, i * stagger);
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Scroll anchors: marks over a scroll container move with it
+  // ---------------------------------------------------------------------------
+  // mark id → [{ el, left, top }]: each scroll container between the element under the mark and
+  // the document, with the scroll offset its mark's coordinates are current for. The window's own
+  // scroll needs none: marks are in document coordinates.
+  const anchors = new Map();
+  function scrollersOf(e) {
+    const list = [];
+    for (let n = e; n && n !== document.body && n !== document.documentElement; n = n.parentElement || n.getRootNode().host) {
+      if (n.nodeType !== 1) continue;
+      const st = getComputedStyle(n);
+      if (/(auto|scroll|overlay)/.test(st.overflowY + st.overflowX)) list.push({ el: n, left: n.scrollLeft, top: n.scrollTop });
+    }
+    return list;
+  }
+  // The point a mark is about: an arrow's head, a pin, else the middle of the mark.
+  function anchorPoint(m) {
+    if (m.type === "arrow" || m.type === "line") return [m.x2, m.y2];
+    if (m.type) { const b = bbox(m); return [b.x + b.w / 2, b.y + b.h / 2]; }
+    return [m.x, m.y];
+  }
+  function anchorMark(m) {
+    const linked = !m.type && m.shape && anchors.get(m.shape);
+    if (linked) { anchors.set(m.id, linked); return; } // a mark's comment moves with its mark
+    const [x, y] = anchorPoint(m);
+    const at = elementAt(x, y);
+    const list = at ? scrollersOf(at) : [];
+    if (list.length) anchors.set(m.id, list);
+    else anchors.delete(m.id);
+  }
+  function anchorAll() {
+    anchors.clear();
+    for (const s of shapes) anchorMark(s);
+    for (const n of notes) anchorMark(n);
+  }
+  function shiftMark(m, dx, dy) {
+    if (m.type === "pen") m.points = m.points.map(([x, y]) => [x + dx, y + dy]);
+    else if (m.type === "arrow" || m.type === "line") { m.x1 += dx; m.y1 += dy; m.x2 += dx; m.y2 += dy; }
+    else { m.x += dx; m.y += dy; }
+  }
+  // Moves every anchored mark by how far its containers scrolled since it was last placed.
+  // A comment shares its mark's anchor list, so the list is brought up to date once per frame.
+  let followFrame = 0;
+  function followScrollSoon() {
+    if (!anchors.size || followFrame) return;
+    followFrame = requestAnimationFrame(followScroll);
+  }
+  function followScroll() {
+    followFrame = 0;
+    const deltas = new Map(); // anchor list → [dx, dy]
+    for (const list of new Set(anchors.values())) {
+      let dx = 0, dy = 0;
+      for (const a of list) {
+        dx += a.left - a.el.scrollLeft; dy += a.top - a.el.scrollTop;
+        a.left = a.el.scrollLeft; a.top = a.el.scrollTop;
+      }
+      if (dx || dy) deltas.set(list, [dx, dy]);
+    }
+    if (!deltas.size) return;
+    for (const m of [...shapes, ...notes]) {
+      const d = deltas.get(anchors.get(m.id));
+      if (d) shiftMark(m, d[0], d[1]);
+    }
+    renderInk();
+    renderPins();
+    placePopover();
+    save();
+  }
+  // What of the document an anchored mark may show in: the visible area its containers share.
+  function clipRect(id) {
+    const list = anchors.get(id);
+    if (!list || !list.some((a) => a.el.isConnected)) return null;
+    let l = -Infinity, t = -Infinity, r = Infinity, b = Infinity;
+    for (const a of list) {
+      if (!a.el.isConnected) continue;
+      const box = a.el.getBoundingClientRect();
+      l = Math.max(l, box.left + a.el.clientLeft); t = Math.max(t, box.top + a.el.clientTop);
+      r = Math.min(r, box.left + a.el.clientLeft + a.el.clientWidth); b = Math.min(b, box.top + a.el.clientTop + a.el.clientHeight);
+    }
+    return { x: Math.round(l + scrollX), y: Math.round(t + scrollY), w: Math.max(0, Math.round(r - l)), h: Math.max(0, Math.round(b - t)) };
+  }
+  function scrolledOut(n) {
+    const c = clipRect(n.id);
+    return !!c && (n.x < c.x || n.y < c.y || n.x > c.x + c.w || n.y > c.y + c.h);
   }
 
   // ---------------------------------------------------------------------------
@@ -824,24 +1042,33 @@ svg.ink g.draft { opacity: .9; }
     if (!note) { if (!d.isNew) return stashDraft(null); note = d.note; notes.push(note); renderPins(); }
     openPopover(note, d.isNew, d.text);
   }
+  // New: a pill beside the pin, "Add a comment…", a check once there is text. Enter saves,
+  // Shift+Enter breaks the line, Esc drops it only while empty. Saved: a card to retype it, with
+  // a trash, Cancel and Save.
   function openPopover(note, isNew = false, text = note.text) {
     popNote = note;
     const inkDef = INKS.find((i) => i.id === note.color) || INKS[0];
     popover.style.setProperty("--ink", inkDef.hex);
     popover.style.setProperty("--ink-dark", inkDef.dark);
-    popover.innerHTML = `
-      <span class="num">${note.n}</span>
-      <textarea placeholder="Add a comment…" rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
-      ${isNew ? "" : `<button class="del" type="button" title="Delete">${svgIcon("trash", 14)}</button>`}
-      <button class="ok" type="button" title="Save (↵)">${svgIcon("send", 13)}</button>`;
+    popover.classList.toggle("card", !isNew);
+    popover.innerHTML = isNew
+      ? `<textarea placeholder="Add a comment…" rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
+      <button class="ok hidden" type="button" title="Save (↵)" aria-label="Save">${svgIcon("check", 14)}</button>`
+      : `<textarea rows="1" maxlength="600" aria-label="Comment ${note.n}"></textarea>
+      <div class="row"><button class="del" type="button" title="Delete" aria-label="Delete">${svgIcon("trash", 14)}</button><span class="sp"></span>
+      <button class="txt cancel" type="button">Cancel</button><button class="txt save" type="button">Save</button></div>`;
     const ta = popover.querySelector("textarea");
     ta.value = text || "";
     popover.classList.remove("hidden");
+    pinsLayer.querySelector(`.pin[data-id="${note.id}"]`)?.classList.add("editing");
+    renderInk(); // its mark shows while the comment is open
+    const ok = popover.querySelector(".ok");
     // One line, like a chat field; it grows, and turns from a pill into a card, past one.
     const grow = () => {
       ta.style.height = "auto";
       ta.style.height = Math.min(140, ta.scrollHeight) + "px";
-      popover.classList.toggle("multi", ta.scrollHeight > 26);
+      if (isNew) popover.classList.toggle("multi", ta.scrollHeight > 26);
+      if (ok) ok.classList.toggle("hidden", !ta.value.trim());
     };
     ta.addEventListener("input", grow);
     const url = pageUrl();
@@ -853,32 +1080,26 @@ svg.ink g.draft { opacity: .9; }
     ta.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitPopover(); }
-      if (e.key === "Escape") { e.preventDefault(); cancelPopover(isNew); }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (!isNew) closePopover(); // Cancel: the saved words stay
+        else if (!ta.value.trim()) cancelPopover(true);
+      }
     });
-    popover.querySelector(".ok").addEventListener("click", commitPopover);
-    const del = popover.querySelector(".del");
-    if (del) del.addEventListener("click", () => { deleteNote(note.id); closePopover(); });
+    if (ok) ok.addEventListener("click", commitPopover);
+    popover.querySelector(".save")?.addEventListener("click", commitPopover);
+    popover.querySelector(".cancel")?.addEventListener("click", () => closePopover());
+    popover.querySelector(".del")?.addEventListener("click", () => { deleteNote(note.id); closePopover(); });
   }
+  // Beside the pin, to its right; to its left or above where the window ends.
   function placePopover() {
     if (!popNote || popover.classList.contains("hidden")) return;
-    const w = popover.offsetWidth || 320, h = popover.offsetHeight || 44;
-    // A mark's comment sits centred under the mark, or above it when there is no room below.
-    const shape = popNote.shape && shapes.find((s) => s.id === popNote.shape);
-    if (shape) {
-      const b = bbox(shape);
-      const below = b.y + b.h - scrollY + 10;
-      const top = below + h > innerHeight - 12 ? b.y - scrollY - h - 10 : below;
-      popover.style.left = clamp(b.x + b.w / 2 - scrollX - w / 2, 12, innerWidth - w - 12) + "px";
-      popover.style.top = clamp(top, 12, innerHeight - h - 12) + "px";
-      popover.style.setProperty("--ox", "50%");
-      popover.style.setProperty("--oy", "0");
-      return;
-    }
+    const w = popover.offsetWidth || 300, h = popover.offsetHeight || 36;
     const px = popNote.x - scrollX, py = popNote.y - scrollY;
-    let left = px + 24, top = py - 14;
+    let left = px + 16, top = py - 16;
     let ox = "0", oy = "0";
-    if (left + w > innerWidth - 12) { left = px - 24 - w; ox = "100%"; }
-    if (top + h > innerHeight - 12) { top = Math.max(12, py - h + 14); oy = "100%"; }
+    if (left + w > innerWidth - 12) { left = px - 16 - w; ox = "100%"; }
+    if (top + h > innerHeight - 12) { top = Math.max(12, py - h + 16); oy = "100%"; }
     popover.style.left = clamp(left, 12, innerWidth - w - 12) + "px";
     popover.style.top = clamp(top, 12, innerHeight - h - 12) + "px";
     popover.style.setProperty("--ox", ox);
@@ -890,11 +1111,13 @@ svg.ink g.draft { opacity: .9; }
     const t = (ta.value || "").trim();
     if (!t) { deleteNote(popNote.id, false, true); closePopover(); return; }
     pushUndo();
-    popNote.text = t;
+    const note = popNote;
+    note.text = t;
     closePopover();
     renderPins();
     save();
-    streamSoon();
+    renderToolbar();
+    capturePreview(note);
   }
   function cancelPopover(isNew) {
     if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true, true);
@@ -903,9 +1126,12 @@ svg.ink g.draft { opacity: .9; }
   function closePopover() {
     const was = popNote;
     popover.classList.add("hidden");
+    popover.classList.remove("card", "multi");
     popover.innerHTML = "";
     popNote = null;
     stashDraft(null);
+    pinsLayer.querySelector(".pin.editing")?.classList.remove("editing");
+    if (was && was.shape) renderInk();
     if (was) { const d = pinsLayer.querySelector(`.pin[data-id="${was.id}"] .dot`); if (d) d.focus({ preventScroll: true }); }
   }
 
@@ -914,16 +1140,10 @@ svg.ink g.draft { opacity: .9; }
   // ---------------------------------------------------------------------------
   function snapshot() { return JSON.stringify({ shapes, notes }); }
   function pushUndo() { undo.push(snapshot()); if (undo.length > 60) undo.shift(); redo.length = 0; renderToolbar(); }
-  function restore(json) { const s = JSON.parse(json); shapes = s.shapes; notes = s.notes; renderInk(); renderPins(); save(); renderToolbar(); }
+  function restore(json) { const s = JSON.parse(json); shapes = s.shapes; notes = s.notes; anchorAll(); renderInk(); renderPins(); save(); renderToolbar(); }
   function doUndo() { if (!undo.length) return; redo.push(snapshot()); restore(undo.pop()); }
   function doRedo() { if (!redo.length) return; undo.push(snapshot()); restore(redo.pop()); }
-  function addShape(s) { pushUndo(); if (!s.ctx) s.ctx = ctxForShape(s); shapes.push(s); renderInk(); save(); }
-  // ⇧ on a line or arrow: the free end snaps to 15° steps around the fixed one, keeping its length
-  function snap15(ax, ay, x, y) {
-    const len = Math.hypot(x - ax, y - ay), step = Math.PI / 12;
-    const a = Math.round(Math.atan2(y - ay, x - ax) / step) * step;
-    return [Math.round(ax + Math.cos(a) * len), Math.round(ay + Math.sin(a) * len)];
-  }
+  function addShape(s) { pushUndo(); if (!s.ctx) s.ctx = ctxForShape(s); shapes.push(s); anchorMark(s); renderInk(); save(); renderToolbar(); }
   // Deleting a mark's comment deletes the mark (keepShape: the comment was only dismissed).
   function deleteNote(id, silent = false, keepShape = false) {
     if (!silent) pushUndo();
@@ -936,22 +1156,25 @@ svg.ink g.draft { opacity: .9; }
   let creating = false;
   // A comment on a mark (shape) is a note pinned to it: it reports what the mark covers, and
   // deleting it deletes the mark. Left empty, the note goes and the mark stays.
-  async function createNote(x, y, shape = null) {
+  async function createNote(x, y, shape = null, extra = null) {
     if (creating) return;
     creating = true;
     try {
       let n;
-      try { n = (await req("POST", "/note/next")).n; } catch { n = Math.max(0, ...notes.map((k) => k.n)) + 1; }
+      try { n = (await req("POST", "/note/next")).n; } catch { /* numbered here */ }
+      if (!Number.isInteger(n)) n = Math.max(0, ...notes.map((k) => k.n)) + 1;
       const note = { id: uid(), n, x, y, color: shape ? shape.color : ink.id, text: "", status: "draft", ctx: shape ? shape.ctx : ctxAtPoint(x, y), batch: null };
       if (shape) note.shape = shape.id;
+      if (extra) Object.assign(note, extra);
       notes.push(note);
+      anchorMark(note);
       renderPins();
       openPopover(note, true);
     } finally { creating = false; }
   }
   async function clearAll() {
     pushUndo();
-    shapes = []; notes = []; phase = "idle";
+    shapes = []; notes = []; anchors.clear(); phase = "idle";
     renderInk(); renderPins(); renderToolbar();
     try { await req("POST", "/clear"); toast("Cleared. Fresh page.", "ok"); } catch (e) { toast(e.message === "busy" ? "Still sending, clear again in a moment." : `Couldn't clear: ${e.message}`); }
   }
@@ -962,21 +1185,27 @@ svg.ink g.draft { opacity: .9; }
   function applyInk() {
     host.style.setProperty("--ink", ink.hex);
     host.style.setProperty("--ink-dark", ink.dark);
-    const cur = `url("data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'><circle cx='11' cy='11' r='6.5' fill='${ink.hex}' stroke='rgba(10,8,14,.75)' stroke-width='2'/></svg>`)}") 11 11, crosshair`;
-    host.style.setProperty("--cursor", cur);
+    host.style.setProperty("--cursor", "default");
   }
+  // Annotate on or off. On: every click marks. Off: the page is the page again; the pins hide but
+  // stay, as in Codex, and come back when Annotate is pressed again.
   function setMode(m) {
     mode = m;
     host.classList.toggle("draw", m === "draw");
     host.classList.toggle("browse", m === "browse");
-    for (const t of TOOLS) host.classList.toggle("t-" + t, m === "draw" && tool === t);
+    if (m !== "draw") { hideHighlight(); setSpace(false); if (popNote) commitPopover(); }
     renderToolbar();
   }
-  function setTool(t) {
-    tool = t;
-    if (t !== "element") hideHighlight();
-    setMode("draw");
-    applyInk();
+  // Space held: the page takes the pointer (to open a menu, scroll, type) until it is let go.
+  function setSpace(on) {
+    spaceHeld = on;
+    host.classList.toggle("space", on);
+    if (on) hideHighlight();
+  }
+  function setMarkersHidden(on) {
+    markersHidden = on;
+    host.classList.toggle("hidemarks", on);
+    renderToolbar();
   }
   function setLink(s) {
     linkState = s;
@@ -984,35 +1213,157 @@ svg.ink g.draft { opacity: .9; }
     host.classList.toggle("link-connecting", s === "connecting");
     host.classList.toggle("link-off", s === "off");
   }
-  // What the stream is doing. There is no Send button: comments go as they are saved.
+  // Where this page's notes stand, for the Send button's title and the ticker.
   function streamState() {
-    if (phase === "sending" || streamTimer) return { label: "Sending…", cls: "sending" };
+    const waiting = waitingComments();
+    if (phase === "sending") return { label: "Sending…", cls: "sending" };
+    if (waiting) return { label: `${waiting} to send`, cls: "idle" };
     if (phase === "sent" && totals.open > 0) return { label: "Claude is on it", cls: "sent" };
     if (phase === "done" && totals.batches > 0) return { label: "Done", cls: "done" };
-    return { label: "Live to Claude", cls: "idle" };
+    return { label: "Nothing to send", cls: "idle" };
   }
+  // Off: one Annotate button. On: grip · Annotating · N · screenshot · record · hide markers ·
+  // discard · the chat the notes go to · Add to chat · ×.
   let lastBar = "";
   function renderToolbar() {
     if (!bar) return;
-    const s = streamState();
-    const btn = (name, title, key, extra = "") =>
-      `<button class="tb ${extra}" type="button" data-${name.startsWith("act:") ? "act" : "tool"}="${name.replace("act:", "")}" aria-label="${title}">${svgIcon(name.replace("act:", "") === "undo" ? "undo" : name.replace("act:", ""))}<span class="kbd">${title}${key ? `<b>${key}</b>` : ""}</span></button>`;
-    const html = `
-      <span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>${frozen ? `
+    const waiting = waitingComments();
+    const tb = (act, icon, title, extra = "", attrs = "") =>
+      `<button class="tb ${extra}" type="button" data-act="${act}" aria-label="${title}" ${attrs}>${svgIcon(icon)}<span class="kbd">${title}</span></button>`;
+    const grip = `<span class="grip" title="Drag">${svgIcon("grip", 16)}<span class="st"></span></span>`;
+    const secs = recorder ? Math.floor((Date.now() - recStart) / 1000) : 0;
+    const status = recorder
+      ? `<span class="count rec" role="status"><span class="recdot"></span>Recording ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}</span>`
+      : `<span class="count" role="status" aria-live="polite">Annotating · ${waiting}</span>`;
+    const to = CHOOSES_CHAT
+      ? `<button class="to" type="button" data-act="chats" aria-haspopup="menu" aria-expanded="${chatMenuOpen}" title="${esc(CFG.sendsPrompt ? `Last message there: ${CFG.sendsPrompt}` : "Click to pick another chat")}"><span class="lbl">To</span><span class="name">${esc(chatLabel())}</span>${CFG.automatic ? '<span class="auto">open chat</span>' : ""}${svgIcon("chevron", 13)}</button>`
+      : "";
+    const html = mode !== "draw"
+      ? `${grip}<button class="go start" type="button" data-act="annotate" aria-label="Annotate">${svgIcon("annotate", 15)}<span>Annotate</span></button>`
+      : `${grip}${frozen ? `
       <span class="frozen" title="The page's hover state is held while you annotate">Hover held</span>` : ""}
-      <span class="sep"></span>
-      ${btn("element", "Element", "E", tool === "element" && mode === "draw" ? "on" : "")}
-      ${btn("rect", "Box", "R", tool === "rect" && mode === "draw" ? "on" : "")}
-      ${btn("arrow", "Arrow", "A", tool === "arrow" && mode === "draw" ? "on" : "")}
-      ${btn("pen", "Pen", "P", tool === "pen" && mode === "draw" ? "on" : "")}
-      <span class="sep"></span>
-      <span class="inks">${INKS.map((i, idx) => `<button class="inkb${ink.id === i.id ? " on" : ""}" type="button" data-ink="${i.id}" style="--c:${i.hex}" aria-label="${i.id} ink" title="${i.id} (${idx + 1})"></button>`).join("")}</span>
-      <span class="sep"></span>
-      <button class="tb" type="button" data-act="undo" aria-label="Undo" ${undo.length ? "" : "disabled style='opacity:.35'"}>${svgIcon("undo")}<span class="kbd">Undo<b>⌘Z</b></span></button>
-      <span class="sep"></span>
-      <span class="send ${s.cls}" role="status" aria-live="polite" title="Comments go to Claude as you save them"><span class="live"></span><span class="label">${s.label}</span></span>
-      <button class="tb danger${clearArmed ? " armed" : ""}${phase === "done" && !clearArmed ? " glow" : ""}" type="button" data-act="clear" aria-label="Clear everything">${svgIcon("trash")}${clearArmed ? "<span>Sure?</span>" : `<span class="kbd">Clear all pages</span>`}</button>`;
-    if (html !== lastBar) { lastBar = html; bar.innerHTML = html; }
+      ${status}
+      ${tb("shot", "shot", "Take a screenshot")}
+      ${recorder ? tb("record", "stop", "Stop recording", "on recb") : tb("record", "video", "Record the tab", "", navigator.mediaDevices?.getDisplayMedia ? "" : "disabled")}
+      ${tb("hide", markersHidden ? "eye" : "eyeoff", markersHidden ? "Show markers" : "Hide markers", markersHidden ? "on" : "", `aria-pressed="${markersHidden}"`)}
+      ${tb("discard", "trash", "Discard annotations", "", shapes.length || notes.length ? "" : "disabled")}
+      <span class="sep"></span>${to}
+      <button class="go" type="button" data-act="add" title="The notes wait above the prompt in Claude Code and go with your next message (⌘↵)" ${!waiting || recorder ? "disabled" : ""}><span>Add to chat</span></button>
+      ${tb("exit", "x", "Exit annotation mode")}`;
+    if (html !== lastBar) { lastBar = html; bar.innerHTML = html; bar.classList.toggle("off", mode !== "draw"); }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recording the tab: a note whose subject is a short screen recording
+  // ---------------------------------------------------------------------------
+  const REC_MAX_MS = 60000;
+  let recorder = null, recStart = 0, recTimer = null, recChunks = [];
+  async function startRecording() {
+    if (recorder) return;
+    if (popNote) commitPopover();
+    let stream;
+    try {
+      // The browser asks which tab, window or screen; this tab is offered first.
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false, preferCurrentTab: true, selfBrowserSurface: "include", surfaceSwitching: "exclude" });
+    } catch { return; } // declined
+    const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
+    recChunks = [];
+    recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 1500000 });
+    recorder.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+    recorder.onstop = () => finishRecording(stream, type);
+    stream.getVideoTracks()[0]?.addEventListener("ended", stopRecording); // "Stop sharing" in the browser's bar
+    recorder.start(1000);
+    recStart = Date.now();
+    recTimer = setInterval(() => { renderToolbar(); if (Date.now() - recStart >= REC_MAX_MS) stopRecording(); }, 500);
+    renderToolbar();
+  }
+  function stopRecording() {
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+  }
+  async function finishRecording(stream, type) {
+    clearInterval(recTimer); recTimer = null;
+    for (const t of stream.getTracks()) t.stop();
+    const duration = (Date.now() - recStart) / 1000;
+    recorder = null;
+    renderToolbar();
+    const blob = new Blob(recChunks, { type: type || "video/webm" });
+    recChunks = [];
+    if (blob.size < 1000) return;
+    tick("saving the recording…");
+    let video;
+    try {
+      const data = await new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(blob); });
+      video = (await req("POST", "/video", { data: String(data).replace(/^data:video\/webm;[^,]*,/, "data:video/webm;base64,"), duration })).video;
+    } catch (e) { return toast(`Couldn't keep the recording: ${e.message}`); }
+    // The view in front of you, marked as a recording; its comment says what to look at.
+    const s = { id: uid(), type: "rect", shot: true, color: ink.id, x: Math.round(scrollX + 1), y: Math.round(scrollY + 1), w: innerWidth - 2, h: innerHeight - 2 };
+    s.ctx = { selector: "recording", text: `${Math.round(duration)} s`, rect: [s.x, s.y, s.w, s.h], chain: "", react: { components: [], source: null } };
+    addShape(s);
+    createNote(Math.round(scrollX + innerWidth / 2), Math.round(scrollY + innerHeight / 2), s, { video });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Claude's annotate_screenshot: the tab in view on that page captures itself
+  // ---------------------------------------------------------------------------
+  const samePage = (url) => { try { const u = new URL(url, location.href); return u.origin === location.origin && u.pathname.replace(/\/$/, "") === location.pathname.replace(/\/$/, ""); } catch { return false; } };
+  async function verifyShot(m) {
+    if (CFG.startMode !== "draw" || document.visibilityState !== "visible" || (m.url && !samePage(m.url))) return;
+    let target = null;
+    if (m.selector) {
+      try { target = document.querySelector(m.selector); } catch { /* not a selector */ }
+      if (target) {
+        const r = target.getBoundingClientRect();
+        if (r.bottom < 0 || r.top > innerHeight) { target.scrollIntoView({ block: "nearest" }); await new Promise((res) => setTimeout(res, 120)); }
+      }
+    }
+    host.style.display = "none"; // the page alone: no toolbar, pins or marks
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 60))));
+    let image = null;
+    try { image = await askExtensionForShot(); } catch { /* none */ }
+    host.style.display = "";
+    if (!image) return;
+    if (target) {
+      try {
+        const shot = await decodeDataUrl(image);
+        const r = target.getBoundingClientRect(), k = shot.width / innerWidth;
+        const x0 = clamp(r.left, 0, innerWidth), y0 = clamp(r.top, 0, innerHeight), x1 = clamp(r.right, x0 + 1, innerWidth), y1 = clamp(r.bottom, y0 + 1, innerHeight);
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round((x1 - x0) * k); canvas.height = Math.round((y1 - y0) * k);
+        canvas.getContext("2d").drawImage(shot, x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k, 0, 0, canvas.width, canvas.height);
+        shot.close();
+        image = canvas.toDataURL("image/jpeg", 0.9);
+      } catch { /* the whole view goes */ }
+    }
+    await req("POST", "/verify-shot", { id: m.id, image }).catch(() => {});
+  }
+
+  // Discard all pending annotations? Cancel / Discard, as Codex asks.
+  function openDiscard() {
+    confirmDiscard = true;
+    confirmBox.innerHTML = `<h2>Discard all pending annotations?</h2><p>All edits will be removed from the page</p><div class="row"><button class="no" type="button">Cancel</button><button class="yes" type="button">Discard</button></div>`;
+    confirmBox.classList.remove("hidden");
+    confirmBox.querySelector(".no").addEventListener("click", closeDiscard);
+    confirmBox.querySelector(".yes").addEventListener("click", () => { closeDiscard(); clearAll(); });
+    confirmBox.querySelector(".no").focus();
+  }
+  function closeDiscard() {
+    confirmDiscard = false;
+    confirmBox.classList.add("hidden");
+    confirmBox.innerHTML = "";
+  }
+  // Leaving annotation mode: through the extension (it unmounts us), or back to browsing.
+  function exitAnnotating() {
+    if (popNote) commitPopover();
+    if (CFG.startMode === "draw") document.dispatchEvent(new CustomEvent("claude-annotate:exit"));
+    else setMode("browse");
+  }
+  // Take a screenshot: the part of the page in view becomes an area mark, with a comment to write.
+  function screenshotView() {
+    if (popNote) commitPopover();
+    const s = { id: uid(), type: "rect", shot: true, color: ink.id, x: Math.round(scrollX + 1), y: Math.round(scrollY + 1), w: innerWidth - 2, h: innerHeight - 2 };
+    s.ctx = { selector: "screenshot", text: "", rect: [s.x, s.y, s.w, s.h], chain: "", react: { components: [], source: null } };
+    addShape(s);
+    createNote(Math.round(scrollX + innerWidth / 2), Math.round(scrollY + innerHeight / 2), s);
   }
 
   // ---------------------------------------------------------------------------
@@ -1067,14 +1418,22 @@ svg.ink g.draft { opacity: .9; }
     bar.addEventListener("click", (e) => {
       const b = e.target.closest("button");
       if (!b) return;
-      if (b.dataset.tool) return setTool(b.dataset.tool);
-      if (b.dataset.ink) { ink = INKS.find((i) => i.id === b.dataset.ink); applyInk(); if (mode !== "draw") setMode("draw"); renderToolbar(); return; }
+      if (b.disabled) return;
       switch (b.dataset.act) {
-        case "undo": return doUndo();
-        case "clear": return armClear();
+        case "annotate": return setMode("draw");
+        case "shot": return screenshotView();
+        case "hide": return setMarkersHidden(!markersHidden);
+        case "discard": return openDiscard();
+        case "add": return addToChat();
+        case "record": return recorder ? stopRecording() : startRecording();
+        case "exit": return exitAnnotating();
+        case "chats": return chatMenuOpen ? closeChatMenu() : openChatMenu();
       }
     });
     bindDrag();
+
+    // A press anywhere else closes the chat menu.
+    root.addEventListener("pointerdown", (e) => { if (chatMenuOpen && !e.composedPath().some((n) => n === chatMenu || (n.dataset && n.dataset.act === "chats"))) closeChatMenu(); }, true);
 
     // Drawing
     svg.addEventListener("pointerdown", onDown);
@@ -1124,10 +1483,13 @@ svg.ink g.draft { opacity: .9; }
 
     // Keyboard
     window.addEventListener("keydown", onKey, { capture: true, signal });
+    window.addEventListener("keyup", onKeyUp, { capture: true, signal });
+    window.addEventListener("blur", () => setSpace(false), { signal }); // a Space let go in another window
 
     // Keep things aligned
     window.addEventListener("scroll", placePopover, { passive: true, signal });
-    window.addEventListener("resize", () => { sizeDoc(); placePopover(); restoreBarPos(); }, { passive: true, signal });
+    document.addEventListener("scroll", (e) => { if (e.target !== document) followScrollSoon(); }, { capture: true, passive: true, signal });
+    window.addEventListener("resize", () => { sizeDoc(); placePopover(); restoreBarPos(); if (chatMenuOpen) placeChatMenu(); if (anchors.size) { renderInk(); renderPins(); } }, { passive: true, signal });
     const ro = new ResizeObserver(() => sizeDoc());
     ro.observe(document.documentElement);
     if (document.body) ro.observe(document.body);
@@ -1160,19 +1522,17 @@ svg.ink g.draft { opacity: .9; }
     hydrate();
   }
 
+  // A click marks the element under it; a drag selects an area (see onMove).
   function onDown(e) {
-    if (mode !== "draw" || e.button !== 0) return;
-    if (!popover.classList.contains("hidden")) { commitPopover(); }
+    if (mode !== "draw" || spaceHeld || e.button !== 0) return;
+    // A click away from an open comment closes it: kept when it has words, dropped when empty.
+    if (!popover.classList.contains("hidden")) { commitPopover(); e.preventDefault(); return; }
     const [x, y] = toDoc(e);
     e.preventDefault();
-    if (tool === "element") { pickElement(e.clientX, e.clientY); return; }
     svg.setPointerCapture(e.pointerId);
     pressAt = [x, y];
-    if (tool === "pen") draft = { id: uid(), type: "pen", color: ink.id, points: [[x, y]] };
-    else if (tool === "arrow") draft = { id: uid(), type: "arrow", color: ink.id, x1: x, y1: y, x2: x, y2: y };
-    else draft = { id: uid(), type: "rect", color: ink.id, x, y, w: 0, h: 0, _ox: x, _oy: y };
-    sizeDoc();
-    renderDraft();
+    pressAlt = e.altKey;
+    elementPress = [e.clientX, e.clientY];
   }
   // Element tool: the element under the pointer is outlined, frames included; a click marks it.
   let hoverSeq = 0, hoverAt = null, hoverBusy = false;
@@ -1185,7 +1545,7 @@ svg.ink g.draft { opacity: .9; }
         const [x, y] = hoverAt; hoverAt = null;
         const seq = ++hoverSeq;
         const pick = await pickIn(document, x, y, true);
-        if (seq === hoverSeq && tool === "element" && mode === "draw") showHighlight(pick);
+        if (seq === hoverSeq && mode === "draw" && !spaceHeld) showHighlight(pick);
       }
     } finally { hoverBusy = false; }
   }
@@ -1196,18 +1556,25 @@ svg.ink g.draft { opacity: .9; }
     hl.querySelector(".lab").textContent = `${pick.ctx ? pick.ctx.selector : "frame"} · ${Math.round(w)}×${Math.round(h)}${pick.frames.length ? " · in frame" : ""}`;
     hl.classList.remove("hidden");
   }
-  function hideHighlight() { hoverSeq++; if (hl) hl.classList.add("hidden"); }
+  function hideHighlight() { hoverSeq++; if (hl) hl.classList.add("hidden"); if (ghost) ghost.classList.add("hidden"); }
+  // The pin that will drop: it follows the pointer while annotating.
+  function moveGhost(cx, cy) {
+    ghost.style.left = cx + "px";
+    ghost.style.top = cy + "px";
+    ghost.classList.remove("hidden");
+  }
+  // The pin goes where the click was, on the element it picked.
   async function pickElement(cx, cy) {
     const pick = await pickIn(document, cx, cy, true);
     hideHighlight();
+    const at = [Math.round(cx + scrollX), Math.round(cy + scrollY)];
     if (!pick || pick.rect[2] < 2 || pick.rect[3] < 2) return;
     const [l, t, w, h] = pick.rect;
     const ctx = pick.ctx ? { ...pick.ctx } : { selector: "iframe", text: "", rect: [0, 0, 0, 0], chain: "", react: { components: [], source: null } };
     if (pick.frames.length) ctx.frames = pick.frames;
     const s = { id: uid(), type: "rect", element: true, color: ink.id, x: Math.round(l + scrollX), y: Math.round(t + scrollY), w: Math.round(w), h: Math.round(h), ctx };
     addShape(s);
-    const [ax, ay] = commentAnchor(s);
-    createNote(ax, ay, s);
+    createNote(at[0], at[1], s);
   }
 
   // The overlay sits outside the page's elements, so the browser would scroll nothing (or only
@@ -1272,43 +1639,80 @@ svg.ink g.draft { opacity: .9; }
   }
   let drag = null; // { kind: "pin", ... } while a pin is being moved
   let pressAt = null, farthest = 0; // where the press began, and how far the pointer has gone since
+  let elementPress = null; // client point of an Element-tool press that hasn't become a drag yet
+  let pressAlt = false; // ⌥ held at the press: mark through an existing area instead of opening its comment
+  let lastPointer = [0, 0]; // the document point a drag is at
   function onMove(e) {
-    if (!draft && tool === "element") return hoverElement(e.clientX, e.clientY);
-    if (!draft) return;
+    if (mode !== "draw" || spaceHeld) return;
+    if (elementPress && !draft) {
+      const [x, y] = toDoc(e);
+      if (Math.hypot(x - pressAt[0], y - pressAt[1]) < CLICK_SLOP) return;
+      hl.classList.add("hidden");
+      draft = { id: uid(), type: "rect", color: ink.id, x: pressAt[0], y: pressAt[1], w: 0, h: 0, _ox: pressAt[0], _oy: pressAt[1] };
+      sizeDoc();
+    }
+    if (!draft) {
+      if (!popover.classList.contains("hidden")) return hideHighlight(); // a comment is open: the next click closes it
+      moveGhost(e.clientX, e.clientY);
+      if (!e.altKey && commentedMarkAt(...toDoc(e))) { hl.classList.add("hidden"); hoverSeq++; return; } // a click here opens that comment
+      return hoverElement(e.clientX, e.clientY);
+    }
     const [x, y] = toDoc(e);
     farthest = Math.max(farthest, Math.hypot(x - pressAt[0], y - pressAt[1]));
-    if (draft.type === "pen") {
-      const l = draft.points[draft.points.length - 1];
-      if (Math.hypot(x - l[0], y - l[1]) >= 2.5) draft.points.push([x, y]);
-    } else if (draft.type === "arrow") { [draft.x2, draft.y2] = e.shiftKey ? snap15(draft.x1, draft.y1, x, y) : [x, y]; }
-    else {
-      draft.x = Math.min(draft._ox, x); draft.y = Math.min(draft._oy, y);
-      draft.w = Math.abs(x - draft._ox); draft.h = Math.abs(y - draft._oy);
-      if (e.shiftKey) { const m = Math.max(draft.w, draft.h); draft.w = draft.h = m; }
-    }
+    lastPointer = [x, y];
+    draft.x = Math.min(draft._ox, x); draft.y = Math.min(draft._oy, y);
+    draft.w = Math.abs(x - draft._ox); draft.h = Math.abs(y - draft._oy);
+    moveGhost(e.clientX, e.clientY); // the pin rides the corner being dragged
     renderDraft();
   }
   function onUp() {
+    const press = elementPress;
+    elementPress = null;
+    if (press && !draft) { openOrCreate(() => pickElement(press[0], press[1])); return; }
     if (!draft) return;
     const d = draft; draft = null;
     const wasClick = farthest < CLICK_SLOP;
     farthest = 0;
-    if (wasClick) { renderDraft(); createNote(pressAt[0], pressAt[1]); return; }
-    let ok = false;
-    if (d.type === "pen") ok = d.points.length >= 3;
-    else if (d.type === "arrow") ok = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) >= 12;
-    else { ok = d.w >= 8 && d.h >= 8; delete d._ox; delete d._oy; }
+    if (wasClick) { renderDraft(); const [x, y] = pressAt; openOrCreate(() => createNote(x, y)); return; }
+    // An area: the pin sits where the drag ended.
+    const ok = d.w >= 8 && d.h >= 8;
+    delete d._ox; delete d._oy;
     if (!ok) { renderDraft(); return; }
     addShape(d);
-    const [ax, ay] = commentAnchor(d);
-    createNote(ax, ay, d);
+    hideHighlight();
+    createNote(Math.round(lastPointer[0]), Math.round(lastPointer[1]), d);
   }
-  // Where a mark's comment pin sits: the end an arrow or line points to, else the box's lower right.
-  function commentAnchor(s) {
-    if (s.type === "arrow" || s.type === "line") return [s.x2, s.y2];
-    const b = bbox(s);
-    return [Math.round(b.x + b.w), Math.round(b.y + b.h)];
+  // A click on a mark that has a comment opens that comment to retype; with ⌥ it marks through.
+  function openOrCreate(create) {
+    const note = !pressAlt && commentedMarkAt(pressAt[0], pressAt[1]);
+    if (note) openPopover(note, false);
+    else create();
   }
+  // The comment of the innermost mark under a document point: inside a box, circle or stroke's
+  // bounds, or near an arrow or line.
+  const NEAR = 8;
+  function commentedMarkAt(x, y) {
+    let best = null, bestArea = Infinity;
+    for (const s of shapes) {
+      if (s.element || s.shot) continue; // an element's outline is hidden, a screenshot covers the view: neither catches clicks
+      const note = notes.find((n) => n.shape === s.id);
+      if (!note) continue;
+      const b = bbox(s);
+      const hit = s.type === "arrow" || s.type === "line"
+        ? distToSegment(x, y, s.x1, s.y1, s.x2, s.y2) <= NEAR
+        : x >= b.x - NEAR && x <= b.x + b.w + NEAR && y >= b.y - NEAR && y <= b.y + b.h + NEAR;
+      const area = Math.max(1, b.w * b.h);
+      if (hit && area < bestArea) { best = note; bestArea = area; }
+    }
+    return best;
+  }
+  function distToSegment(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    const t = len2 ? clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1) : 0;
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  }
+  // Keys while annotating: Space held lets the page have the pointer; Esc backs out one step
+  // (the discard dialog, the chat list, then annotation mode); ⌘Z / ⇧⌘Z undo and redo; ⌘↵ sends.
   function onKey(e) {
     if (RENDER_ONLY) return;
     const target = e.composedPath()[0];
@@ -1316,44 +1720,165 @@ svg.ink g.draft { opacity: .9; }
     const editing = target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
     if (editing && !inOurs) return; // the page's own inputs
     if (inOurs && editing) return; // our textarea handles itself
+    if (mode !== "draw") return;
     const meta = e.metaKey || e.ctrlKey;
     if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
-    if (meta && e.key === "Enter") { e.preventDefault(); clearTimeout(streamTimer); streamTimer = null; send(); return; } // send now
+    if (meta && e.key === "Enter") { e.preventDefault(); addToChat(); return; }
     if (meta || e.altKey) return;
-    const k = e.key.toLowerCase();
-    if (e.key === "Escape") {
-      if (clearArmed) disarmClear();
-      // Mounted by the extension: Esc turns annotation mode off (the extension unmounts us).
-      else if (CFG.startMode === "draw") { e.preventDefault(); e.stopPropagation(); document.dispatchEvent(new CustomEvent("claude-annotate:exit")); }
-      else if (mode === "draw") setMode("browse");
+    if (e.key === " " && !inOurs) {
+      e.preventDefault(); // not a page scroll: Space is held to use the page
+      if (!spaceHeld) setSpace(true);
       return;
     }
-    if (mode === "browse" && !(k in KEYS) && k !== "v") return;
-    if (k === "v" && CFG.startMode === "draw") return; // the extension's icon is the switch
-    if (k === "v") { setMode(mode === "draw" ? "browse" : "draw"); return; }
-    if (k in KEYS) { setTool(KEYS[k]); return; }
-    if (/^[1-4]$/.test(k)) { ink = INKS[Number(k) - 1]; applyInk(); renderToolbar(); return; }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (confirmDiscard) closeDiscard();
+      else if (chatMenuOpen) closeChatMenu();
+      else exitAnnotating();
+    }
+  }
+  function onKeyUp(e) {
+    if (e.key === " " && spaceHeld) { e.preventDefault(); setSpace(false); }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Which chat: the pill lists the live chats, this page's project first
+  // ---------------------------------------------------------------------------
+  // Only the extension knows the chats; an overlay put up by annotate_open belongs to its session.
+  const CHOOSES_CHAT = CFG.startMode === "draw" && CFG.chat != null;
+  const RECENT_MS = 12 * 3600e3; // other projects' chats older than this aren't offered
+  let chatMenuOpen = false;
+  let carried = CFG.carry || null;
+
+  function openChatMenu() {
+    chatMenuOpen = true;
+    chatMenu.innerHTML = `<div class="hd">Add notes to</div><div class="msg">Looking for chats…</div>`;
+    chatMenu.classList.remove("hidden");
+    placeChatMenu();
+    renderToolbar();
+    askExtension("claude-annotate:chats", "claude-annotate:chat-list").then(renderChatMenu);
+  }
+  function closeChatMenu() {
+    if (!chatMenuOpen) return;
+    chatMenuOpen = false;
+    chatMenu.classList.add("hidden");
+    renderToolbar();
+  }
+  function placeChatMenu() {
+    const pill = bar.querySelector('[data-act="chats"]');
+    if (!pill) return;
+    const r = pill.getBoundingClientRect(), w = chatMenu.offsetWidth || 340, h = chatMenu.offsetHeight || 120;
+    chatMenu.style.left = clamp(r.left + r.width / 2 - w / 2, 12, innerWidth - w - 12) + "px";
+    chatMenu.style.top = (r.top - h - 10 >= 12 ? r.top - h - 10 : r.bottom + 10) + "px";
+  }
+  function ago(at) {
+    const min = Math.max(0, Math.round((Date.now() - at) / 60000));
+    return min < 1 ? "just now" : min < 60 ? `${min} min ago` : min < 48 * 60 ? `${Math.round(min / 60)} h ago` : `${Math.round(min / 1440)} d ago`;
+  }
+  function renderChatMenu(json) {
+    if (!chatMenuOpen) return;
+    let list = null;
+    try { list = json ? JSON.parse(json) : null; } catch { /* below */ }
+    if (!list || !Array.isArray(list.chats)) {
+      chatMenu.innerHTML = `<div class="hd">Add notes to</div><div class="msg">Couldn't list the chats. Reload the extension and try again.</div>`;
+      return placeChatMenu();
+    }
+    const item = (c) => `<button type="button" role="menuitemradio" aria-checked="${!CFG.automatic && c.pid === list.current}" data-pid="${c.pid}">
+      <span class="t">${esc(c.title || c.folder)}</span>
+      <span class="s">${esc(c.folder)} · ${c.typed ? "typed" : "started"} ${ago(c.at)}${c.lastPrompt ? ` · “${esc(c.lastPrompt)}”` : ""}</span>${!CFG.automatic && c.pid === list.current ? svgIcon("check", 16) : ""}</button>`;
+    const follow = `<button type="button" role="menuitemradio" aria-checked="${!!CFG.automatic}" data-pid="follow">
+      <span class="t">The chat open in Claude Code</span>
+      <span class="s">Follows you as you switch chats</span>${CFG.automatic ? svgIcon("check", 16) : ""}</button>`;
+    const mine = list.chats.filter((c) => c.servesPage);
+    const others = list.chats.filter((c) => !c.servesPage && (c.pid === list.current || Date.now() - c.at < RECENT_MS));
+    chatMenu.innerHTML = `<div class="hd">Add notes to</div>${follow}` +
+      (mine.length ? `<div class="hd">This page's project</div>${mine.map(item).join("")}` : "") +
+      (others.length ? `<div class="hd">${mine.length ? "Other chats" : "Chats"}</div>${others.map(item).join("")}` : "") +
+      (mine.length || others.length ? "" : `<div class="msg">No Claude Code chat is running with the annotate plugin.</div>`);
+    for (const b of chatMenu.querySelectorAll("button[data-pid]")) b.addEventListener("click", () => (b.dataset.pid === "follow" ? followAgain() : chooseChat(Number(b.dataset.pid))));
+    placeChatMenu();
+    (chatMenu.querySelector('[aria-checked="true"]') || chatMenu.querySelector("button"))?.focus({ preventScroll: true });
+  }
+  // Switching chats: what this chat has already got stays with it; unsent marks and comments go
+  // along to the new one. The extension then mounts the overlay again for that chat.
+  // auto: the open chat changed and the tab follows it (a pick in the menu holds instead).
+  // add: the notes were on their way to the chat: the new overlay adds them there.
+  async function chooseChat(pid, { auto = false, add = false } = {}) {
+    closeChatMenu();
+    if (pid === CFG.chat) return;
+    if (popNote) commitPopover();
+    const url = pageUrl();
+    const carry = { url, add, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
+    shapes = shapes.filter((x) => x.batch);
+    notes = notes.filter((n) => n.batch);
+    clearTimeout(saveTimer); saveTimer = null;
+    await req("PUT", "/state", { url, shapes, notes }).catch(() => {});
+    document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ pid, carry, auto }) }));
+  }
+  // The chat open in Claude Code changed: a tab on Automatic follows it, unsent notes and all.
+  // Not mid-comment or mid-recording: the next change looks again.
+  async function followOpenChat() {
+    if (!CHOOSES_CHAT || !CFG.automatic || popNote || draft || recorder || phase === "sending") return;
+    const pid = Number(await askExtension("claude-annotate:recheck", "claude-annotate:retarget"));
+    if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) chooseChat(pid, { auto: true });
+  }
+  const chatLabel = () => [CFG.sendsTo, CFG.sendsFolder].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ") || "Claude";
+
+  // Back to following the open chat after a pick in the menu.
+  async function followAgain() {
+    closeChatMenu();
+    if (CFG.automatic) return;
+    if (popNote) commitPopover();
+    const url = pageUrl();
+    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
+    shapes = shapes.filter((x) => x.batch);
+    notes = notes.filter((n) => n.batch);
+    clearTimeout(saveTimer); saveTimer = null;
+    await req("PUT", "/state", { url, shapes, notes }).catch(() => {});
+    document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ follow: true, carry }) }));
+  }
+
+  // The new chat's server numbers its own comments: carried ones get the next numbers there.
+  async function takeCarried() {
+    const c = carried;
+    carried = null;
+    if (!c || c.url !== pageUrl() || !(c.notes.length || c.shapes.length)) return;
+    if (c.add) setTimeout(addToChat, 0); // after hydrate has drawn them
+    for (const n of c.notes) {
+      try { n.n = (await req("POST", "/note/next")).n; } catch { n.n = Math.max(0, ...notes.map((k) => k.n)) + 1; }
+      n.status = "draft";
+    }
+    shapes.push(...c.shapes.filter((x) => !shapes.some((y) => y.id === x.id)));
+    notes.push(...c.notes.filter((n) => !notes.some((k) => k.id === n.id)));
+    save();
   }
 
   // ---------------------------------------------------------------------------
   // Send / clear
   // ---------------------------------------------------------------------------
-  // Streaming: a saved comment goes to Claude on its own, STREAM_MS after the last one, so a few
-  // quick comments travel together. Marks without a comment ride along with the next comment.
-  const STREAM_MS = 1500;
-  let streamTimer = null;
-  const waitingComments = () => notes.some((n) => !n.batch && n.text);
-  function streamSoon(ms = STREAM_MS) {
-    clearTimeout(streamTimer);
-    if (!waitingComments()) return renderToolbar();
-    streamTimer = setTimeout(() => { streamTimer = null; send(); }, ms);
-    renderToolbar();
+  // Notes wait on the page until Send: the sidebar's button (the server asks the tab the user looks
+  // at, so its screenshot goes along) or ⌘↵ here. What went out then leaves the page.
+  const waitingComments = () => notes.filter((n) => !n.batch && n.text).length;
+  // Add to chat: the notes wait in Claude Code's bar above the prompt and go with the next message
+  // there. The tab's picture goes along now, so the notes reach Claude with the page as it was.
+  async function addToChat() {
+    if (popNote) commitPopover();
+    if (!waitingComments() && !shapes.some((sh) => !sh.batch)) return;
+    if (CHOOSES_CHAT && CFG.automatic) {
+      const pid = Number(await askExtension("claude-annotate:recheck", "claude-annotate:retarget"));
+      if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) return chooseChat(pid, { auto: true, add: true }); // that chat's overlay adds them
+    }
+    clearTimeout(saveTimer); saveTimer = null;
+    try { await req("PUT", "/state", { url: pageUrl(), shapes, notes }); } catch (e) { return toast(`Couldn't add them: ${e.message}`); }
+    if (CFG.startMode === "draw") await uploadView();
+    toast(`Added to ${chatLabel()}. Send your message there when you're ready.`, "ok");
+    exitAnnotating();
   }
   async function send() {
     if (phase === "sending") return;
-    if (!popover.classList.contains("hidden")) return streamSoon(); // a comment is being written: it goes with this one
+    if (popNote) commitPopover(); // a comment being written goes with this Send
     if (!waitingComments() && !shapes.some((sh) => !sh.batch)) return;
-    clearTimeout(streamTimer); streamTimer = null;
     phase = "sending";
     renderToolbar();
     clearTimeout(saveTimer);
@@ -1361,24 +1886,78 @@ svg.ink g.draft { opacity: .9; }
     if (CFG.startMode === "draw") await uploadView(); // the extension put us up: it takes the screenshot
     try {
       const r = await req("POST", "/send");
-      for (const n of notes) if (!n.batch) { n.batch = r.batch; n.status = "pending"; }
-      for (const s of shapes) if (!s.batch) s.batch = r.batch;
       totals = r.totals || totals;
       phase = "sent";
-      renderPins();
-      renderToolbar();
-      wigglePins();
-      tick(`sent ${r.notes} comment${r.notes === 1 ? "" : "s"} to Claude`);
-      if (waitingComments()) streamSoon(); // written while this one was on its way
+      tick(`sent ${r.notes} note${r.notes === 1 ? "" : "s"} to Claude`);
+      await flushOut(r.ids || []);
       // The server cannot tell whether the channel is on. If nothing comes back, say what to do.
       clearTimeout(quietTimer);
-      quietTimer = setTimeout(() => { if (phase === "sent") toast("Nothing from Claude yet? In the session, type /annotate pull."); }, 20000);
+      quietTimer = setTimeout(() => { if (phase === "sent") toast("Nothing from Claude yet? In the session, ask Claude to pull the annotations."); }, 20000);
     } catch (e) {
       phase = "idle";
       renderToolbar();
-      if (e.message === "busy") return streamSoon(); // another tab is sending: try again shortly
+      if (e.message === "busy") return; // another tab is sending; its batch takes this page's notes too
       if (e.message !== "Nothing to send yet.") toast(`Couldn't send to Claude: ${e.message}`);
     }
+  }
+  // What went out leaves the page: its pins and marks shrink away, then they are gone, undo history
+  // included (an undo must not bring a sent note back to be sent again). The rest stays.
+  const FLUSH_MS = 380;
+  async function flushOut(ids) {
+    const out = new Set(ids);
+    const going = [...notes, ...shapes].filter((x) => out.has(x.id));
+    if (!going.length) return renderToolbar();
+    if (popNote && out.has(popNote.id)) closePopover();
+    for (const x of going) {
+      pinsLayer.querySelector(`.pin[data-id="${x.id}"]`)?.classList.add("flushed");
+      shapesG.querySelector(`g[data-id="${x.id}"]`)?.classList.add("flushed");
+    }
+    await new Promise((r) => setTimeout(r, FLUSH_MS));
+    notes = notes.filter((n) => !out.has(n.id));
+    shapes = shapes.filter((x) => !out.has(x.id));
+    for (const id of out) anchors.delete(id);
+    undo.length = 0; redo.length = 0;
+    renderInk(); renderPins(); renderToolbar();
+  }
+
+  // A small picture of the tab around a note, cut when the note is saved: the sidebar shows it, and
+  // it goes to Claude as that note's crop. Only where the extension can capture the tab.
+  const PREVIEW = { w: 280, maxH: 200, padX: 140, padY: 90 };
+  async function capturePreview(note) {
+    if (CFG.startMode !== "draw" || RENDER_ONLY) return;
+    api.capture(true);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 30))));
+    let image = null;
+    try { image = await askExtensionForShot(); } catch { /* none */ }
+    api.capture(false);
+    if (!image || !notes.includes(note)) return;
+    try {
+      const shot = await decodeDataUrl(image);
+      const shape = note.shape && shapes.find((s) => s.id === note.shape);
+      const b = shape ? bbox(shape) : { x: note.x, y: note.y, w: 0, h: 0 };
+      // The mark and its pin with room around, in viewport pixels, kept on screen.
+      let x0 = Math.min(b.x, note.x) - scrollX - PREVIEW.padX, x1 = Math.max(b.x + b.w, note.x) - scrollX + PREVIEW.padX;
+      let y0 = Math.min(b.y, note.y) - scrollY - PREVIEW.padY, y1 = Math.max(b.y + b.h, note.y) - scrollY + PREVIEW.padY;
+      x0 = clamp(x0, 0, innerWidth); x1 = clamp(x1, x0 + 1, innerWidth);
+      y0 = clamp(y0, 0, innerHeight); y1 = clamp(y1, y0 + 1, innerHeight);
+      const k = shot.width / innerWidth; // the capture is in device pixels
+      const scale = Math.min(PREVIEW.w / (x1 - x0), PREVIEW.maxH / (y1 - y0), k);
+      const w = Math.max(1, Math.round((x1 - x0) * scale)), h = Math.max(1, Math.round((y1 - y0) * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(shot, x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k, 0, 0, w, h);
+      shot.close();
+      note.preview = { src: canvas.toDataURL("image/jpeg", 0.75), w, h };
+      save();
+    } catch { /* no preview: the note still goes */ }
+  }
+  // Decoded by hand: an <img> or fetch of a data: URL would be subject to the page's CSP.
+  function decodeDataUrl(url) {
+    const [head, b64] = url.split(",");
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return createImageBitmap(new Blob([bytes], { type: head.slice(5, head.indexOf(";")) }));
   }
   // What the tab shows, marks included and the toolbar hidden, captured by the extension and
   // uploaded so the session's server needs no connection to Chrome. Best effort: without it the
@@ -1394,22 +1973,20 @@ svg.ink g.draft { opacity: .9; }
   }
   // The extension's isolated-world relay answers "claude-annotate:shoot" with "claude-annotate:shot"
   // (a data URL, or "" when the tab could not be captured). DOM events reach it from either world.
-  function askExtensionForShot() {
+  async function askExtensionForShot() {
+    const image = await askExtension("claude-annotate:shoot", "claude-annotate:shot");
+    return image && image.startsWith("data:image/") ? image : null;
+  }
+  // One question to the extension's relay, answered by one event with a string detail (null: no answer).
+  function askExtension(ask, answer, ms = 4000) {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => done(null), 4000);
-      const done = (v) => { clearTimeout(timer); document.removeEventListener("claude-annotate:shot", onShot); resolve(v); };
-      const onShot = (e) => done(typeof e.detail === "string" && e.detail.startsWith("data:image/") ? e.detail : null);
-      document.addEventListener("claude-annotate:shot", onShot);
-      document.dispatchEvent(new CustomEvent("claude-annotate:shoot"));
+      const timer = setTimeout(() => done(null), ms);
+      const done = (v) => { clearTimeout(timer); document.removeEventListener(answer, onAnswer); resolve(v); };
+      const onAnswer = (e) => done(typeof e.detail === "string" ? e.detail : null);
+      document.addEventListener(answer, onAnswer);
+      document.dispatchEvent(new CustomEvent(ask));
     });
   }
-
-  function armClear() {
-    if (clearArmed) { disarmClear(); clearAll(); return; }
-    clearArmed = setTimeout(disarmClear, 2200);
-    renderToolbar();
-  }
-  function disarmClear() { clearTimeout(clearArmed); clearArmed = null; renderToolbar(); }
 
   // ---------------------------------------------------------------------------
   // Toasts / ticker
@@ -1435,6 +2012,8 @@ svg.ink g.draft { opacity: .9; }
       const r = await req("GET", `/state?url=${encodeURIComponent(pageUrl())}`);
       shapes = r.shapes || [];
       notes = r.notes || [];
+      await takeCarried();
+      anchorAll();
       totals = r.totals || totals;
       if (totals.open > 0) phase = "sent";
       else if (totals.batches > 0 && totals.unsent === 0) phase = "done";
@@ -1455,25 +2034,32 @@ svg.ink g.draft { opacity: .9; }
         case "hello": setLink("on"); if (m.totals) { totals = m.totals; renderToolbar(); } break;
         case "progress": {
           const n = notes.find((k) => k.n === m.n);
-          if (n) { n.status = m.status; if (m.message) n.result = m.message; updatePin(n); }
-          tick(m.status === "working" ? `working on note ${m.n}` : m.status === "done" ? `note ${m.n} done${m.message ? " · " + m.message : ""}` : `note ${m.n} skipped${m.message ? " · " + m.message : ""}`);
+          if (n) { n.status = m.status; updatePin(n); }
+          tick(m.status === "working" ? `working on note ${m.n}` : `note ${m.n} ${m.status}`); // Claude's words stay in Claude Code
           if (m.status === "done") { const d = pinsLayer.querySelector(`.pin[data-id="${n ? n.id : ""}"] .dot`); if (d) d.classList.add("wiggle"); }
           break;
         }
         case "status": tick(m.text, true); break;
         case "toast": toast(m.text); break;
-        case "sent": if (!draft && !popNote && !drag) hydrate(); break; // another tab sent; don't clobber work in progress
+        case "sent": phase = "sent"; if (m.totals) totals = m.totals; flushOut(m.ids || []); break; // this or another tab sent
+        case "send-request": // Send, pressed in the sidebar: the tab in view sends, with its screenshot when it has notes of its own
+          if (document.visibilityState !== "visible") break;
+          if (waitingComments() || shapes.some((sh) => !sh.batch)) send();
+          else req("POST", "/send").catch(() => {}); // the notes are on other pages: send them without waiting for a tab that has them
+          break;
         case "changed": if (m.url === pageUrl() && !draft && !popNote && !drag) hydrate(); break; // edited from outside the page
+        case "chats": followOpenChat(); break; // a chat was opened, typed in, started or ended
+        case "verify-shot": verifyShot(m); break; // Claude's annotate_screenshot
         case "done":
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";
           totals.open = 0;
           renderToolbar();
-          toast(m.summary ? `Done. ${m.summary}` : "Done.", "ok");
+          toast("Done. Claude's notes are in Claude Code.", "ok");
           wigglePins(70);
           break;
         case "clear":
-          shapes = []; notes = []; phase = "idle"; undo.length = 0; redo.length = 0;
+          shapes = []; notes = []; anchors.clear(); phase = "idle"; undo.length = 0; redo.length = 0;
           totals = { notes: 0, shapes: 0, pages: 0, unsent: 0, open: 0, batches: 0 };
           closePopover(); renderInk(); renderPins(); renderToolbar();
           break;
@@ -1495,7 +2081,7 @@ svg.ink g.draft { opacity: .9; }
     }
     off.abort();
     if (sse) sse.close();
-    for (const t of [quietTimer, clearArmed, tickerTimer]) clearTimeout(t);
+    for (const t of [quietTimer, tickerTimer, recTimer]) clearTimeout(t);
     if (host) host.remove();
     if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;
   };

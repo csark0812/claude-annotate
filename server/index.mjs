@@ -21,6 +21,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import { chromium } from "playwright-core";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,15 +53,24 @@ const state = {
   nextNote: 1,
   batchSeq: 0,
   batches: [], // { id, dir, content, notes, pages, createdAt, done }
+  sent: [], // notes that went out, taken off their page: { url, n, text, color, batch, status, result, preview }
   pending: [], // batches sent but not yet pulled/handled (poll mode + safety net)
   waiters: [],
   hookWaiter: null, // the chat hook's open long poll; a newer hook replaces it
   listeners: new Set(),
   lastUrl: null,
   sending: false, // one Send (or Clear) at a time; the build takes seconds
+  sendWaiters: [], // a Send from the sidebar, waiting for the visible tab to send with its screenshot
+  // A Send riding along with the user's prompt: the batch goes back to the prompt as context, not
+  // through the chat hook. `skip` holds the notes the user took off that message ("url#n").
+  riding: null, // { skip: Set<string> } | null
   views: new Map(), // url -> { buf, ext, viewport: {w, h}, scroll: {x, y}, at }: the extension's capture of the tab at Send
+  shotWaiters: new Map(), // annotate_screenshot through the extension: request id -> resolve(image data URL | null)
 };
-const VIEW_FRESH_MS = 120000; // an uploaded view older than this is not the page as it was sent
+const EXT_SHOT_MS = 4000; // how long annotate_screenshot waits for an annotating tab before it tries Chrome's debugging port
+const VIDEO_MAX_FRAMES = 12; // a recording reaches Claude as at most this many stills
+const VIEW_FRESH_MS = 30 * 60000; // the page's Add to chat uploads its view; the notes may wait in the chat's bar this long before they go
+const TAB_SEND_MS = 5000; // how long a Send from the sidebar waits for the visible tab before it builds without it
 
 let endpoint = null;
 let contextHasOverlay = false; // the browser context injects the overlay into every page it loads
@@ -197,7 +207,7 @@ function assertLocal(url) {
   return u.href;
 }
 
-// The user's tab. A second /annotate navigates it in place rather than opening another tab.
+// The user's tab. A second annotate_open navigates it in place rather than opening another tab.
 async function openUrl(url) {
   url = assertLocal(url);
   const ctx = await ensureBrowser();
@@ -374,6 +384,11 @@ function renderContent(batch, sections) {
       const cluster = sec.shots.find((c) => c.notes.includes(note));
       out += `\n### Note ${note.n} — "${note.text.replace(/\s+/g, " ").trim()}"\n`;
       if (cluster) out += `crop: ${cluster.path}  (region ${cluster.clip.x},${cluster.clip.y} → ${cluster.clip.width}×${cluster.clip.height})\n`;
+      if (sec.previews.has(note.id)) out += `crop: ${sec.previews.get(note.id)}  (the tab around this note when it was written)\n`;
+      if (note.video && note.video.file) {
+        out += `video: ${note.video.file}  (${Math.round(note.video.duration || 0)} s screen recording of the tab; the note is about what happens in it)\n`;
+        if (note.video.frames && note.video.frames.length) out += `frames (in order, read them all): ${note.video.frames.join(" ")}\n`;
+      }
       out += `pin at ${Math.round(note.x)},${Math.round(note.y)} · ${note.color}\n`;
       out += fmtCtx(note.ctx);
       if (cluster && cluster.shapes.length) {
@@ -395,11 +410,16 @@ function renderContent(batch, sections) {
   return out;
 }
 
-async function buildBatch() {
+async function buildBatch(skip = new Set()) {
   // Snapshot: a PUT /state during the build replaces the live arrays.
   const pages = [...state.pages.entries()]
-    // Only what hasn't gone out yet: comments stream, and each batch carries the new ones.
-    .map(([url, p]) => [url, { shapes: p.shapes.filter((s) => !s.batch && (s.type !== "pen" || (Array.isArray(s.points) && s.points.length > 1))), notes: p.notes.filter((n) => !n.batch) }])
+    // Only what hasn't gone out yet. Send flushes, so this is usually everything on the pages.
+    .map(([url, p]) => {
+      // A note taken off this Send keeps its mark with it.
+      const held = new Set(p.notes.filter((n) => skip.has(`${url}#${n.n}`)).map((n) => n.shape).filter(Boolean));
+      const shapes = p.shapes.filter((s) => !s.batch && !held.has(s.id) && (s.type !== "pen" || (Array.isArray(s.points) && s.points.length > 1)));
+      return [url, { shapes, notes: p.notes.filter((n) => isSendable(n) && !skip.has(`${url}#${n.n}`)) }];
+    })
     .filter(([, p]) => p.shapes.length || p.notes.length);
   if (!pages.length) throw new Error("Nothing to send yet.");
   const id = ++state.batchSeq;
@@ -409,13 +429,14 @@ async function buildBatch() {
   let pi = 0;
   for (const [url, pageState] of pages) {
     pi++;
+    const previews = await writePreviews(dir, pi, pageState.notes);
     // The browser extension uploads what the tab shows at Send: use it, no Chrome connection needed.
     const view = state.views.get(url);
     if (view && Date.now() - view.at < VIEW_FRESH_MS) {
       const fullPath = path.join(dir, `p${pi}-view.${view.ext}`);
       await fsp.writeFile(fullPath, view.buf);
       state.views.delete(url); // used once: the next Send takes a new one
-      sections.push({ url, viewport: { width: view.viewport.w, height: view.viewport.h }, doc: view.viewport, fullPath, shots: [], pageState, visible: { ...view.scroll, ...view.viewport } });
+      sections.push({ url, viewport: { width: view.viewport.w, height: view.viewport.h }, doc: view.viewport, fullPath, shots: [], pageState, previews, visible: { ...view.scroll, ...view.viewport } });
       continue;
     }
     let target;
@@ -423,7 +444,7 @@ async function buildBatch() {
       target = await pageFor(url);
     } catch (e) {
       // No screenshot (Chrome not reachable): the notes and their element context still go out.
-      sections.push({ url, viewport: { width: 0, height: 0 }, doc: { w: 0, h: 0 }, fullPath: null, shots: [], pageState, noShot: String(e.message).split("\n")[0] });
+      sections.push({ url, viewport: { width: 0, height: 0 }, doc: { w: 0, h: 0 }, fullPath: null, shots: [], pageState, previews, noShot: String(e.message).split("\n")[0] });
       continue;
     }
     const { page, temp } = target;
@@ -444,7 +465,7 @@ async function buildBatch() {
         await shoot(page, { path: p, fullPage: true, scale: "css", clip: c.clip });
         shots.push({ ...c, path: p });
       }
-      sections.push({ url, viewport, doc, fullPath, shots, pageState });
+      sections.push({ url, viewport, doc, fullPath, shots, pageState, previews });
     } finally {
       await setCapture(page, false).catch(() => {});
       if (temp) await page.close().catch(() => {});
@@ -456,17 +477,90 @@ async function buildBatch() {
     pages: sections.length,
     createdAt: Date.now(),
     done: false,
+    ids: pages.flatMap(([, p]) => [...p.notes, ...p.shapes].map((x) => x.id)), // what left the pages
   };
   batch.content = renderContent(batch, sections);
-  // Mark what went out as sent, on the live objects (they may have been replaced during the build).
+  // Flush: what went out leaves its page (the live objects: a PUT may have replaced them during the
+  // build) and joins the sent list, where Claude's progress lands.
   for (const [url, snap] of pages) {
     const live = state.pages.get(url);
-    if (!live) continue;
     const ids = new Set([...snap.notes, ...snap.shapes].map((x) => x.id));
-    for (const n of live.notes) if (ids.has(n.id) && !n.batch) { n.batch = id; if (!n.status || n.status === "draft") n.status = "pending"; }
-    for (const sh of live.shapes) if (ids.has(sh.id) && !sh.batch) sh.batch = id;
+    for (const n of snap.notes) state.sent.push({ url, n: n.n, text: n.text, color: n.color, batch: id, status: "pending", result: "", preview: n.preview || null });
+    if (!live) continue;
+    live.notes = live.notes.filter((n) => !ids.has(n.id));
+    live.shapes = live.shapes.filter((s) => !ids.has(s.id));
+    if (!live.notes.length && !live.shapes.length) state.pages.delete(url);
   }
   return batch;
+}
+
+// A note goes out once it has words; one still being written stays on its page.
+const isSendable = (n) => !n.batch && typeof n.text === "string" && n.text.trim() !== "";
+
+// The overlay cuts a small picture of the tab around each note as it is saved. Each goes out as that
+// note's crop. Returns note id → file path.
+async function writePreviews(dir, pi, notes) {
+  const paths = new Map();
+  for (const n of notes) {
+    const m = /^data:image\/(png|jpeg);base64,(.+)$/.exec(String(n.preview?.src || ""));
+    if (!m) continue;
+    const file = path.join(dir, `p${pi}-note${n.n}.${m[1] === "jpeg" ? "jpg" : "png"}`);
+    await fsp.writeFile(file, Buffer.from(m[2], "base64"));
+    paths.set(n.id, file);
+  }
+  return paths;
+}
+
+async function sendNow() {
+  if (state.sending) throw new Error("busy");
+  state.sending = true;
+  try {
+    const riding = state.riding;
+    const batch = await buildBatch(riding?.skip);
+    // Riding along: the prompt carries it, so the chat hook must not deliver it a second time.
+    const pushed = riding ? (state.batches.push(batch), false) : await deliver(batch);
+    log(`batch ${batch.id}: ${batch.notes} notes on ${batch.pages} page(s) → ${riding ? "attached to the user's prompt" : pushed ? "written to the channel" : { chat: "handed to the chat hook", poll: "handed to waiter", channel: "queued (pull)" }[state.mode]}`);
+    broadcast({ type: "sent", batch: batch.id, ids: batch.ids, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals() });
+    for (const w of state.sendWaiters.splice(0)) w(batch);
+    return { batch, pushed };
+  } finally {
+    state.sending = false;
+  }
+}
+
+// Send from the sidebar: the tab the user looks at sends itself, so its screenshot goes along.
+// No tab answers in time (none open, or none visible): send without it.
+async function sendFromSidebar() {
+  const before = state.batchSeq;
+  if (state.listeners.size) {
+    const batch = await new Promise((resolve) => {
+      const done = (b) => { clearTimeout(timer); state.sendWaiters = state.sendWaiters.filter((w) => w !== done); resolve(b); };
+      const timer = setTimeout(() => done(null), TAB_SEND_MS);
+      state.sendWaiters.push(done);
+      broadcast({ type: "send-request" });
+    });
+    if (batch) return { batch, pushed: state.mode === "channel" };
+    for (let i = 0; state.sending && i < 300; i++) await new Promise((r) => setTimeout(r, 100)); // a tab's send that is still building
+    // The tab answered late: its batch already took the notes, so this Send worked.
+    const late = state.batchSeq > before && state.batches.findLast((b) => b.id > before);
+    if (late) return { batch: late, pushed: state.mode === "channel" };
+  }
+  return sendNow();
+}
+
+// Send with the user's next prompt: built as the sidebar's Send is (the visible tab adds its
+// screenshot), then handed back to the prompt instead of the chat hook.
+async function rideAlong(skip) {
+  const held = new Set(Array.isArray(skip) ? skip.map(String) : []);
+  // Checked up front: the prompt must not wait on the tabs when there is nothing to take.
+  const anything = [...state.pages].some(([url, p]) => p.notes.some((n) => isSendable(n) && !held.has(`${url}#${n.n}`)) || p.shapes.some((s) => !s.batch && !p.notes.some((n) => n.shape === s.id)));
+  if (!anything) throw new Error("Nothing to send yet.");
+  state.riding = { skip: held };
+  try {
+    return await sendFromSidebar();
+  } finally {
+    state.riding = null;
+  }
 }
 
 async function deliver(batch) {
@@ -499,11 +593,60 @@ async function removeBatchFiles(batch) {
   await fsp.rm(batch.dir, { recursive: true, force: true }).catch(() => {});
 }
 
+// annotate_screenshot through the browser extension: the annotating tab in view on that page
+// captures itself and posts the image to /verify-shot. null when no tab answered in time.
+async function shotFromTab(args) {
+  if (!state.listeners.size) return null;
+  const id = crypto.randomBytes(6).toString("hex");
+  const image = await new Promise((resolve) => {
+    const timer = setTimeout(() => { state.shotWaiters.delete(id); resolve(null); }, EXT_SHOT_MS);
+    state.shotWaiters.set(id, (img) => { clearTimeout(timer); state.shotWaiters.delete(id); resolve(img); });
+    broadcast({ type: "verify-shot", id, url: args.url ? String(args.url) : null, selector: args.selector ? String(args.selector) : null });
+  });
+  const m = /^data:image\/(png|jpeg);base64,(.+)$/.exec(String(image || ""));
+  return m ? { buf: Buffer.from(m[2], "base64"), ext: m[1] === "jpeg" ? "jpg" : "png" } : null;
+}
+
+// A screen recording from the page: kept as a file, and cut into stills Claude can read.
+const run = (cmd, argv) => new Promise((resolve, reject) => execFile(cmd, argv, { timeout: 60000 }, (e, out) => (e ? reject(e) : resolve(out))));
+async function saveVideo(dataUrl, duration) {
+  const m = /^data:video\/(webm|mp4)[^,]*;base64,(.+)$/.exec(String(dataUrl || ""));
+  if (!m) throw new Error("a webm or mp4 data URL is required");
+  const id = crypto.randomBytes(4).toString("hex");
+  const dir = path.join(SHOTS_DIR, "videos", id);
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `recording.${m[1]}`);
+  await fsp.writeFile(file, Buffer.from(m[2], "base64"));
+  const secs = Math.max(1, Number(duration) || 1);
+  const fps = Math.min(2, VIDEO_MAX_FRAMES / secs);
+  let frames = [];
+  try {
+    await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", file, "-vf", `fps=${fps.toFixed(3)},scale='min(1280,iw)':-2`, "-frames:v", String(VIDEO_MAX_FRAMES), path.join(dir, "frame-%02d.jpg")]);
+    frames = (await fsp.readdir(dir)).filter((f) => f.startsWith("frame-")).sort().map((f) => path.join(dir, f));
+  } catch (e) {
+    log(`video stills: none (${e.code === "ENOENT" ? "ffmpeg is not installed" : "ffmpeg could not read the recording"})`);
+  }
+  return { id, file, frames, duration: secs };
+}
+
+// The chat open in Claude Code may have changed (the desktop app rewrites its record of a chat when
+// it is focused), or a chat was typed in, started or ended: annotating tabs that follow the open chat
+// look again.
+const DESKTOP_CHATS = process.env.ANNOTATE_DESKTOP_DIR || path.join(os.homedir(), "Library", "Application Support", "Claude", "claude-code-sessions");
+function watchChats() {
+  let timer = null;
+  const changed = () => { clearTimeout(timer); timer = setTimeout(() => { if (state.listeners.size) broadcast({ type: "chats" }); }, 500); };
+  try { fs.watch(SESSIONS_DIR, changed); } catch (e) { log(`sessions watch: ${e.message}`); }
+  try { fs.watch(DESKTOP_CHATS, { recursive: true }, changed); } catch { /* not the desktop app: the chat typed in last stands in */ }
+}
+
 async function clearAll() {
   state.pages.clear();
   state.views.clear();
+  await fsp.rm(path.join(SHOTS_DIR, "videos"), { recursive: true, force: true }).catch(() => {});
   state.nextNote = 1;
   state.pending = [];
+  state.sent = [];
   for (const b of state.batches) await removeBatchFiles(b);
   state.batches = [];
   broadcast({ type: "clear" });
@@ -549,7 +692,7 @@ const TOOLS = [
   },
   {
     name: "annotate_screenshot",
-    description: "Take a screenshot of the annotation browser to verify a change. Returns the image inline and the file path. Optional url (rendered in a background tab, the user's tab stays where it is), full (full page), selector (clip to an element), chrome (keep the annotation toolbar visible, off by default).",
+    description: "Take a screenshot of the page to verify a change. Returns the image inline and the file path. With the browser extension, the annotating tab in view captures itself (no Chrome debugging needed; what is on screen only). Otherwise it uses the annotation browser. Optional url (the page to look at; without the extension it renders in a background tab), full (full page, debugging-port path only), selector (clip to an element), chrome (keep the annotation toolbar visible, off by default).",
     inputSchema: { type: "object", properties: { url: { type: "string" }, full: { type: "boolean" }, selector: { type: "string" }, chrome: { type: "boolean" } } },
   },
   {
@@ -610,6 +753,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const status = String(args.status);
       const message = String(args.message || "").trim();
       for (const [, p] of state.pages) for (const note of p.notes) if (note.n === n) { note.status = status; note.result = message; }
+      for (const note of state.sent) if (note.n === n) { note.status = status; note.result = message; }
       broadcast({ type: "progress", n, status, message });
       return text("ok");
     }
@@ -618,7 +762,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Without an id: the oldest batch still open, never a newer one Claude hasn't read yet.
       const batch = args.batch ? state.batches.find((b) => b.id === Number(args.batch)) : state.batches.find((b) => !b.done);
       if (batch) {
-        for (const [, p] of state.pages) for (const note of p.notes) if (note.batch === batch.id && (note.status === "pending" || note.status === "working")) note.status = "done";
+        for (const note of state.sent) if (note.batch === batch.id && (note.status === "pending" || note.status === "working")) note.status = "done";
         batch.done = true;
         await removeBatchFiles(batch);
         takePending(batch);
@@ -631,8 +775,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return text("shown");
     }
     case "annotate_screenshot": {
+      // First the extension: an annotating tab in view captures itself, no debugging port needed.
+      const viaTab = await shotFromTab(args).catch(() => null);
+      if (viaTab) {
+        await fsp.mkdir(SHOTS_DIR, { recursive: true });
+        const file = path.join(SHOTS_DIR, `verify-${Date.now()}.${viaTab.ext}`);
+        await fsp.writeFile(file, viaTab.buf);
+        return { content: [{ type: "text", text: `saved ${file} (captured by the browser extension: what the tab shows${args.full ? "; full page is not available this way" : ""})` }, { type: "image", data: viaTab.buf.toString("base64"), mimeType: viaTab.ext === "jpg" ? "image/jpeg" : "image/png" }] };
+      }
       // A url renders in a tab behind the user's (or reuses one already on it): never navigate the tab they're annotating.
-      const { page, temp } = args.url ? await pageFor(assertLocal(String(args.url))) : { page: mainPage && !mainPage.isClosed() ? mainPage : null, temp: false };
+      let opened;
+      try {
+        opened = args.url ? await pageFor(assertLocal(String(args.url))) : { page: mainPage && !mainPage.isClosed() ? mainPage : null, temp: false };
+      } catch (e) {
+        throw new Error(`No annotating tab showed ${args.url || "the page"}, and Chrome isn't open to remote debugging. Ask the user to turn annotation on in that tab (the extension's icon or ⌥⇧A) and keep it in view, then try again. (${String(e.message).split("\n")[0]})`);
+      }
+      const { page, temp } = opened;
       if (!page) throw new Error("No page open. Pass a url.");
       await fsp.mkdir(SHOTS_DIR, { recursive: true });
       const file = path.join(SHOTS_DIR, `verify-${Date.now()}.png`);
@@ -712,9 +870,9 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, X-Annot-Token",
 };
 const json = (res, code, obj) => { res.writeHead(code, { ...CORS, "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
-const readBody = (req) => new Promise((resolve, reject) => {
+const readBody = (req, max = 8e6) => new Promise((resolve, reject) => {
   let body = "";
-  req.on("data", (c) => { body += c; if (body.length > 8e6) { req.destroy(); reject(new Error("too large")); } });
+  req.on("data", (c) => { body += c; if (body.length > max) { req.destroy(); reject(new Error("too large")); } });
   req.on("end", () => resolve(body));
   req.on("error", reject);
 });
@@ -723,15 +881,19 @@ function pageState(url) {
   if (!state.pages.has(url)) state.pages.set(url, { shapes: [], notes: [] });
   return state.pages.get(url);
 }
+// notes, shapes, pages: what is on the pages, not sent yet. unsent: what Send would take.
+// sent, open: the notes that went out, and those Claude has not finished.
 function totals() {
-  let notes = 0, shapes = 0, pages = 0, unsent = 0, open = 0;
+  let notes = 0, shapes = 0, pages = 0, unsent = 0;
   for (const [, p] of state.pages) {
     if (!p.notes.length && !p.shapes.length) continue;
     pages++; notes += p.notes.length; shapes += p.shapes.length;
-    unsent += p.notes.filter((n) => !n.batch).length + p.shapes.filter((s) => !s.batch).length;
-    open += p.notes.filter((n) => n.batch && (n.status === "pending" || n.status === "working")).length;
+    // A mark and its comment are one thing to send; a mark without a comment is one too.
+    const commented = new Set(p.notes.map((n) => n.shape).filter(Boolean));
+    unsent += p.notes.filter(isSendable).length + p.shapes.filter((s) => !s.batch && !commented.has(s.id)).length;
   }
-  return { notes, shapes, pages, unsent, open, batches: state.batches.length };
+  const open = state.sent.filter((n) => n.status === "pending" || n.status === "working").length;
+  return { notes, shapes, pages, unsent, open, sent: state.sent.length, batches: state.batches.length };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -771,13 +933,18 @@ const server = http.createServer(async (req, res) => {
       const pages = [];
       for (const [page, p] of state.pages) if (p.notes.length || p.shapes.length) pages.push({ url: page, notes: p.notes, shapes: p.shapes.length });
       const batches = state.batches.map((b) => ({ id: b.id, notes: b.notes, pages: b.pages, done: !!b.done }));
-      return json(res, 200, { ok: true, mode: state.mode, totals: totals(), pages, batches });
+      // Batches Claude has not picked up yet, and whether a chat hook is waiting to hand the next one over.
+      const delivery = { queued: state.pending.length, listening: state.mode !== "chat" || !!state.hookWaiter };
+      return json(res, 200, { ok: true, mode: state.mode, totals: totals(), pages, sent: state.sent, batches, delivery });
     }
     if (req.method === "POST" && url.pathname === "/note/delete") {
       const body = JSON.parse((await readBody(req)) || "{}");
+      const n = Number(body.n);
       const p = state.pages.get(String(body.url || ""));
-      if (!p || !p.notes.some((n) => n.n === Number(body.n))) return json(res, 404, { ok: false, error: "no such note" });
-      p.notes = p.notes.filter((n) => n.n !== Number(body.n));
+      // A note that went out leaves the sidebar's sent list; one still on its page leaves the page.
+      if (state.sent.some((k) => k.n === n)) { state.sent = state.sent.filter((k) => k.n !== n); return json(res, 200, { ok: true, totals: totals() }); }
+      if (!p || !p.notes.some((k) => k.n === n)) return json(res, 404, { ok: false, error: "no such note" });
+      p.notes = p.notes.filter((k) => k.n !== n);
       broadcast({ type: "changed", url: body.url });
       return json(res, 200, { ok: true, totals: totals() });
     }
@@ -796,19 +963,29 @@ const server = http.createServer(async (req, res) => {
       });
       return json(res, 200, { ok: true });
     }
+    if (req.method === "POST" && url.pathname === "/verify-shot") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const w = state.shotWaiters.get(String(body.id || ""));
+      if (w) w(String(body.image || ""));
+      return json(res, 200, { ok: !!w });
+    }
+    if (req.method === "POST" && url.pathname === "/video") {
+      const body = JSON.parse((await readBody(req, 60e6)) || "{}");
+      try { return json(res, 200, { ok: true, video: await saveVideo(body.data, body.duration) }); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+    }
     if (req.method === "POST" && url.pathname === "/send") {
+      // The sidebar's Send says so; a tab's own Send (with its screenshot already uploaded) does not.
+      const body = JSON.parse((await readBody(req)) || "{}");
       if (state.sending) return json(res, 409, { ok: false, error: "busy" });
-      state.sending = true;
+      let sent;
       try {
-        let batch;
-        try { batch = await buildBatch(); } catch (e) { return json(res, 400, { ok: false, error: e.message }); }
-        const pushed = await deliver(batch);
-        log(`batch ${batch.id}: ${batch.notes} notes on ${batch.pages} page(s) → ${pushed ? "written to the channel" : { chat: "handed to the chat hook", poll: "handed to waiter", channel: "queued (pull)" }[state.mode]}`);
-        broadcast({ type: "sent", batch: batch.id, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode });
-        return json(res, 200, { ok: true, batch: batch.id, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals() });
-      } finally {
-        state.sending = false;
-      }
+        if (body.from === "prompt") sent = await rideAlong(body.skip);
+        else sent = body.from === "sidebar" ? await sendFromSidebar() : await sendNow();
+      } catch (e) { return json(res, e.message === "busy" ? 409 : 400, { ok: false, error: e.message }); }
+      const { batch, pushed } = sent;
+      const content = body.from === "prompt" ? batch.content : undefined; // the prompt carries it to Claude
+      return json(res, 200, { ok: true, batch: batch.id, ids: batch.ids, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals(), content });
     }
     if (req.method === "GET" && url.pathname === "/next") {
       // The chat hook's long poll. 200 carries a batch, 204 means ask again, 409 and 410 mean stop.
@@ -898,5 +1075,6 @@ server.listen(0, "127.0.0.1", async () => {
   endpoint = `http://127.0.0.1:${server.address().port}`;
   markReady();
   await writeSessionFile().catch((e) => log(`session file: ${e.message}`));
+  watchChats();
   log(`v${VERSION} ready at ${endpoint}`);
 });

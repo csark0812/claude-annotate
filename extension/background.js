@@ -1,7 +1,9 @@
 // Claude Annotate: turns annotation mode on and off per tab.
 //
-// On: ask the native host for the live Claude Code sessions, pick one (the one the user
-// picked in the icon's right-click menu, else the one they typed in last), and mount the overlay.
+// On: ask the native host for the live Claude Code sessions, pick one (the chat chosen for this tab
+// in the toolbar's chat pill, else the one picked in the icon's right-click menu, else the one
+// working in the folder of the dev server behind the page, else the one typed in last), and mount
+// the overlay.
 //  - A local dev page: in the page's main world with the session's endpoint and token, so it
 //    can read React's component and source data. The page is the user's own code.
 //  - Any other page: in this extension's isolated world. The page's scripts can't see it, and
@@ -27,9 +29,10 @@ function isWebUrl(url) {
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
-async function listSessions() {
+// With a page url, the host puts the sessions working on that page's project first.
+async function listSessions(url) {
   try {
-    const reply = await chrome.runtime.sendNativeMessage(HOST, { type: "sessions" });
+    const reply = await chrome.runtime.sendNativeMessage(HOST, { type: "sessions", url });
     if (!reply?.ok) throw new Error(reply?.error || "no reply");
     return reply.sessions;
   } catch (e) {
@@ -41,12 +44,32 @@ async function getPinnedPid() {
   return (await chrome.storage.local.get("pinnedPid")).pinnedPid ?? null;
 }
 
-async function targetSession() {
-  const sessions = await listSessions();
-  await chrome.storage.session.set({ sessionsByPid: Object.fromEntries(sessions.map((s) => [s.pid, s])) });
+async function targetSession(url, tabId) {
+  const sessions = await listSessions(url);
+  const { sessionsByPid = {}, chosen = {} } = await chrome.storage.session.get(["sessionsByPid", "chosen"]);
+  for (const s of sessions) sessionsByPid[s.pid] = s;
+  await chrome.storage.session.set({ sessionsByPid });
   const pinned = await getPinnedPid();
-  const session = sessions.find((s) => s.pid === pinned) ?? sessions[0] ?? null;
-  return { session, sessions, pinned };
+  const pick = (pid) => pid != null && sessions.find((s) => s.pid === pid);
+  // Automatic: the page's project, else the chat typed in last. A chat picked in the bar or the
+  // icon's menu holds instead.
+  const picked = pick(chosen[tabId]) || pick(pinned);
+  const session = picked || sessions[0] || null;
+  return { session, sessions, pinned, automatic: !picked };
+}
+
+// The chat a tab's notes go to, chosen in the overlay's chat pill. It holds across reloads until
+// the tab closes or that chat ends.
+async function chooseForTab(tabId, pid) {
+  const { chosen = {} } = await chrome.storage.session.get("chosen");
+  if (pid == null) delete chosen[tabId];
+  else chosen[tabId] = pid;
+  await chrome.storage.session.set({ chosen });
+}
+
+// What the overlay may know about a chat: never its endpoint or token.
+function chatInfo(s) {
+  return { pid: s.pid, title: s.title, lastPrompt: s.lastPrompt ?? null, folder: folder(s.cwd), servesPage: !!s.servesPage, at: s.lastPromptAt ?? s.startedAt, typed: s.lastPromptAt != null };
 }
 
 // ---------------------------------------------------------------------------
@@ -78,13 +101,14 @@ async function unmountOverlay(tabId) {
 
 // Records the tab's session first: an isolated overlay asks for it over the port as soon as it runs.
 // freezeHover: hold what the pointer rests on hovered (turned on from the keyboard).
-async function mountOverlay(tabId, url, session, { freezeHover = false } = {}) {
+// carry: unsent marks and comments brought over from the chat the tab sent to before.
+async function mountOverlay(tabId, url, session, { freezeHover = false, carry = null, automatic = true } = {}) {
   await unmountOverlay(tabId); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
   const version = chrome.runtime.getManifest().version;
   const local = isLocalUrl(url);
   const world = local ? "MAIN" : "ISOLATED";
-  const common = { renderOnly: false, version, startMode: "draw", freezeHover };
+  const common = { renderOnly: false, version, startMode: "draw", freezeHover, sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry };
   const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
@@ -110,6 +134,11 @@ chrome.webNavigation.onCompleted.addListener(async ({ tabId, frameId }) => {
 //  - "claude-annotate:exit" (Esc): turn the tab off, as a click on the icon would.
 //  - "claude-annotate:shoot" (Send): capture the visible tab; the answer comes back as
 //    "claude-annotate:shot" with a data URL, or "" when it could not be captured.
+//  - "claude-annotate:chats" (the chat pill opens): the answer comes back as
+//    "claude-annotate:chat-list", JSON { current, chats }, or "" when the list can't be had.
+//  - "claude-annotate:choose" (a chat was picked), JSON { pid, carry }: the overlay is mounted
+//    again, sending to that chat.
+// Details cross between worlds as strings: an object from the page's world arrives empty.
 function relayPage() {
   if (window.__claudeAnnotateRelay) return;
   window.__claudeAnnotateRelay = true;
@@ -121,6 +150,21 @@ function relayPage() {
     try { image = (await chrome.runtime.sendMessage({ type: "shoot" }))?.image || ""; } catch { /* reloaded */ }
     document.dispatchEvent(new CustomEvent("claude-annotate:shot", { detail: image }));
   });
+  document.addEventListener("claude-annotate:chats", async () => {
+    let list = "";
+    try { list = JSON.stringify(await chrome.runtime.sendMessage({ type: "chats" })); } catch { /* reloaded */ }
+    document.dispatchEvent(new CustomEvent("claude-annotate:chat-list", { detail: list }));
+  });
+  document.addEventListener("claude-annotate:recheck", async () => {
+    let pid = "";
+    try { pid = String((await chrome.runtime.sendMessage({ type: "recheck" }))?.pid ?? ""); } catch { /* reloaded */ }
+    document.dispatchEvent(new CustomEvent("claude-annotate:retarget", { detail: pid }));
+  });
+  document.addEventListener("claude-annotate:choose", (e) => {
+    let choice;
+    try { choice = JSON.parse(e.detail); } catch { return; }
+    try { chrome.runtime.sendMessage({ type: "choose", pid: choice.pid ?? null, carry: choice.carry ?? null, auto: !!choice.auto, follow: !!choice.follow }); } catch { /* reloaded */ }
+  });
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -131,14 +175,46 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       .then((image) => reply({ image }), (e) => reply({ image: "", error: e.message }));
     return true; // answered asynchronously
   }
+  if (msg?.type === "chats" && sender.tab) {
+    const tab = sender.tab;
+    Promise.all([targetSession(tab.url, tab.id), onTabs()])
+      .then(([{ sessions }, tabs]) => reply({ current: tabs[tab.id] ?? null, chats: sessions.map(chatInfo) }), () => reply(null));
+    return true;
+  }
+  // Following the active chat: which chat this tab should send to now, when that changed.
+  if (msg?.type === "recheck" && sender.tab) {
+    const tab = sender.tab;
+    Promise.all([targetSession(tab.url, tab.id), onTabs()])
+      .then(([{ session, automatic }, tabs]) => reply({ pid: automatic && session && session.pid !== tabs[tab.id] ? session.pid : null }), () => reply({ pid: null }));
+    return true;
+  }
+  // Back to following the open chat.
+  if (msg?.type === "choose" && sender.tab && msg.follow) {
+    const tab = sender.tab;
+    (async () => {
+      await chooseForTab(tab.id, null);
+      const { session, automatic } = await targetSession(tab.url, tab.id);
+      if (session) await mountOverlay(tab.id, tab.url, session, { carry: msg.carry, automatic });
+    })().catch(() => {});
+  }
+  // A chat picked in the bar (auto: the active chat changed, the tab keeps following).
+  if (msg?.type === "choose" && sender.tab && Number.isInteger(msg.pid)) {
+    const tab = sender.tab;
+    (async () => {
+      if (!msg.auto) await chooseForTab(tab.id, msg.pid);
+      const { sessions, automatic } = await targetSession(tab.url, tab.id);
+      const session = sessions.find((s) => s.pid === msg.pid);
+      if (session) await mountOverlay(tab.id, tab.url, session, { carry: msg.carry, automatic: msg.auto ? true : automatic });
+    })().catch(() => {});
+  }
 });
 
 async function turnOn(tab, opts) {
   if (!isWebUrl(tab.url)) throw new Error("Chrome doesn't let extensions draw on this page. Open a website or your dev server.");
-  const { session } = await targetSession();
+  const { session, automatic } = await targetSession(tab.url, tab.id);
   if (!session) throw new Error("No Claude Code session is running with the annotate plugin. Start one, then try again.");
   try {
-    await mountOverlay(tab.id, tab.url, session, opts);
+    await mountOverlay(tab.id, tab.url, session, { ...opts, automatic });
   } catch (e) {
     await setTabSession(tab.id, null);
     throw e;
@@ -158,12 +234,12 @@ async function toggle(tab, opts) {
 // Re-points every tab that is on at the session now chosen.
 async function remountAll() {
   const tabs = await onTabs();
-  const { session } = await targetSession();
   for (const id of Object.keys(tabs).map(Number)) {
-    if (!session) { await turnOff({ id }); continue; }
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) continue;
-    await mountOverlay(id, tab.url, session).catch(() => setTabSession(id, null));
+    const { session, automatic } = await targetSession(tab.url, id).catch(() => ({ session: null }));
+    if (!session) { await turnOff({ id }); continue; }
+    await mountOverlay(id, tab.url, session, { automatic }).catch(() => setTabSession(id, null));
   }
 }
 
@@ -175,15 +251,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if ((await onTabs())[tabId] == null) return;
   if (!isWebUrl(tab.url)) return setTabSession(tabId, null);
   try {
-    const { session } = await targetSession();
+    const { session, automatic } = await targetSession(tab.url, tabId);
     if (!session) return setTabSession(tabId, null);
-    await mountOverlay(tabId, tab.url, session); // fails on a site the user never granted: off
+    await mountOverlay(tabId, tab.url, session, { automatic }); // fails on a site the user never granted: off
   } catch {
     await setTabSession(tabId, null);
   }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await chooseForTab(tabId, null);
   const tabs = await onTabs();
   if (tabs[tabId] == null) return;
   delete tabs[tabId];
@@ -243,7 +320,7 @@ async function refreshMenu() {
     return;
   }
   const isPinned = sessions.some((s) => s.pid === pinned);
-  chrome.contextMenus.create({ id: "pid:auto", parentId: MENU_PARENT, type: "radio", checked: !isPinned, title: `The session I typed in last (${folder(sessions[0].cwd)})`, contexts: ["action"] });
+  chrome.contextMenus.create({ id: "pid:auto", parentId: MENU_PARENT, type: "radio", checked: !isPinned, title: "Automatic: the chat I typed in last (the page's project first)", contexts: ["action"] });
   for (const s of sessions) {
     chrome.contextMenus.create({ id: `pid:${s.pid}`, parentId: MENU_PARENT, type: "radio", checked: s.pid === pinned, title: describeSession(s), contexts: ["action"] });
   }
@@ -272,6 +349,7 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
   if (!String(info.menuItemId).startsWith("pid:")) return;
   const pid = info.menuItemId === "pid:auto" ? null : Number(String(info.menuItemId).slice(4));
   await chrome.storage.local.set({ pinnedPid: pid });
+  await chrome.storage.session.set({ chosen: {} }); // the menu speaks for every tab
   await remountAll();
   refreshMenu();
 });

@@ -33,7 +33,7 @@ claude --dangerously-load-development-channels plugin:annotate@claude-annotate
 
 Claude Code shows a full-screen notice about development channels. Pick "I am using this for local development". After the banner a dim line must say that messages from `plugin:annotate@claude-annotate` inject into this session.
 
-If the line says **blocked by org policy**, an admin has to enable channels for the organization (claude.ai → Admin settings → Claude Code → Channels). Until then use `/annotate <url> --poll`, which needs no flag.
+If the line says **blocked by org policy**, an admin has to enable channels for the organization (claude.ai → Admin settings → Claude Code → Channels). Until then use Add to chat: the notes go with the next message, which needs no flag.
 
 Suggest an alias for the person, for example in their shell profile:
 
@@ -43,25 +43,18 @@ alias claude-annotate='claude --dangerously-load-development-channels plugin:ann
 
 ## 4. Verify
 
-With a dev server running, in the session:
+With the Chrome extension set up (`npm run extension:install`, then Load unpacked on `extension/`) and a dev server running: open the page in Chrome and turn annotating on with the extension's icon or `⌥⇧A`.
 
-```text
-/annotate http://localhost:3000/
-```
-
-Expected: a Chrome window opens on that URL with a floating toolbar at the bottom and a green dot on the hand icon. Press `N`, click anywhere, type a word, press `↵`, then click **Send to Claude**. The session should receive a channel event within a few seconds and Claude should read a PNG path from it. The page shows a toast starting with "Sent 1 note."
-
-If nothing arrives in the session within a few seconds, type `/annotate pull`. If a batch comes back, the channel is not active in this session: go back to step 3.
+Expected: a bar at the bottom of the page says *Annotating · 0* and **To** the chat open in Claude Code. Click an element, type a word, press `↵`, then **Add to chat**. Above the prompt of that chat a chip says *1 annotation*; press its **Send** and Claude should read a PNG path from the message.
 
 ## 5. Clean up
 
-`/annotate close` closes the window. Temporary screenshots are removed when Claude calls done, on Clear, and when the session ends. The Chrome profile stays in `~/.cache/claude-annotate/chrome-profile/` so logins persist; delete it to reset.
+Turn annotating off with the extension's icon. Temporary screenshots are removed when Claude calls done, on Clear, and when the session ends. The Chrome profile stays in `~/.cache/claude-annotate/chrome-profile/` so logins persist; delete it to reset.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `/annotate` says it cannot launch chrome | No Chrome at the standard path, or the shared profile is locked by a crashed window | Install Chrome or set `ANNOTATE_BROWSER`; kill stray `Google Chrome` processes whose arguments contain `claude-annotate/chrome-profile` |
 | `/mcp` shows the annotate server as failed | The packages did not install, or Node is too old | `claude plugin update annotate@claude-annotate`, or `npm install` inside the plugin directory, then start a new session |
 | Marks drawn but Send does nothing | The bridge is unreachable (red dot on the toolbar) | Restart the session; the server and the overlay share one process |
-| Progress never shows on the page | Claude is not calling `annotate_progress` | Remind it: the `/annotate` command and the server instructions describe the protocol |
+| Progress never shows on the page | Claude is not calling `annotate_progress` | Remind it: the server's instructions describe the protocol |

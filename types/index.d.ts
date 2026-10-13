@@ -6,21 +6,44 @@ export type Note = {
   status?: NoteStatus
   result?: string
   batch?: number
-  /** The overlay's ink: pink, sun, cyan or lime. */
+  /** The overlay's ink: blue (pink, sun, cyan or lime from an older overlay). */
   color?: string
+  /** A small JPEG of the tab around the note, cut by the overlay when the note was saved. */
+  preview?: Preview | null
+  /** A screen recording the note is about: the file, its stills, its length in seconds. */
+  video?: { file: string; frames?: string[]; duration?: number } | null
+  /** What the note is on, as the overlay read it. */
+  ctx?: { selector?: string } | null
+}
+
+export type Preview = { src: string; w: number; h: number }
+
+/** A note that went to Claude and left its page. */
+export type SentNote = {
+  url: string
+  n: number
+  text: string
+  color?: string
+  batch: number
+  status: NoteStatus
+  result: string
+  preview: Preview | null
 }
 
 export type Page = { url: string; notes: Note[]; shapes: number }
 
-export type Totals = { notes: number; shapes: number; pages: number; unsent: number; open: number; batches: number }
+export type Totals = { notes: number; shapes: number; pages: number; unsent: number; open: number; sent: number; batches: number }
+
+/** Batches sent but not yet in Claude's hands; `listening` is false when no chat hook waits to wake Claude. */
+export type Delivery = { queued: number; listening: boolean }
 
 /** What the annotate server's GET /overview answers, or why there is nothing to show. */
 export type Overview =
-  | { kind: 'linked'; mode: string; totals: Totals; pages: Page[] }
+  | { kind: 'linked'; mode: string; totals: Totals; pages: Page[]; sent: SentNote[]; delivery: Delivery }
   | { kind: 'no-server' }
 
 declare module 'claude-code' {
   interface PluginState {
-    annotate: { overview: Overview; error: string | null; confirmClear: boolean }
+    annotate: { overview: Overview; error: string | null; confirmClear: boolean; expanded: boolean }
   }
 }

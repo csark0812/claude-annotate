@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// Async rewake hook, armed at session start and again after annotate_open and annotate_done.
+// Async rewake hook, armed at session start, at the end of every turn (Stop), and after
+// annotate_open and annotate_done. Each delivery uses one up, so the Stop arming keeps Send working
+// when Claude finishes a batch without calling annotate_done. A newer hook replaces an older one (410).
 // It waits in the background until the user hits Send, then exits 2 with the batch on stderr.
 // Claude Code wakes the session and shows the batch in the chat. Exit 0 (silent) when there
 // is nothing to wait for.
-import { findSession, readStdin } from "./session.mjs";
+import { chatFields, findSession, findSessionFile, readStdin, stampSession } from "./session.mjs";
 
 const SESSION_WAIT_MS = 30000; // at session start the annotate server may not have written its file yet
 
@@ -14,6 +16,8 @@ for (const until = Date.now() + waitMs; !session && Date.now() < until; session 
   await new Promise((r) => setTimeout(r, 1000));
 }
 if (!session) process.exit(0);
+const file = findSessionFile();
+if (file && input.transcript_path) stampSession(file, chatFields(input)); // so the extension can name this chat before anyone types
 
 for (;;) {
   let res;

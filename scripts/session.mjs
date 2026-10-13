@@ -22,6 +22,22 @@ export function findSessionFile() {
   return null;
 }
 
+// Adds fields to this session's file: when the user last typed, and the chat's transcript, where
+// the extension reads the chat's title. A session that ended meanwhile has nothing to stamp.
+export function stampSession(file, fields) {
+  try {
+    const session = JSON.parse(fs.readFileSync(file, "utf8"));
+    fs.writeFileSync(file, JSON.stringify({ ...session, ...fields }));
+  } catch {
+    // Gone or being rewritten: skip it this time.
+  }
+}
+
+// What a hook's input says about the chat it runs in.
+export function chatFields(input) {
+  return input?.transcript_path ? { transcriptPath: input.transcript_path } : {};
+}
+
 export function readStdin() {
   return new Promise((resolve) => {
     let input = "";
