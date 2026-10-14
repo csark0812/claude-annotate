@@ -445,8 +445,18 @@ async function noteOn(page, selector, text) {
 
     // Following the open chat mounts the overlay again: the old one leaves, and a note saved after
     // reaches Claude by itself. Then Esc leaves annotating.
-    await page.evaluate((pid) => document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ pid, auto: true }) })), session.pid);
-    await sleep(500);
+    const before = await page.evaluate(() => document.querySelector("claude-annotate")?.shadowRoot?.querySelector(".bar") ? 1 : 0);
+    await page.evaluate(() => { window.__oldOverlay = document.querySelector("claude-annotate"); });
+    await sw.evaluate((id) => self.claudeAnnotate.remount(id), tabId);
+    assert.equal(before, 1, "the overlay was up before the remount");
+    assert.ok(await page.evaluate(() => window.__oldOverlay && !window.__oldOverlay.isConnected), "the old overlay left the page");
+    // A page's own script can't drive the extension: a fake choose from the page does nothing.
+    const leaked = await page.evaluate(() => new Promise((resolve) => {
+      document.addEventListener("claude-annotate:chat-list", (e) => resolve(e.detail || "empty"), { once: true });
+      document.dispatchEvent(new CustomEvent("claude-annotate:chats"));
+      setTimeout(() => resolve(null), 1000);
+    }));
+    assert.equal(leaked, null, "the page gets no chat list");
     await until("one overlay after the remount", async () => (await page.evaluate(() => document.querySelectorAll("claude-annotate").length)) === 1 && (await overlayMode(page)) === "draw");
     await noteOn(page, "#inc", "after following the chat");
     const auto = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json(); // throws when nothing comes

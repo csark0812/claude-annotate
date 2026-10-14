@@ -22,7 +22,9 @@ const ICONS = (kind) => Object.fromEntries([16, 32, 48, 128].map((s) => [s, `ico
 function isLocalUrl(url) {
   let h;
   try { h = new URL(url).hostname; } catch { return false; }
-  return /^(localhost|127(\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2})$/.test(h) || /\.(localhost|test|local|internal)$/.test(h);
+  // This machine only: a LAN device or an intranet site (192.168.x, *.local, *.internal) is
+  // somebody else's code, and is annotated from the isolated world like any other site.
+  return /^(localhost|127(\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)$/.test(h) || /\.(localhost|test)$/.test(h);
 }
 
 // Pages the overlay can be put into: http, https and file pages, every site. Chrome keeps
@@ -165,7 +167,10 @@ async function mountOverlay(tabId, url, session, { carry = null, automatic = tru
   const cfg = await overlayConfig(tabId, url, session, { carry, automatic });
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
-  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayPage });
+  // The DOM relay serves an overlay in the page's own world, which has no extension API. An
+  // isolated overlay asks the worker directly: no page script can drive the extension or read
+  // its answers (the chat list, a screenshot of the tab).
+  if (local) await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayPage });
   await addFrameHelpers(tabId);
 }
 
@@ -545,6 +550,12 @@ chrome.commands.onCommand.addListener(onShortcut);
 self.claudeAnnotate = {
   click: async (tabId) => onIconClick(await chrome.tabs.get(tabId)),
   shortcut: async (command, tabId) => onShortcut(command, await chrome.tabs.get(tabId)),
+  // What following another chat does to a tab: the overlay taken off and put on again.
+  remount: async (tabId) => {
+    const tab = await chrome.tabs.get(tabId);
+    const { session, automatic } = await targetSession(await pageUrlOf(tab), tabId);
+    await mountOverlay(tabId, tab.url, session, { automatic });
+  },
 };
 
 // ---------------------------------------------------------------------------

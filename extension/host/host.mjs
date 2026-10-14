@@ -162,7 +162,12 @@ function rankByFocus(sessions, focus) {
     const id = s.transcriptPath ? path.basename(s.transcriptPath, ".jsonl") : null;
     s.focusedAt = (id && focus.get(id)) || null;
   }
-  return sessions.map((s, i) => [s, i]).sort(([a, i], [b, j]) => (b.focusedAt ?? 0) - (a.focusedAt ?? 0) || i - j).map(([s]) => s);
+  // The chat used last: focused in the desktop app, or typed in (a terminal chat has no focus record,
+  // and one just typed in must not lose to a desktop chat focused before it).
+  // No desktop app: the order for the page stands (its project first, then typed in last).
+  if (!sessions.some((s) => s.focusedAt)) return sessions;
+  const lastUsed = (s) => Math.max(s.focusedAt ?? 0, s.lastPromptAt ?? 0);
+  return sessions.map((s, i) => [s, i]).sort(([a, i], [b, j]) => lastUsed(b) - lastUsed(a) || i - j).map(([s]) => s);
 }
 
 async function reachableSessions(url) {

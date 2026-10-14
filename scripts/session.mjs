@@ -5,10 +5,13 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 
 const SESSIONS = path.join(os.homedir(), ".cache", "claude-annotate", "sessions");
-const parentOf = (pid) => { try { return Number(execSync(`ps -o ppid= -p ${pid}`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim()); } catch { return 0; } };
+const ps = (field, pid) => { try { return execSync(`ps -o ${field}= -p ${pid}`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { return ""; } };
+const parentOf = (pid) => Number(ps("ppid", pid)) || 0;
+const isClaude = (pid) => path.basename(ps("comm", pid)) === "claude";
 
-// Walk up the process tree (hook → shell → claude) until a session file matches.
-// No match means no annotate session for this tree: return null, never guess another session's page.
+// Walk up the process tree (hook → shell → claude) until a session file matches, and no further
+// than the first Claude Code: a claude started inside another chat (claude -p from a tool) has its
+// own session, never the outer chat's. No match: return null, never guess another session's page.
 export function findSession() {
   const file = findSessionFile();
   return file ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
@@ -18,6 +21,7 @@ export function findSessionFile() {
   for (let pid = process.ppid, i = 0; pid > 1 && i < 4; pid = parentOf(pid), i++) {
     const f = path.join(SESSIONS, `${pid}.json`);
     if (fs.existsSync(f)) return f;
+    if (isClaude(pid)) return null;
   }
   return null;
 }
@@ -27,7 +31,7 @@ export function findSessionFile() {
 export function stampSession(file, fields) {
   try {
     const session = JSON.parse(fs.readFileSync(file, "utf8"));
-    fs.writeFileSync(file, JSON.stringify({ ...session, ...fields }));
+    fs.writeFileSync(file, JSON.stringify({ ...session, ...fields }), { mode: 0o600 });
   } catch {
     // Gone or being rewritten: skip it this time.
   }

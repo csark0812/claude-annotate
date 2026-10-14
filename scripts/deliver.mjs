@@ -19,12 +19,23 @@ if (!session) process.exit(0);
 const file = findSessionFile();
 if (file && input.transcript_path) stampSession(file, chatFields(input)); // so the extension can name this chat before anyone types
 
+const RESTART_WAIT_MS = 30000; // a restarted server (same chat, new port and token) writes its file again
+
 for (;;) {
   let res;
   try {
     res = await fetch(`${session.endpoint}/next`, { headers: { "X-Annot-Token": session.token }, signal: AbortSignal.timeout(300000) });
   } catch {
-    process.exit(0); // the server is gone (session ended)
+    // The server is gone: the chat ended, or its server restarted. Wait on the new one if it comes.
+    const gone = session.token;
+    session = null;
+    for (const until = Date.now() + RESTART_WAIT_MS; !session && Date.now() < until;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const found = findSession();
+      if (found && found.token !== gone) session = found; // a file left by the dead server is not a new one
+    }
+    if (!session) process.exit(0);
+    continue;
   }
   if (res.status === 204) continue; // the long poll expired: ask again
   if (res.status !== 200) process.exit(0); // a newer hook took over (410), or not in chat delivery (409)

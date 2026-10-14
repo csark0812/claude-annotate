@@ -84,6 +84,10 @@ fs.writeFileSync(path.join(desktopDir, "acct", "org", "local_a.json"), JSON.stri
 const focused = await askHost({ type: "sessions", url: `${fake}/some/page` }, hostDir, desktopDir);
 assert.deepEqual(focused.sessions.map((s) => [s.token, s.focusedAt]), [["parent", 99], ["me", null]], "the open chat first");
 assert.equal(focused.sessions[0].transcriptPath, undefined, "transcript paths stay in the host");
+// A terminal chat (no focus record) typed in after the desktop chat was focused comes first.
+fs.writeFileSync(path.join(hostDir, `${process.pid}.json`), JSON.stringify({ endpoint: fake, token: "me", cwd: path.dirname(process.cwd()), startedAt: 5, lastPromptAt: 500 }));
+const typed = await askHost({ type: "sessions", url: `${fake}/some/page` }, hostDir, desktopDir);
+assert.deepEqual(typed.sessions.map((s) => s.token), ["me", "parent"], "the terminal chat typed in last beats an older desktop focus");
 assert.equal((await askHost({ type: "nope" }, hostDir)).ok, false, "unknown message refused");
 fakeServer.close();
 console.log("✓ native host lists live sessions");
@@ -342,6 +346,31 @@ console.log("✓ a Send from Claude Code is immediate, even with a silent tab");
   assert.match(edited.content, /### Note 23 — "first, changed"/, "it goes with the changed words");
 }
 console.log("✓ notes go to Claude by themselves, no Send");
+
+// What a tab saves is checked: a bad note is dropped, never stored where it breaks the session or
+// names a file; a note that went out is not sent again when a tab saves it again; text survives.
+{
+  const put = (notes, shapes = []) => fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes, notes }) });
+  const outside = path.join(os.tmpdir(), `annotate-escape-${process.pid}`);
+  const bad = await put([null, { id: "t1", n: `/../../../../../../../../..${outside}`, text: "x", preview: { src: "data:image/png;base64,AAAA" } }, { id: "c1", n: 31, x: 1, y: 1, text: "no rect", ctx: { selector: "div" } }], [null]);
+  assert.equal(bad.status, 200, "a bad note is dropped, the save goes on");
+  assert.equal((await fetch(`${endpoint}/overview`, { headers: H })).status, 200, "the session still answers");
+  const got = await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  assert.match(got.content, /### Note 31 — "no rect"/, "a note without a rect still goes");
+  assert.ok(!fs.existsSync(`${outside}.png`), "a note number never names a file outside the batch");
+  await put([{ id: "c1", n: 31, x: 1, y: 1, text: "no rect" }]); // a tab that missed "sent"
+  await sleep(2000);
+  assert.equal((await (await fetch(`${endpoint}/overview`, { headers: H })).json()).delivery.queued, 0, "a sent note saved again is not sent twice");
+  const words = "é 漢字 🙂 ".repeat(300);
+  await put([{ id: "u1", n: 32, x: 1, y: 1, text: words }]);
+  const utf = await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  assert.ok(utf.content.includes(words.replace(/\s+/g, " ").trim().slice(0, 200)) && !utf.content.includes("\uFFFD"), "UTF-8 survives a large body");
+  await put([{ id: "d1", n: 33, x: 1, y: 1, text: "", shape: "dm" }], [{ id: "dm", type: "rect", x: 1, y: 1, w: 5, h: 5 }]);
+  await fetch(`${endpoint}/note/delete`, { method: "POST", headers: H, body: JSON.stringify({ url, n: 33 }) });
+  const left = await (await fetch(`${endpoint}/state?url=${encodeURIComponent(url)}`, { headers: H })).json();
+  assert.deepEqual([left.notes.length, left.shapes.length], [0, 0], "deleting a note takes its mark with it");
+}
+console.log("✓ bad saves are dropped; sent notes never twice; UTF-8 intact; delete takes the mark");
 
 
 // The Claude Code bar's follower: "up" once linked, then a line for each change, with no token in its argv.

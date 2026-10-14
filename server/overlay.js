@@ -26,7 +26,7 @@
   const RENDER_ONLY = !!CFG.renderOnly || !!window.__CLAUDE_ANNOTATE_RENDER_ONLY__;
 
   function isLocalHost(h) {
-    return /^(localhost|127(\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2})$/.test(h) || /\.(localhost|test|local|internal)$/.test(h);
+    return /^(localhost|127(\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)$/.test(h) || /\.(localhost|test)$/.test(h);
   }
 
   // ---------------------------------------------------------------------------
@@ -328,7 +328,10 @@
   // page while they shrink away (flushOut), but the server took them already: saving them again
   // would put them back, and they would go to Claude twice.
   const leaving = new Set();
-  const stateBody = (url) => ({ url, shapes: shapes.filter((x) => !leaving.has(x.id)), notes: notes.filter((n) => !leaving.has(n.id)) });
+  // Who saves: this overlay, for its whole life. Two tabs on one page each save the page as they know
+  // it; the server keeps what the other tab added and this one never saw.
+  const SAVER = Math.random().toString(36).slice(2, 12);
+  const stateBody = (url) => ({ url, tab: SAVER, shapes: shapes.filter((x) => !leaving.has(x.id)), notes: notes.filter((n) => !leaving.has(n.id)) });
   let saveTimer = null;
   const save = () => {
     clearTimeout(saveTimer);
@@ -361,7 +364,8 @@ svg.ink .line:not(.box) { fill: none; }
 svg.ink .line { stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 svg.ink .head { stroke: rgba(10,8,14,.42); stroke-width: 2; stroke-linejoin: round; }
 svg.ink g.draft { opacity: .9; }
-:host(.capturing) svg.ink .hit, :host(.capturing) .chrome, :host(.capturing) .pop { display: none !important; }
+:host(.capturing) svg.ink .hit, :host(.capturing) .chrome { display: none !important; }
+:host(.capturing) .pop { opacity: 0 !important; } /* out of the picture, but a comment being typed keeps its focus */
 :host(.capturing) .pin .tag { white-space: normal; width: max-content; max-width: 260px; border-radius: 12px; }
 :host(.capturing) .pin .dot { animation: none; }
 
@@ -1217,7 +1221,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (!popNote) return;
     const ta = popover.querySelector("textarea");
     const t = (ta.value || "").trim();
-    if (!t) { deleteNote(popNote.id, false, true); closePopover(); return; }
+    if (!t) { deleteNote(popNote.id); closePopover(); return; } // nothing said: the mark goes too
     pushUndo();
     const note = popNote;
     note.text = t;
@@ -1228,7 +1232,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     capturePreview(note);
   }
   function cancelPopover(isNew) {
-    if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true, true);
+    if (isNew && popNote && !popNote.text) deleteNote(popNote.id, true);
     closePopover();
   }
   function closePopover() {
@@ -1268,7 +1272,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   let creating = false;
   // A comment on a mark (shape) is a note pinned to it: it reports what the mark covers, and
-  // deleting it deletes the mark. Left empty, the note goes and the mark stays.
+  // deleting it deletes the mark. Left empty, both go: a mark with nothing said tells Claude nothing.
   async function createNote(x, y, shape = null, extra = null) {
     if (creating) return;
     creating = true;
@@ -1289,7 +1293,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     pushUndo();
     shapes = []; notes = []; anchors.clear(); phase = "idle";
     renderInk(); renderPins(); renderToolbar();
-    try { await req("POST", "/clear"); toast("Cleared. Fresh page.", "ok"); } catch (e) { toast(e.message === "busy" ? "Still sending, clear again in a moment." : `Couldn't clear: ${e.message}`); }
+    try { await req("POST", "/clear", { url: pageUrl() }); toast("Cleared. Fresh page.", "ok"); } catch (e) { toast(e.message === "busy" ? "Still sending, clear again in a moment." : `Couldn't clear: ${e.message}`); }
   }
 
   // ---------------------------------------------------------------------------
@@ -1461,7 +1465,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     rec.phase = "saving";
     renderToolbar();
     if (rec.via === "tab") {
-      document.dispatchEvent(new CustomEvent("claude-annotate:rec-stop", { detail: JSON.stringify({ cancel }) }));
+      tellExtension("rec-stop", { cancel });
       return;
     }
     rec.cancel = cancel;
@@ -1509,7 +1513,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     s.ctx = { selector: "recording", text: `${Math.round(video.duration || 0)} s`, rect: [s.x, s.y, s.w, s.h], chain: "", react: { components: [], source: null } };
     addShape(s);
     createNote(Math.round(scrollX + innerWidth / 2), Math.round(scrollY + innerHeight / 2), s, { video });
-    if (CFG.startMode === "draw") document.dispatchEvent(new CustomEvent("claude-annotate:rec-taken"));
+    if (CFG.startMode === "draw") tellExtension("rec-taken");
   }
   // What the user does while recording, with the time: the timeline Claude reads beside the stills.
   // Page navigations are the extension's to write down (it sees them across page loads).
@@ -1540,7 +1544,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const log = (kind, extra) => {
       if (!rec || rec.phase !== "recording") return;
       const ev = { t: Math.round((Date.now() - rec.startedAt) / 100) / 10, kind, ...extra };
-      if (rec.via === "tab") document.dispatchEvent(new CustomEvent("claude-annotate:rec-event", { detail: JSON.stringify(ev) }));
+      if (rec.via === "tab") tellExtension("rec-event", { event: ev }, ev);
       else if (rec.events.length < 300) rec.events.push(ev);
     };
     const pageEvent = (e) => rec && !fromOverlay(e);
@@ -1701,8 +1705,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Leaving annotation mode: through the extension (it unmounts us), or back to browsing.
   function exitAnnotating() {
     if (popNote) commitPopover();
-    if (CFG.startMode === "draw") document.dispatchEvent(new CustomEvent("claude-annotate:exit"));
-    else setMode("browse");
+    if (CFG.startMode !== "draw") return setMode("browse");
+    tellExtension("exit");
+    // The extension unmounts us. One reloaded or updated since can't: leave on our own.
+    setTimeout(() => { if (!off.signal.aborted) api.unmount(); }, 1500);
   }
   // Take a screenshot: the part of the page in view becomes an area mark, with a comment to write.
   function screenshotView() {
@@ -1818,11 +1824,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       if (!drag || drag.kind !== "pin") return;
       const d = drag; drag = null;
       host.classList.remove("dragging");
+      if (!notes.includes(d.n)) return; // sent meanwhile: nothing to move or open
       if (d.moved) { undo.push(d.before); if (undo.length > 60) undo.shift(); redo.length = 0; d.n.ctx = ctxAtPoint(d.n.x, d.n.y); renderPins(); save(); renderToolbar(); }
       else openPopover(d.n, false);
     };
     pinsLayer.addEventListener("pointerup", endPinDrag);
     pinsLayer.addEventListener("pointercancel", endPinDrag);
+    pinsLayer.addEventListener("lostpointercapture", endPinDrag); // the pin left the page (sent) mid-drag
 
     // Window-level listeners go through `off` so unmount() removes them all at once.
     const { signal } = off;
@@ -1830,6 +1838,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     bindRecordingLog(signal);
     bindPageLog(signal);
     document.addEventListener("claude-annotate:rec-state", (e) => { try { onRecState(JSON.parse(e.detail)); } catch { /* not ours */ } }, { signal });
+    if (EXT) { const onMsg = (m) => { if (m && m.type === "rec-state") onRecState(m); }; EXT.onMessage.addListener(onMsg); signal.addEventListener("abort", () => EXT.onMessage.removeListener(onMsg)); }
     // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
     document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
 
@@ -1926,7 +1935,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   // The pin goes where the click was, on the element it picked.
   async function pickElement(cx, cy) {
+    if (creating) return; // a double click: one mark, one note
     const pick = await pickIn(document, cx, cy, true);
+    if (creating) return;
     hideHighlight();
     const at = [Math.round(cx + scrollX), Math.round(cy + scrollY)];
     if (!pick || pick.rect[2] < 2 || pick.rect[3] < 2) return;
@@ -2038,7 +2049,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     // An area: the pin sits where the drag ended.
     const ok = d.w >= 8 && d.h >= 8;
     delete d._ox; delete d._oy;
-    if (!ok) { renderDraft(); return; }
+    if (!ok || creating) { renderDraft(); return; }
     addShape(d);
     hideHighlight();
     createNote(Math.round(lastPointer[0]), Math.round(lastPointer[1]), d);
@@ -2182,7 +2193,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
     await req("PUT", "/state", stateBody(url)).catch(() => {});
-    document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ pid, carry, auto }) }));
+    tellExtension("choose", { pid, carry, auto: !!auto });
   }
   // The chat open in Claude Code changed: a tab on Automatic follows it, unsent notes and all.
   // Not mid-comment or mid-recording: the next change looks again.
@@ -2204,7 +2215,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
     await req("PUT", "/state", stateBody(url)).catch(() => {});
-    document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ follow: true, carry }) }));
+    tellExtension("choose", { follow: true, carry });
   }
 
   // The new chat's server numbers its own comments: carried ones get the next numbers there.
@@ -2325,12 +2336,29 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   // The extension's isolated-world relay answers "claude-annotate:shoot" with "claude-annotate:shot"
   // (a data URL, or "" when the tab could not be captured). DOM events reach it from either world.
+  // The extension's worker. From its isolated world (any site that is not local, and the snapshot
+  // page) the overlay asks it directly, out of the page's sight. In a local page's own world there is
+  // no extension API: there it goes through the relay's DOM events (extension/relay.js).
+  const EXT = VIA_PORT && globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id ? globalThis.chrome.runtime : null;
+  // The relay's answers, as strings, from the worker's replies.
+  const ANSWER = { shoot: (r) => (r && r.image) || "", chats: (r) => JSON.stringify(r ?? null), recheck: (r) => String((r && r.pid) ?? ""), relink: (r) => JSON.stringify(r ?? null), "rec-start": (r) => JSON.stringify(r ?? null) };
+  function tellExtension(type, msg = {}, detail = msg) {
+    if (EXT) { try { EXT.sendMessage({ type, ...msg }); } catch { /* the extension was reloaded */ } return; }
+    document.dispatchEvent(new CustomEvent(`claude-annotate:${type}`, { detail: JSON.stringify(detail) }));
+  }
   async function askExtensionForShot() {
     const image = await askExtension("claude-annotate:shoot", "claude-annotate:shot");
     return image && image.startsWith("data:image/") ? image : null;
   }
   // One question to the extension's relay, answered by one event with a string detail (null: no answer).
   function askExtension(ask, answer, ms = 4000) {
+    const type = ask.replace("claude-annotate:", "");
+    if (EXT) {
+      return Promise.race([
+        EXT.sendMessage({ type }).then((r) => ANSWER[type](r), () => null),
+        new Promise((r) => setTimeout(() => r(null), ms)),
+      ]).catch(() => null);
+    }
     return new Promise((resolve) => {
       const timer = setTimeout(() => done(null), ms);
       const done = (v) => { clearTimeout(timer); document.removeEventListener(answer, onAnswer); resolve(v); };
@@ -2354,7 +2382,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // ---------------------------------------------------------------------------
   async function hydrate() {
     try {
-      const r = await req("GET", `/state?url=${encodeURIComponent(pageUrl())}`);
+      const r = await req("GET", `/state?url=${encodeURIComponent(pageUrl())}&tab=${SAVER}`);
       shapes = r.shapes || [];
       notes = r.notes || [];
       await takeCarried();
@@ -2372,6 +2400,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // keeps trying. Nothing for the user to do.
   const RELINK_MS = [250, 500, 1000, 2000, 5000];
   const LINK_GIVE_UP_MS = 10000;
+  const sentHere = new Set(); // numbers of the notes this tab sent that Claude has not finished
   let tabId = null, relinkTimer = null, relinkTries = 0, linkLostAt = 0, restoreOnHello = false;
   const presenceQuery = () => new URLSearchParams({ url: pageUrl(), title: document.title.slice(0, 200), kind: mode === "record" ? "recording" : "annotating", visible: document.visibilityState === "visible" ? "1" : "0" }).toString();
   function connectSse() {
@@ -2427,6 +2456,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "progress": {
           const n = notes.find((k) => k.n === m.n);
           if (n) { n.status = m.status; updatePin(n); }
+          // A note sent from this tab has left the page: Claude's word on it comes as a toast.
+          else if (sentHere.has(m.n) && (m.status === "done" || m.status === "skipped")) {
+            toast(`${m.status === "done" ? "Done" : "Skipped"} · ${m.n}${m.message ? ` · ${m.message}` : ""}`, m.status === "done" ? "ok" : "");
+          }
           if (m.status === "done") { const d = pinsLayer.querySelector(`.pin[data-id="${n ? n.id : ""}"] .dot`); if (d) d.classList.add("wiggle"); }
           break;
         }
@@ -2434,13 +2467,15 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "sent": // the server sent what was on the pages, this tab's notes among them or not
           phase = "sent"; if (m.totals) totals = m.totals;
           if ((m.ids || []).some((id) => notes.some((n) => n.id === id))) toast(`Sent to ${chatLabel()}.`, "ok");
+          for (const n of notes) if ((m.ids || []).includes(n.id)) sentHere.add(n.n);
           flushOut(m.ids || []);
           break;
-        case "changed": if (m.url === pageUrl() && !draft && !popNote && !drag) hydrate(); break; // edited from outside the page
+        case "changed": if (m.url === pageUrl() && m.from !== SAVER && !saveTimer && !draft && !popNote && !drag) hydrate(); break; // edited from outside this tab
         case "chats": followOpenChat(); break; // a chat was opened, typed in, started or ended
         case "ask": answerAsk(m); break; // Claude's annotate_screenshot, annotate_read, annotate_inspect…
         case "stop": exitAnnotating(); break; // the ✕ on the bar in Claude Code
         case "done":
+          if (sentHere.size) { toast(m.summary ? `Claude: ${m.summary}` : "Claude is done.", "ok"); sentHere.clear(); }
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";
           totals.open = 0;

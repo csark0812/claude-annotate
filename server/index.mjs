@@ -54,6 +54,7 @@ const state = {
   batchSeq: 0,
   batches: [], // { id, dir, content, notes, pages, createdAt, done }
   sent: [], // notes that went out, taken off their page: { url, n, text, color, batch, status, result, preview }
+  sentIds: new Set(), // ids of every note and mark that went out: a tab saving one again does not send it twice
   pending: [], // batches sent but not yet pulled/handled (poll mode + safety net)
   waiters: [],
   hookWaiter: null, // the chat hook's open long poll; a newer hook replaces it
@@ -511,6 +512,7 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
   for (const [url, snap] of pages) {
     const live = state.pages.get(url);
     const ids = new Set([...snap.notes, ...snap.shapes].map((x) => x.id));
+    for (const id of ids) state.sentIds.add(id);
     for (const n of snap.notes) state.sent.push({ url, n: n.n, text: n.text, color: n.color, batch: id, status: "pending", result: "", preview: n.preview || null });
     if (!live) continue;
     live.notes = live.notes.filter((n) => !ids.has(n.id));
@@ -605,6 +607,14 @@ async function deliver(batch) {
   const waiters = state.waiters.splice(0);
   if (waiters.length) { takePending(batch); for (const w of waiters) w(batch); }
   return pushed;
+}
+
+// A batch already listed (riding along) that the chat hook must deliver after all.
+function handToHook(batch) {
+  state.pending.push(batch);
+  const waiters = state.waiters.splice(0);
+  if (waiters.length) { takePending(batch); for (const w of waiters) w(batch); }
+  changed();
 }
 
 function takePending(batch) { state.pending = state.pending.filter((b) => b !== batch); changed(); return batch; }
@@ -735,10 +745,11 @@ function watchChats() {
 }
 
 async function clearAll() {
+  for (let i = 0; state.sending && i < 600; i++) await new Promise((r) => setTimeout(r, 50)); // a build in progress goes first
   state.pages.clear();
   state.views.clear();
   await fsp.rm(path.join(SHOTS_DIR, "videos"), { recursive: true, force: true }).catch(() => {});
-  state.nextNote = 1;
+  // nextNote keeps counting: a new note must never share a number with one Claude may still report on.
   state.pending = [];
   state.sent = [];
   for (const b of state.batches) await removeBatchFiles(b);
@@ -863,8 +874,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   switch (req.params.name) {
     case "annotate_open": {
       const url = String(args.url || "").trim();
+      await openUrl(url); // a page that can't be opened leaves the delivery as it was
       state.mode = ["channel", "poll"].includes(args.delivery) ? args.delivery : "chat";
-      await openUrl(url);
       broadcast({ type: "hello", mode: state.mode });
       changed();
       return text({
@@ -1014,12 +1025,55 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, X-Annot-Token",
 };
 const json = (res, code, obj) => { res.writeHead(code, { ...CORS, "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+// Bytes first, text once: a chunk can end inside a UTF-8 character.
 const readBody = (req, max = 8e6) => new Promise((resolve, reject) => {
-  let body = "";
-  req.on("data", (c) => { body += c; if (body.length > max) { req.destroy(); reject(new Error("too large")); } });
-  req.on("end", () => resolve(body));
+  const chunks = [];
+  let size = 0;
+  req.on("data", (c) => { chunks.push(c); size += c.length; if (size > max) { req.destroy(); reject(new Error("too large")); } });
+  req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
   req.on("error", reject);
 });
+
+// What a tab saves is checked here once: everything after (totals, batches, file names, the text
+// Claude reads) trusts these shapes. Anything else is dropped, never stored.
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isId = (v) => typeof v === "string" && /^[\w-]{1,64}$/.test(v);
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+function cleanCtx(ctx) {
+  if (!isObj(ctx)) return undefined;
+  const rect = Array.isArray(ctx.rect) && ctx.rect.length === 4 ? ctx.rect.map(num) : [0, 0, 0, 0];
+  return { ...ctx, selector: String(ctx.selector ?? ""), text: String(ctx.text ?? ""), chain: String(ctx.chain ?? ""), rect, react: isObj(ctx.react) ? ctx.react : { components: [], source: null } };
+}
+function cleanNotes(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const n of list.slice(0, 200)) {
+    if (!isObj(n) || !isId(n.id) || !Number.isInteger(n.n) || n.n < 1 || n.n > 1e6) continue;
+    const note = { ...n, text: typeof n.text === "string" ? n.text.slice(0, 4000) : "", x: num(n.x), y: num(n.y) };
+    if (n.ctx !== undefined) note.ctx = cleanCtx(n.ctx);
+    if (n.shape !== undefined && !isId(n.shape)) delete note.shape;
+    out.push(note);
+  }
+  return out;
+}
+function cleanShapes(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 500).filter((x) => isObj(x) && isId(x.id) && typeof x.type === "string").map((x) => (x.ctx === undefined ? x : { ...x, ctx: cleanCtx(x.ctx) }));
+}
+
+// Which notes and marks each tab has seen (saved or read): a tab's save removes only those.
+const seen = new Map(); // tab id -> Set of ids
+function seenBy(tab, items) {
+  if (!tab) return;
+  if (!seen.has(tab)) seen.set(tab, new Set());
+  const ids = seen.get(tab);
+  for (const x of items) ids.add(x.id);
+}
+function mergeSave(tab, stored, saved) {
+  const ids = new Set(saved.map((x) => x.id));
+  const known = seen.get(tab) || new Set();
+  return [...saved, ...stored.filter((x) => !ids.has(x.id) && !known.has(x.id))];
+}
 
 function pageState(url) {
   if (!state.pages.has(url)) state.pages.set(url, { shapes: [], notes: [] });
@@ -1068,6 +1122,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/state") {
       const page = url.searchParams.get("url") || "";
       const p = state.pages.get(page) || { shapes: [], notes: [] };
+      seenBy(url.searchParams.get("tab"), [...p.notes, ...p.shapes]);
       return json(res, 200, { ok: true, shapes: p.shapes, notes: p.notes, totals: totals(), mode: state.mode });
     }
     if (req.method === "PUT" && url.pathname === "/state") {
@@ -1075,9 +1130,17 @@ const server = http.createServer(async (req, res) => {
       const page = String(body.url || "");
       if (!page) return json(res, 400, { ok: false, error: "url required" });
       const p = pageState(page);
-      p.shapes = Array.isArray(body.shapes) ? body.shapes.slice(0, 500) : [];
-      p.notes = Array.isArray(body.notes) ? body.notes.slice(0, 200) : [];
+      // What went out already never comes back: a tab that missed the "sent" event saves it again.
+      const shapes = cleanShapes(body.shapes).filter((x) => !state.sentIds.has(x.id));
+      const notes = cleanNotes(body.notes).filter((n) => !state.sentIds.has(n.id));
+      // A tab saves the whole page as it knows it. Two tabs on one page: what the other tab added,
+      // and this one never saw, stays. A tab that names no id (annotate_open's page) replaces it.
+      const tab = typeof body.tab === "string" && body.tab ? body.tab : null;
+      p.shapes = tab ? mergeSave(tab, p.shapes, shapes) : shapes;
+      p.notes = tab ? mergeSave(tab, p.notes, notes) : notes;
+      seenBy(tab, [...notes, ...shapes]);
       for (const n of p.notes) if (n.n >= state.nextNote) state.nextNote = n.n + 1;
+      if (tab) broadcast({ type: "changed", url: page, from: tab }); // the other tabs on this page look again
       changed();
       scheduleAutoSend();
       return json(res, 200, { ok: true, totals: totals() });
@@ -1097,10 +1160,16 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)) || "{}");
       const n = Number(body.n);
       const p = state.pages.get(String(body.url || ""));
-      // A note that went out leaves the sidebar's sent list; one still on its page leaves the page.
-      if (state.sent.some((k) => k.n === n)) { state.sent = state.sent.filter((k) => k.n !== n); changed(); return json(res, 200, { ok: true, totals: totals() }); }
-      if (!p || !p.notes.some((k) => k.n === n)) return json(res, 404, { ok: false, error: "no such note" });
-      p.notes = p.notes.filter((k) => k.n !== n);
+      // A note still on its page leaves the page, its mark with it; one that went out leaves the sent list.
+      const onPage = p && p.notes.find((k) => k.n === n);
+      if (!onPage) {
+        if (!state.sent.some((k) => k.n === n)) return json(res, 404, { ok: false, error: "no such note" });
+        state.sent = state.sent.filter((k) => k.n !== n);
+        changed();
+        return json(res, 200, { ok: true, totals: totals() });
+      }
+      p.notes = p.notes.filter((k) => k !== onPage);
+      if (onPage.shape) p.shapes = p.shapes.filter((x) => x.id !== onPage.shape);
       broadcast({ type: "changed", url: body.url });
       changed();
       return json(res, 200, { ok: true, totals: totals() });
@@ -1159,6 +1228,9 @@ const server = http.createServer(async (req, res) => {
         else sent = await sendNow();
       } catch (e) { return json(res, e.message === "busy" ? 409 : 400, { ok: false, error: e.message }); }
       const { batch, pushed } = sent;
+      // The prompt that asked went away (its hook timed out) while the batch was built: nothing will
+      // carry it, so the chat hook does.
+      if (body.from === "prompt" && (req.socket.destroyed || res.writableEnded)) { handToHook(batch); return; }
       const content = body.from === "prompt" ? batch.content : undefined; // the prompt carries it to Claude
       return json(res, 200, { ok: true, batch: batch.id, ids: batch.ids, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals(), content });
     }
@@ -1185,6 +1257,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/clear") {
       if (state.sending) return json(res, 409, { ok: false, error: "busy" });
+      const body = JSON.parse((await readBody(req)) || "{}");
+      // A tab's Discard: that page only. Claude Code's bar: everything.
+      if (typeof body.url === "string" && body.url) {
+        state.pages.delete(body.url);
+        broadcast({ type: "changed", url: body.url });
+        changed();
+        return json(res, 200, { ok: true });
+      }
       await clearAll();
       return json(res, 200, { ok: true });
     }
@@ -1201,14 +1281,17 @@ server.on("error", (e) => log(`http server error: ${e}`));
 // Housekeeping
 // ---------------------------------------------------------------------------
 async function writeSessionFile() {
-  await fsp.mkdir(SESSIONS_DIR, { recursive: true });
+  await fsp.mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+  await fsp.chmod(SESSIONS_DIR, 0o700).catch(() => {});
   // Prune files whose owning process is gone.
   for (const f of await fsp.readdir(SESSIONS_DIR).catch(() => [])) {
     const pid = Number(f.replace(/\.json$/, ""));
     if (!pid) continue;
     try { process.kill(pid, 0); } catch { await fsp.rm(path.join(SESSIONS_DIR, f), { force: true }).catch(() => {}); }
   }
-  await fsp.writeFile(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, cwd: process.cwd(), startedAt: Date.now() }));
+  // Owner-only: it holds the bridge's token.
+  await fsp.writeFile(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, cwd: process.cwd(), startedAt: Date.now() }), { mode: 0o600 });
+  await fsp.chmod(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), 0o600).catch(() => {}); // a file left by an older server keeps its mode otherwise
 }
 
 
@@ -1218,7 +1301,11 @@ function cleanupSync() {
   cleaned = true;
   try { fs.rmSync(SHOTS_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
   if (sessionProfile) { try { fs.rmSync(sessionProfile, { recursive: true, force: true }); } catch { /* ignore */ } }
-  try { fs.rmSync(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), { force: true }); } catch { /* ignore */ }
+  // Only our own: a newer server for the same chat (a reconnect) may have written it since.
+  try {
+    const file = path.join(SESSIONS_DIR, `${PARENT_PID}.json`);
+    if (JSON.parse(fs.readFileSync(file, "utf8")).pid === process.pid) fs.rmSync(file, { force: true });
+  } catch { /* gone, or being rewritten */ }
 }
 let stopping = false;
 async function shutdown() {
