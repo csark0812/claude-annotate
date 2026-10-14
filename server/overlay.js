@@ -17,6 +17,7 @@
   if (window.top !== window) { installFrameProbe(); return; } // inside a frame: only answer the element picker
   const CFG = window.__CLAUDE_ANNOTATE__;
   try { delete window.__CLAUDE_ANNOTATE__; } catch { window.__CLAUDE_ANNOTATE__ = undefined; } // the token never stays on the page
+  if (CFG && CFG.pageHelper) { installPageHelper(); return; } // the page's own world, beside an isolated overlay
   if (!CFG || window.__claudeAnnotate) return;
   const VIA_PORT = CFG.transport === "port";
   const INLINE = !!CFG.state;
@@ -224,7 +225,17 @@
       target.dispatchEvent(copy);
       if (copy.defaultPrevented) e.preventDefault();
     };
-    for (const t of [...SHIELD_COPY, ...SHIELD_STOP]) addEventListener(t, shield, { capture: true, passive: false, signal });
+    for (const t of [...SHIELD_COPY, ...SHIELD_STOP]) onWindowFirst(t, shield, signal);
+  }
+  // A window capture listener that runs before the page's own. The extension's early script
+  // (extension/early.js) listens from before the page loads; a page that grabs keys or presses on
+  // the window first (and stops them) can't starve the toolbar then. Without it, the usual way.
+  function onWindowFirst(type, fn, signal) {
+    const early = window.__claudeAnnotateEarly;
+    if (early && early.types.includes(type)) {
+      early.add(type, fn);
+      signal.addEventListener("abort", () => early.remove(type, fn));
+    } else addEventListener(type, fn, { capture: true, passive: false, signal });
   }
   function copyEvent(e) {
     const init = {};
@@ -655,6 +666,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   .bar { left: 8px; right: 8px; bottom: 8px; width: fit-content; max-width: calc(100vw - 16px); margin: 0 auto; transform: none; animation-name: riseN;
     flex-wrap: wrap; justify-content: center; row-gap: 4px; border-radius: 24px; }
   .bar .grip, .bar .sep { display: none; }
+  .bar .count { flex: 1 1 100%; min-width: 0; max-width: 100%; text-align: center; white-space: normal; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 `;
@@ -778,7 +790,21 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (dt) s += `[data-testid=${dt}]`;
     return s;
   }
+  // A local page annotated by the extension: the overlay lives in the isolated world, where React's
+  // fiber data isn't visible. The page helper (installPageHelper) reads it in the page's own world
+  // and leaves the answer on the element for a moment.
+  function reactFromHelper(e) {
+    const none = { components: [], source: null };
+    try {
+      e.dispatchEvent(new CustomEvent("claude-annotate:react"));
+      const v = e.getAttribute("data-claude-annotate-react");
+      e.removeAttribute("data-claude-annotate-react");
+      const r = v ? JSON.parse(v) : null;
+      return r && Array.isArray(r.components) ? { components: r.components.map(String).slice(0, 5), source: typeof r.source === "string" ? r.source : null } : none;
+    } catch { return none; }
+  }
   function reactInfo(e) {
+    if (CFG.helped && e && e.ownerDocument === document) return reactFromHelper(e);
     const out = { components: [], source: null };
     try {
       let node = e, fiber = null;
@@ -822,6 +848,35 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     } catch { /* not react */ }
     return out;
   }
+  // The page's own world, for an isolated overlay on a local page: React's data and the page's
+  // console. It holds no token and sends nothing anywhere; the page could fake its answers, which
+  // are hints about the page's own code.
+  function installPageHelper() {
+    if (window.__claudeAnnotateHelper) return;
+    const onReact = (e) => { const t = e.target; if (t && t.nodeType === 1) t.setAttribute("data-claude-annotate-react", JSON.stringify(reactInfo(t))); };
+    document.addEventListener("claude-annotate:react", onReact, true);
+    const restore = [];
+    for (const level of ["error", "warn"]) {
+      const orig = console[level];
+      const wrapped = function (...a) {
+        try { document.dispatchEvent(new CustomEvent("claude-annotate:console", { detail: JSON.stringify({ level, text: a.map(logArg).join(" ").slice(0, 500) }) })); } catch { /* ignore */ }
+        return orig.apply(this, a);
+      };
+      console[level] = wrapped;
+      restore.push(() => { if (console[level] === wrapped) console[level] = orig; });
+    }
+    // Uncaught errors are heard in the page's own world only.
+    const tell = (level, text) => { try { document.dispatchEvent(new CustomEvent("claude-annotate:console", { detail: JSON.stringify({ level, text: String(text).slice(0, 500) }) })); } catch { /* ignore */ } };
+    const onError = (e) => { if (e.message) tell("error", `${e.message}${e.filename ? ` (${relPath(e.filename)}:${e.lineno})` : ""}`); };
+    const onRejection = (e) => tell("rejection", (e.reason && e.reason.stack) || (e.reason && e.reason.message) || e.reason);
+    addEventListener("error", onError);
+    addEventListener("unhandledrejection", onRejection);
+    restore.push(() => { removeEventListener("error", onError); removeEventListener("unhandledrejection", onRejection); });
+    const off = () => { document.removeEventListener("claude-annotate:react", onReact, true); document.removeEventListener("claude-annotate:helper-off", off); for (const r of restore) r(); delete window.__claudeAnnotateHelper; };
+    document.addEventListener("claude-annotate:helper-off", off);
+    window.__claudeAnnotateHelper = { off };
+  }
+  function logArg(x) { return x instanceof Error ? x.stack || x.message : typeof x === "string" ? x : (() => { try { return JSON.stringify(x); } catch { return String(x); } })(); }
   function relPath(p) {
     if (!/^https?:/.test(p)) return p.replace(/^\/\.\//, ""); // FS path (React 18) or webpack-internal "/./app/page.tsx"
     try { p = new URL(p).pathname; } catch { return p; } // Vite: drop origin and ?t=
@@ -1392,7 +1447,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   //  - via "tab": the extension records the tab (tabCapture, in its offscreen document). No share
   //    picker, and the recording goes on across page loads: the overlay that comes back after one
   //    picks it up from CFG.recording. The extension owns its state and says how it goes with
-  //    "claude-annotate:rec-state" events; the icon, ⌥⇧R and the pill's Stop all stop it.
+  //    "rec-state" messages from the worker; the icon, ⌥⇧R and the pill's Stop all stop it.
   //  - via "page": without the extension, or where Chrome won't let it capture this tab, the page
   //    records itself through the browser's share picker. A full page load ends it unsaved.
   // What the user does (clicks, typing, keys, errors) is written down with the time, so Claude gets
@@ -1408,7 +1463,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (popNote) commitPopover();
     if (CFG.startMode === "draw") {
       let r = null;
-      try { r = JSON.parse((await askExtension("claude-annotate:rec-start", "claude-annotate:rec-started", 10000)) || "null"); } catch { /* below */ }
+      try { r = JSON.parse((await askExtension("rec-start", 10000)) || "null"); } catch { /* below */ }
       if (r && r.ok) return enterRecording({ via: "tab", startedAt: r.startedAt });
       // Chrome lets the extension capture a tab only after its icon or shortcut was used on that
       // site; otherwise the page records itself.
@@ -1527,13 +1582,17 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (pageLog.length > PAGE_LOG_MAX) pageLog.shift();
   }
   function bindPageLog(signal) {
+    if (CFG.helped) { // the page helper hears the page's console and errors
+      document.addEventListener("claude-annotate:console", (e) => { try { const m = JSON.parse(e.detail); if (["error", "warn", "rejection"].includes(m.level)) logPage(m.level, m.text); } catch { /* not ours */ } }, { signal });
+      return;
+    }
     addEventListener("error", (e) => { if (e.message) logPage("error", `${e.message}${e.filename ? ` (${relPath(e.filename)}:${e.lineno})` : ""}`); }, { signal });
     addEventListener("unhandledrejection", (e) => logPage("rejection", (e.reason && e.reason.stack) || (e.reason && e.reason.message) || e.reason), { signal });
     if (VIA_PORT) return;
     for (const level of ["error", "warn"]) {
       const orig = console[level];
       const wrapped = function (...a) {
-        logPage(level, a.map((x) => (x instanceof Error ? x.stack || x.message : typeof x === "string" ? x : (() => { try { return JSON.stringify(x); } catch { return String(x); } })())).join(" "));
+        logPage(level, a.map(logArg).join(" "));
         return orig.apply(this, a);
       };
       console[level] = wrapped;
@@ -1544,7 +1603,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const log = (kind, extra) => {
       if (!rec || rec.phase !== "recording") return;
       const ev = { t: Math.round((Date.now() - rec.startedAt) / 100) / 10, kind, ...extra };
-      if (rec.via === "tab") tellExtension("rec-event", { event: ev }, ev);
+      if (rec.via === "tab") tellExtension("rec-event", { event: ev });
       else if (rec.events.length < 300) rec.events.push(ev);
     };
     const pageEvent = (e) => rec && !fromOverlay(e);
@@ -1837,14 +1896,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     bindHold(signal);
     bindRecordingLog(signal);
     bindPageLog(signal);
-    document.addEventListener("claude-annotate:rec-state", (e) => { try { onRecState(JSON.parse(e.detail)); } catch { /* not ours */ } }, { signal });
     if (EXT) { const onMsg = (m) => { if (m && m.type === "rec-state") onRecState(m); }; EXT.onMessage.addListener(onMsg); signal.addEventListener("abort", () => EXT.onMessage.removeListener(onMsg)); }
     // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
     document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
 
     // Keyboard
-    window.addEventListener("keydown", onKey, { capture: true, signal });
-    window.addEventListener("keyup", onKeyUp, { capture: true, signal });
+    onWindowFirst("keydown", onKey, signal);
+    onWindowFirst("keyup", onKeyUp, signal);
     window.addEventListener("blur", () => setSpace(false), { signal }); // a Space let go in another window
 
     // Keep things aligned
@@ -2137,7 +2195,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     chatMenu.classList.remove("hidden");
     placeChatMenu();
     renderToolbar();
-    askExtension("claude-annotate:chats", "claude-annotate:chat-list").then(renderChatMenu);
+    askExtension("chats").then(renderChatMenu);
   }
   function closeChatMenu() {
     if (!chatMenuOpen) return;
@@ -2148,9 +2206,17 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   function placeChatMenu() {
     const pill = bar.querySelector('[data-act="chats"]');
     if (!pill) return;
-    const r = pill.getBoundingClientRect(), w = chatMenu.offsetWidth || 340, h = chatMenu.offsetHeight || 120;
+    const r = pill.getBoundingClientRect(), w = chatMenu.offsetWidth || 340;
+    const b = bar.getBoundingClientRect(); // a narrow bar wraps: clear all of it, not just the pill
+    // Above the pill when it fits there (or there is more room there), else below; never over the
+    // bar: the list scrolls inside what room there is. Placed again once the list has loaded.
+    const above = b.top - 22, below = innerHeight - b.bottom - 22, want = chatMenu.scrollHeight || 120;
+    const up = above >= want || above >= below;
+    const room = Math.max(80, Math.min(420, up ? above : below));
+    chatMenu.style.maxHeight = room + "px";
+    const h = Math.min(want, room);
     chatMenu.style.left = clamp(r.left + r.width / 2 - w / 2, 12, innerWidth - w - 12) + "px";
-    chatMenu.style.top = (r.top - h - 10 >= 12 ? r.top - h - 10 : r.bottom + 10) + "px";
+    chatMenu.style.top = (up ? b.top - h - 10 : b.bottom + 10) + "px";
   }
   function ago(at) {
     const min = Math.max(0, Math.round((Date.now() - at) / 60000));
@@ -2183,12 +2249,14 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Switching chats: what this chat has already got stays with it; unsent marks and comments go
   // along to the new one. The extension then mounts the overlay again for that chat.
   // auto: the open chat changed and the tab follows it (a pick in the menu holds instead).
-  async function chooseChat(pid, { auto = false } = {}) {
+  // rescue: the chat the notes went to is gone; what it never got to goes along too.
+  async function chooseChat(pid, { auto = false, rescue = false } = {}) {
     closeChatMenu();
     if (pid === CFG.chat) return;
     if (popNote) commitPopover();
     const url = pageUrl();
-    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
+    const lost = rescue ? takeInFlight(url) : { notes: [], shapes: [] };
+    const carry = { url, shapes: [...shapes.filter((x) => !x.batch), ...lost.shapes], notes: [...notes.filter((n) => !n.batch), ...lost.notes] };
     shapes = shapes.filter((x) => x.batch);
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
@@ -2199,7 +2267,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Not mid-comment or mid-recording: the next change looks again.
   async function followOpenChat() {
     if (!CHOOSES_CHAT || !CFG.automatic || popNote || draft || rec || phase === "sending") return;
-    const pid = Number(await askExtension("claude-annotate:recheck", "claude-annotate:retarget"));
+    const pid = Number(await askExtension("recheck"));
     if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) chooseChat(pid, { auto: true });
   }
   const chatLabel = () => [CFG.sendsTo, CFG.sendsFolder].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ") || "Claude";
@@ -2334,38 +2402,25 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (!image) return;
     await req("POST", "/view", { url: pageUrl(), image, viewport: { w: innerWidth, h: innerHeight }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) } }).catch(() => {});
   }
-  // The extension's isolated-world relay answers "claude-annotate:shoot" with "claude-annotate:shot"
-  // (a data URL, or "" when the tab could not be captured). DOM events reach it from either world.
-  // The extension's worker. From its isolated world (any site that is not local, and the snapshot
-  // page) the overlay asks it directly, out of the page's sight. In a local page's own world there is
-  // no extension API: there it goes through the relay's DOM events (extension/relay.js).
+  // The extension's worker, asked straight from the isolated world, out of the page's sight. An
+  // overlay with no extension (annotate_open's browser, a screenshot) has none: nothing is asked.
   const EXT = VIA_PORT && globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id ? globalThis.chrome.runtime : null;
-  // The relay's answers, as strings, from the worker's replies.
+  // Each answer as the overlay reads it.
   const ANSWER = { shoot: (r) => (r && r.image) || "", chats: (r) => JSON.stringify(r ?? null), recheck: (r) => String((r && r.pid) ?? ""), relink: (r) => JSON.stringify(r ?? null), "rec-start": (r) => JSON.stringify(r ?? null) };
-  function tellExtension(type, msg = {}, detail = msg) {
-    if (EXT) { try { EXT.sendMessage({ type, ...msg }); } catch { /* the extension was reloaded */ } return; }
-    document.dispatchEvent(new CustomEvent(`claude-annotate:${type}`, { detail: JSON.stringify(detail) }));
+  function tellExtension(type, msg = {}) {
+    if (EXT) try { EXT.sendMessage({ type, ...msg }); } catch { /* the extension was reloaded */ }
   }
   async function askExtensionForShot() {
-    const image = await askExtension("claude-annotate:shoot", "claude-annotate:shot");
+    const image = await askExtension("shoot");
     return image && image.startsWith("data:image/") ? image : null;
   }
-  // One question to the extension's relay, answered by one event with a string detail (null: no answer).
-  function askExtension(ask, answer, ms = 4000) {
-    const type = ask.replace("claude-annotate:", "");
-    if (EXT) {
-      return Promise.race([
-        EXT.sendMessage({ type }).then((r) => ANSWER[type](r), () => null),
-        new Promise((r) => setTimeout(() => r(null), ms)),
-      ]).catch(() => null);
-    }
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => done(null), ms);
-      const done = (v) => { clearTimeout(timer); document.removeEventListener(answer, onAnswer); resolve(v); };
-      const onAnswer = (e) => done(typeof e.detail === "string" ? e.detail : null);
-      document.addEventListener(answer, onAnswer);
-      document.dispatchEvent(new CustomEvent(ask));
-    });
+  // One question to the worker: its answer as a string, or null (no extension, no answer in time).
+  function askExtension(type, ms = 4000) {
+    if (!EXT) return Promise.resolve(null);
+    return Promise.race([
+      EXT.sendMessage({ type }).then((r) => ANSWER[type](r), () => null),
+      new Promise((r) => setTimeout(() => r(null), ms)),
+    ]).catch(() => null);
   }
 
   // ---------------------------------------------------------------------------
@@ -2401,6 +2456,22 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   const RELINK_MS = [250, 500, 1000, 2000, 5000];
   const LINK_GIVE_UP_MS = 10000;
   const sentHere = new Set(); // numbers of the notes this tab sent that Claude has not finished
+  // Notes this tab sent that Claude has not reported on yet, as they were, with their marks:
+  // id -> { item, batch, url }. A chat that closes mid-turn, or a server that dies, takes a batch
+  // Claude never read with it; these go again, to the server that comes back or the chat that takes over.
+  const inFlight = new Map();
+  let serverBoot = null; // the server this tab sent to
+  function takeInFlight(url) {
+    const out = { notes: [], shapes: [] };
+    for (const [id, f] of inFlight) {
+      if (f.url !== url) continue;
+      inFlight.delete(id);
+      const item = { ...f.item, batch: null };
+      if (item.type) out.shapes.push(item); else { item.status = "draft"; out.notes.push(item); }
+    }
+    return out;
+  }
+  function settled(match) { for (const [id, f] of inFlight) if (match(f)) inFlight.delete(id); }
   let tabId = null, relinkTimer = null, relinkTries = 0, linkLostAt = 0, restoreOnHello = false;
   const presenceQuery = () => new URLSearchParams({ url: pageUrl(), title: document.title.slice(0, 200), kind: mode === "record" ? "recording" : "annotating", visible: document.visibilityState === "visible" ? "1" : "0" }).toString();
   function connectSse() {
@@ -2428,11 +2499,11 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (CHOOSES_CHAT) {
       // The extension asks the native host again: the same chat with a new token, another chat, or none.
       let at = null;
-      try { at = JSON.parse((await askExtension("claude-annotate:relink", "claude-annotate:relinked")) || "null"); } catch { /* none */ }
+      try { at = JSON.parse((await askExtension("relink")) || "null"); } catch { /* none */ }
       if (!at || !at.pid) return linkLost();
       if (at.pid !== CFG.chat) {
         if (!CFG.automatic) toast(`${chatLabel()} is gone. Notes now go to the chat open in Claude Code.`);
-        return chooseChat(at.pid, { auto: true }); // remounts for that chat, unsent notes carried
+        return chooseChat(at.pid, { auto: true, rescue: true }); // remounts for that chat, unsent notes carried, and sent ones it never got to
       }
       if (at.endpoint) { CFG.endpoint = at.endpoint; CFG.token = at.token; }
     }
@@ -2448,6 +2519,17 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       switch (m.type) {
         case "hello":
           if (m.tab !== undefined) tabId = m.tab; // annotate_open's hello names no tab
+          // Another server than the one this tab sent to: what that one never got to goes again.
+          if (m.server && serverBoot && m.server !== serverBoot && inFlight.size) {
+            const lost = takeInFlight(pageUrl());
+            if (lost.notes.length) {
+              notes.push(...lost.notes); shapes.push(...lost.shapes);
+              anchorAll(); renderInk(); renderPins(); renderToolbar();
+              restoreOnHello = true; // saved just below
+              toast(`${lost.notes.length === 1 ? "A note" : `${lost.notes.length} notes`} Claude never got to ${lost.notes.length === 1 ? "goes" : "go"} again.`);
+            }
+          }
+          if (m.server) serverBoot = m.server;
           linkLostAt = 0; relinkTries = 0; setLink("on");
           if (m.totals) { totals = m.totals; renderToolbar(); }
           // Back after a drop: a restarted server starts empty, so this page's notes go to it again.
@@ -2461,6 +2543,8 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
             toast(`${m.status === "done" ? "Done" : "Skipped"} · ${m.n}${m.message ? ` · ${m.message}` : ""}`, m.status === "done" ? "ok" : "");
           }
           if (m.status === "done") { const d = pinsLayer.querySelector(`.pin[data-id="${n ? n.id : ""}"] .dot`); if (d) d.classList.add("wiggle"); }
+          // Claude has it: it is no longer this tab's to send again (its mark with it).
+          { const f = [...inFlight.values()].find((v) => !v.item.type && v.item.n === m.n); if (f) settled((v) => v === f || (f.item.shape && v.item.id === f.item.shape)); }
           break;
         }
         case "toast": toast(m.text); break;
@@ -2468,6 +2552,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
           phase = "sent"; if (m.totals) totals = m.totals;
           if ((m.ids || []).some((id) => notes.some((n) => n.id === id))) toast(`Sent to ${chatLabel()}.`, "ok");
           for (const n of notes) if ((m.ids || []).includes(n.id)) sentHere.add(n.n);
+          for (const x of [...notes, ...shapes]) if ((m.ids || []).includes(x.id)) inFlight.set(x.id, { item: JSON.parse(JSON.stringify(x)), batch: m.batch, url: pageUrl() });
           flushOut(m.ids || []);
           break;
         case "changed": if (m.url === pageUrl() && m.from !== SAVER && !saveTimer && !draft && !popNote && !drag) hydrate(); break; // edited from outside this tab
@@ -2476,6 +2561,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "stop": exitAnnotating(); break; // the ✕ on the bar in Claude Code
         case "done":
           if (sentHere.size) { toast(m.summary ? `Claude: ${m.summary}` : "Claude is done.", "ok"); sentHere.clear(); }
+          settled((f) => !m.batch || f.batch === m.batch);
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";
           totals.open = 0;
@@ -2510,6 +2596,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     clearTimeout(relinkTimer);
     clearInterval(recTimer);
     if (host) host.remove();
+    if (CFG.helped) document.dispatchEvent(new CustomEvent("claude-annotate:helper-off"));
     if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;
   };
 

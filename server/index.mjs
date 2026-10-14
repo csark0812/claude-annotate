@@ -75,6 +75,8 @@ const VIDEO_AFTER_S = 0.7; // a still this long after each action shows what it 
 // Notes go to Claude by themselves: this long after the last change on the pages, so a burst of
 // notes goes as one message and a note being written waits for its words.
 const AUTO_SEND_MS = 1500;
+// This server's life: a tab that sees another one after a drop knows notes it sent are gone with the old.
+const BOOT = crypto.randomBytes(6).toString("hex");
 const VIEW_FRESH_MS = 30 * 60000; // the page's Add to chat uploads its view; the notes may wait in the chat's bar this long before they go
 
 let endpoint = null;
@@ -509,9 +511,14 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
   batch.content = renderContent(batch, sections);
   // Flush: what went out leaves its page (the live objects: a PUT may have replaced them during the
   // build) and joins the sent list, where Claude's progress lands.
+  const kept = new Set(); // changed while the batch was built: they stay, and go again as they are now
   for (const [url, snap] of pages) {
     const live = state.pages.get(url);
-    const ids = new Set([...snap.notes, ...snap.shapes].map((x) => x.id));
+    for (const n of snap.notes) {
+      const now = live && live.notes.find((k) => k.id === n.id);
+      if (now && (now.text !== n.text || now.editing)) { kept.add(n.id); if (n.shape) kept.add(n.shape); }
+    }
+    const ids = new Set([...snap.notes, ...snap.shapes].map((x) => x.id).filter((id) => !kept.has(id)));
     for (const id of ids) state.sentIds.add(id);
     for (const n of snap.notes) state.sent.push({ url, n: n.n, text: n.text, color: n.color, batch: id, status: "pending", result: "", preview: n.preview || null });
     if (!live) continue;
@@ -519,6 +526,8 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
     live.shapes = live.shapes.filter((s) => !ids.has(s.id));
     if (!live.notes.length && !live.shapes.length) state.pages.delete(url);
   }
+  batch.ids = batch.ids.filter((id) => !kept.has(id)); // the tabs keep those on their pages
+  if (kept.size) scheduleAutoSend();
   return batch;
 }
 
@@ -1112,7 +1121,7 @@ const server = http.createServer(async (req, res) => {
         kind: url.searchParams.get("kind") === "recording" ? "recording" : "annotating", local: isLocalUrl(page),
         visible: url.searchParams.get("visible") !== "0", since: Date.now(),
       } : null;
-      res.write(`data: ${JSON.stringify({ type: "hello", mode: state.mode, totals: totals(), tab: tab?.id ?? null, rev: state.rev })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "hello", mode: state.mode, totals: totals(), tab: tab?.id ?? null, rev: state.rev, server: BOOT })}\n\n`);
       state.listeners.set(res, tab);
       if (tab) changed();
       const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch { /* gone */ } }, 20000);
@@ -1317,6 +1326,8 @@ async function shutdown() {
   process.exit(0);
 }
 process.on("unhandledRejection", (e) => log(`unhandled: ${e && e.stack ? e.stack.split("\n")[0] : e}`));
+// Claude Code does not start a chat's server again: one error must not end it for the whole chat.
+process.on("uncaughtException", (e) => log(`uncaught: ${e && e.stack ? e.stack.split("\n").slice(0, 3).join(" | ") : e}`));
 process.on("exit", cleanupSync);
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

@@ -4,21 +4,19 @@
 // in the toolbar's chat pill, else the one picked in the icon's right-click menu, else the one
 // working in the folder of the dev server behind the page, else the one typed in last), and mount
 // the overlay.
-//  - A local dev page: in the page's main world with the session's endpoint and token, so it
-//    can read React's component and source data. The page is the user's own code.
-//  - Any other page: in this extension's isolated world. The page's scripts can't see it, and
-//    its requests go through this worker (the "annotate" port), so the token never enters the page.
+//  Every page: in this extension's isolated world. The page's scripts can't see it, its requests go
+//  through this worker (the "annotate" port), so the token never enters the page and the page's CSP
+//  doesn't apply, and it talks to this worker directly. A local dev page also gets a small helper in
+//  its own world that reads React's component and source data and the page's console for it.
 // Off: unmount it. A tab that is on stays on across reloads and navigations.
 // Recording: one tab at a time is recorded with tabCapture into an offscreen document while the user
 // uses the page; the overlay shows that it is recording and gets the video as a note when it stops.
-
-import { relayPage } from "./relay.js";
 
 const HOST = "com.claude_annotate.host";
 const INSTALL_HINT = "Run `npm run extension:install` in the claude-annotate repo, then reload this extension.";
 const ICONS = (kind) => Object.fromEntries([16, 32, 48, 128].map((s) => [s, `icons/${kind}-${s}.png`]));
 
-// Mirrors isLocalHost() in overlay.js: where the overlay may hold the token in the page's main world.
+// A dev page on this machine: the user's own code, whose React data and console are worth reading.
 function isLocalUrl(url) {
   let h;
   try { h = new URL(url).hostname; } catch { return false; }
@@ -140,7 +138,7 @@ async function unmountOverlay(tabId) {
     await chrome.scripting.executeScript({
       target: { tabId },
       world,
-      func: async () => { await window.__claudeAnnotate?.unmount?.(); },
+      func: async () => { await window.__claudeAnnotate?.unmount?.(); window.__claudeAnnotateHelper?.off?.(); }, // MAIN: an older overlay, or the page helper
     }).catch(() => {}); // the page is gone or not scriptable: nothing to remove
   }
 }
@@ -162,20 +160,18 @@ async function mountOverlay(tabId, url, session, { carry = null, automatic = tru
   }
   await unmountOverlay(tabId); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
-  const local = isLocalUrl(url);
-  const world = local ? "MAIN" : "ISOLATED";
   const cfg = await overlayConfig(tabId, url, session, { carry, automatic });
-  await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
-  await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
-  // The DOM relay serves an overlay in the page's own world, which has no extension API. An
-  // isolated overlay asks the worker directly: no page script can drive the extension or read
-  // its answers (the chat list, a screenshot of the tab).
-  if (local) await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayPage });
+  if (cfg.helped) {
+    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: () => { window.__CLAUDE_ANNOTATE__ = { pageHelper: true }; } });
+    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", files: ["overlay.js"] });
+  }
+  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
+  await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", files: ["overlay.js"] });
   await addFrameHelpers(tabId);
 }
 
-// What the overlay is told. Only a local dev page (the user's own code) holds the endpoint and token;
-// any other page talks to its session through this worker's "annotate" port.
+// What the overlay is told: never the endpoint or token; it talks to its session through this
+// worker's "annotate" port. helped: a page helper in the page's own world reads React data for it.
 async function overlayConfig(tabId, url, session, { carry = null, automatic = true, pageUrl = null } = {}) {
   const version = chrome.runtime.getManifest().version;
   const rec = await getRecording();
@@ -183,7 +179,7 @@ async function overlayConfig(tabId, url, session, { carry = null, automatic = tr
   const recordingSaved = recording ? null : (await savedVideos())[tabId] ?? null;
   if (recording) await showRecording(tabId, true); // a page load clears the tab's badge
   const common = { renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved, pageUrl };
-  return isLocalUrl(url) && !pageUrl ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
+  return { transport: "port", helped: isLocalUrl(url) && !pageUrl, ...common };
 }
 
 // The element picker asks each frame what is under the pointer. overlay.js run inside a frame is
@@ -252,7 +248,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.type === "relink" && sender.tab) {
     const tab = sender.tab;
     pageUrlOf(tab).then((url) => targetSession(url, tab.id))
-      .then(({ session }) => reply(!session ? null : isLocalUrl(tab.url) ? { pid: session.pid, endpoint: session.endpoint, token: session.token } : { pid: session.pid }), () => reply(null));
+      .then(({ session }) => reply(session ? { pid: session.pid } : null), () => reply(null));
     return true;
   }
   // Back to following the open chat.

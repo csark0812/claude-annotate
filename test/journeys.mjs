@@ -15,6 +15,9 @@
 //     in Claude Code turns annotating off.
 //  7. Any page: a site that is not local stays annotated across a reload, and a page Chrome keeps
 //     extensions out of (chrome://) is annotated as a picture, its notes filed under its own URL.
+//  8. A local page fighting back: a strict CSP, a page that grabs every key, scripts that wrap
+//     fetch. Notes still go, Esc still leaves, the page never sees the token, and React's data
+//     comes through the page helper.
 import { chromium } from "playwright-core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -100,7 +103,20 @@ const HOME_PAGE = `<!doctype html><meta charset="utf-8"><title>Fixture</title>
   document.getElementById("inc").addEventListener("click", () => { const c = document.getElementById("count"); c.textContent = Number(c.textContent) + 1; });
 </script>`;
 const NEXT_PAGE = `<!doctype html><meta charset="utf-8"><title>Next</title><body style="font:16px system-ui;margin:40px"><h1>Next</h1><button id="done">Done</button></body>`;
+// Journey 8's page: everything a local page can do to get in the way.
+const HOSTILE_PAGE = `<!doctype html><meta charset="utf-8"><title>Hostile</title><body style="font:16px system-ui;margin:40px">
+<h1 id="h">Hostile</h1><button id="buy">Buy</button>
+<script>
+  addEventListener("keydown", (e) => { e.stopImmediatePropagation(); e.preventDefault(); }, true);
+  addEventListener("keypress", (e) => { e.stopImmediatePropagation(); e.preventDefault(); }, true);
+  window.seen = [];
+  const f = window.fetch; window.fetch = function (u, o) { window.seen.push(JSON.stringify([String(u), o && o.headers])); return f.apply(this, arguments); };
+  function Checkout() {}
+  document.getElementById("buy").__reactFiber$j8 = { type: "button", return: { type: Checkout, _debugSource: { fileName: "/src/Checkout.tsx", lineNumber: 12 }, return: null } };
+</script>`;
+const HOSTILE_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'none'; connect-src 'self'";
 const site = http.createServer((req, res) => {
+  if (req.url.startsWith("/hostile")) { res.writeHead(200, { "Content-Type": "text/html", "Content-Security-Policy": HOSTILE_CSP }); return res.end(HOSTILE_PAGE); }
   res.writeHead(200, { "Content-Type": "text/html" });
   res.end(req.url.startsWith("/next") ? NEXT_PAGE : HOME_PAGE);
 });
@@ -483,6 +499,30 @@ async function noteOn(page, selector, text) {
     assert.match(sent.content, /annotated as a picture/, "Claude is told it is a picture");
     await snap.locator('claude-annotate .bar [data-act="exit"]').click();
     await until("Done closes the picture", async () => !context.pages().some((p) => p.url().includes("snapshot.html")));
+  });
+  await context.close();
+}
+
+// ---------------------------------------------------------------------------
+// 8. A local page that fights back
+// ---------------------------------------------------------------------------
+{
+  const { context, sw, page } = await launch();
+  await journey("a hostile local page: notes still go, Esc leaves, no token on the page, React through the helper", async () => {
+    await fetch(`${session.endpoint}/clear`, { method: "POST", headers: H });
+    const url = `${SITE}/hostile`;
+    await page.goto(url);
+    await click(sw, await tabIdOf(sw, url));
+    await until("the overlay", async () => (await overlayMode(page)) === "draw");
+    await noteOn(page, "#buy", "typed past the page");
+    const got = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json();
+    assert.match(got.content, /### Note \d+ — "typed past the page"/, "a page that grabs every key and has a strict CSP: the note goes");
+    assert.match(got.content, /Checkout/, "React's component, read in the page's own world");
+    const seen = await page.evaluate(() => window.seen.join("\n") + JSON.stringify(window.__CLAUDE_ANNOTATE__ ?? null));
+    assert.ok(!seen.includes(session.token), "the page's scripts never see the token");
+    await page.mouse.move(600, 500);
+    await page.keyboard.press("Escape");
+    await until("Esc leaves", async () => (await overlayMode(page)) === "none", 3000);
   });
   await context.close();
 }

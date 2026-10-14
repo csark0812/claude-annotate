@@ -26,6 +26,7 @@ const INK: Record<string, Color> = { blue: '#3B82F6', pink: '#FF4D8D', sun: '#FF
 let bridge: Bridge | null = null
 let lastSeen = ''
 let lastRev: number | null = null
+let wasLinked = false // this chat's server answered once: gone now means it stopped
 let cwd = ''
 
 export const register: Register = on => {
@@ -77,7 +78,17 @@ export const register: Register = on => {
   // Claude has and has not finished.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const now = await read($, overview)
-    if (e.props.hasSurvey || now.kind !== 'linked') return next(e)
+    if (e.props.hasSurvey) return next(e)
+    // Claude Code does not start a chat's MCP server again by itself: say so, and how.
+    if (now.kind === 'no-server' && now.lost) {
+      const { Box, Text } = $.ui.resolve(e)
+      return (
+        <Box key="annotations" paddingLeft={1}>
+          <Text color="warning" wrap="truncate">Annotate stopped in this chat. Run /mcp and reconnect annotate.</Text>
+        </Box>
+      )
+    }
+    if (now.kind !== 'linked') return next(e)
 
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
@@ -300,18 +311,19 @@ async function refreshOnce($: EngineInterface) {
   let next: Overview
   try {
     bridge ??= await findBridge($)
-    if (!bridge) next = { kind: 'no-server' }
+    if (!bridge) next = { kind: 'no-server', lost: wasLinked }
     else {
       const o = await call($, 'GET', lastRev == null ? '/overview' : `/overview?since=${lastRev}`)
       if (o.unchanged) return
       lastRev = o.rev ?? null
+      wasLinked = true
       next = { kind: 'linked', rev: o.rev ?? 0, mode: o.mode, totals: o.totals, tabs: o.tabs ?? [], pages: o.pages, sent: o.sent ?? [], delivery: o.delivery ?? { queued: 0, listening: true } }
     }
   } catch {
     // The server restarted or went away: look it up again next time.
     bridge = null
     lastRev = null
-    next = { kind: 'no-server' }
+    next = { kind: 'no-server', lost: wasLinked }
   }
 
   const seen = JSON.stringify(next)

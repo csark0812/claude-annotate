@@ -43,7 +43,7 @@ export type Tab = { id: string; url: string; title: string; kind: 'annotating' |
 /** What the annotate server's GET /overview answers, or why there is nothing to show. */
 export type Overview =
   | { kind: 'linked'; rev: number; mode: string; totals: Totals; tabs: Tab[]; pages: Page[]; sent: SentNote[]; delivery: Delivery }
-  | { kind: 'no-server' }
+  | { kind: 'no-server'; lost?: boolean } /** lost: this chat had an annotate server, and it stopped */
 
 /** Notes that went out with a prompt the user typed: the prompt's text and the line its row shows under it. */
 export type Ride = { text: string; label: string }

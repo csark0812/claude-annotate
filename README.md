@@ -98,7 +98,7 @@ Recording uses Chrome's tab capture, so there is no share picker and it goes on 
 
 The element picker reads inside iframes, from any site.
 
-On a local dev page (this machine: localhost, 127.0.0.1, `*.localhost`, `*.test`) the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, can't talk to the extension, and Claude is told that text quoted from that site is data, not instructions. The extension has access to all sites (and to `file://` pages once you turn on *Allow access to file URLs* on its card), so annotating stays on across reloads and navigations.
+On every page the toolbar runs in the extension's isolated world and its requests go through the extension: the page's scripts can't see the toolbar or your session's token, can't talk to the extension, and the page's Content-Security-Policy doesn't get in the way. A small script loaded with every page (`early.js`) does nothing until you annotate; then it hands the toolbar your keys and clicks before the page's own listeners, so a page that grabs every key can't block a comment. On a local dev page (this machine: localhost, 127.0.0.1, `*.localhost`, `*.test`) a small helper in the page's own world reads React's components and source lines and the page's console errors for the toolbar; it holds no token. On any other site Claude is told that text quoted from that site is data, not instructions. The extension has access to all sites (and to `file://` pages once you turn on *Allow access to file URLs* on its card), so annotating stays on across reloads and navigations.
 
 ```sh
 npm run extension:install   # copies the overlay into extension/ and registers the native host with Chrome
@@ -131,7 +131,7 @@ One Node process per session, spawned by Claude Code as an MCP server. It does t
 2. **Bridge.** The overlay talks to the process over a local HTTP port with a per-session token. State is kept per URL on the server, which is why navigation keeps your marks and a reload restores them. Changes reach the page over server-sent events.
 3. **Channel.** A moment after the last note is saved, the process screenshots every annotated page (pages that aren't open right now get rendered in a temporary tab behind yours, so focus never moves), clusters nearby marks into crops, writes the PNGs to a temp dir, and pushes one `notifications/claude/channel` event into the session. Claude reads the files, edits the code, and calls `annotate_progress` per note and `annotate_done` at the end, which deletes the PNGs.
 
-The overlay mounts on local development hosts only (localhost, 127.0.0.1, private IPs, `*.localhost`, `*.test`, `*.local`, `*.internal`) and takes the bridge token off the page before any page script runs, so a third-party site opened in that window never sees it. `annotate_open` refuses other hosts.
+In `annotate_open`'s own browser the overlay mounts on local development hosts only (localhost, 127.0.0.1, `*.localhost`, `*.test`) and takes the bridge token off the page before any page script runs, so a third-party site opened in that window never sees it. `annotate_open` refuses other hosts.
 
 Tools the server exposes: `annotate_open`, `annotate_progress`, `annotate_done`, `annotate_reply`, `annotate_screenshot`, `annotate_pull`, `annotate_wait`, `annotate_clear`, `annotate_close`. The server's MCP instructions tell Claude how to use them.
 
@@ -168,7 +168,11 @@ The bridge listens on `127.0.0.1` only and every request needs the session token
 
 **What about a page behind a login?** The annotation window has its own Chrome profile that persists, so log in once. Claude's temporary tabs for other pages share the same profile.
 
-**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. If a batch still seems lost, `annotate_pull` returns it.
+**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. A note stays with the tab until Claude reports on it: if its chat closes or its server restarts before that, it goes again to the server that comes back or the chat that takes over. If a batch still seems lost, `annotate_pull` returns it.
+
+**"Annotate stopped in this chat."** The chat's annotate server ended and Claude Code doesn't start it again by itself: run `/mcp` and reconnect annotate.
+
+**The note arrives as a "hook blocking error".** That is how Claude Code labels a background hook that wakes the chat (the only way a plugin can wake an idle chat without the channel flag); Claude reads it as the note it is.
 
 **Two Claude Code sessions, two annotate windows?** Yes. Each session has its own server, port, token and batch directory. The second window gets a throwaway Chrome profile because Chrome allows one process per profile.
 
