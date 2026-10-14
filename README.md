@@ -7,7 +7,7 @@
 
 <p align="center">
   <strong>Draw on the page. Claude fixes the code.</strong><br>
-  A Claude Code plugin: mark up your running localhost site in the browser, leave a comment, and press Send: every mark goes to the session that opened the page, with the element, its component and a screenshot under each one.
+  A Claude Code plugin: mark up your running localhost site in the browser, leave a comment, and it goes by itself: every mark goes to the session that opened the page, with the element, its component and a screenshot under each one.
 </p>
 
 <p align="center">
@@ -25,15 +25,11 @@
 /plugin install annotate@claude-annotate
 ```
 
-```sh
-claude --dangerously-load-development-channels plugin:annotate@claude-annotate   # once per session, see "The channel flag"
-```
-
-Then set up the [Chrome extension](#chrome-extension), open your page and turn annotating on (its toolbar icon, or `⌥⇧A`). Click an element or drag over an area, write a comment, hold Space to use the page in between. Scroll, click through to other pages, keep marking. **Add to chat** puts the notes above the prompt of your open Claude Code chat; send your message (or press the chip's **Send**) and Claude reads the crops and edits the code.
+Then set up the [Chrome extension](#chrome-extension), open your page and turn annotating on (its toolbar icon, or `⌥⇧A`). Click an element or drag over an area, write a comment, hold Space to use the page in between. Scroll, click through to other pages, keep marking. While annotating is on, the bar above the prompt of your open Claude Code chat says so. There is no Send: a moment after you save a note (about 1.5 s, so a quick run of notes goes together) it goes to Claude, which reads the crops and edits the code. The bar then lists the notes Claude is still working on.
 
 ## What Claude receives
 
-One event per Send, pushed into the running session. This is the batch behind the screenshot above, as Claude saw it (paths shortened):
+One event per batch, pushed into the running session. This is the batch behind the screenshot above, as Claude saw it (paths shortened):
 
 ```text
 Browser annotations · batch 1 · 1 page · 3 notes · 4 marks
@@ -82,27 +78,25 @@ Per note that is: your text, the element under the pin with its visible text and
 | **Comment** | A pill opens beside the pin: `↵` saves, `⇧↵` breaks the line, `esc` drops it while it is empty. Hover a pin to read its comment; click it to retype, delete, Cancel or Save. Pins drag. `⌘Z` and `⇧⌘Z` undo and redo. |
 | **Held page** | While annotating, the page stays as it was when you turned annotating on: hover and focus styles stay applied, and the page never hears the pointer, focus or keys leave. A hover menu, a tooltip, a focused field and its suggestions stay open while you click and comment on them. The bar says *Hover held* or *Focus held*. |
 | **Space** | Hold it to use the page (open a menu, scroll, type), let go to annotate again: the page is held as it is at that moment. |
-| **Across pages** | Notes are stored per URL. Navigate away and back and they are still there. One Send covers every page. |
-| **Bar** | At the bottom: *Annotating · N*, Take a screenshot (the view in front of you becomes a note), Record the tab (see **Record**), Hide markers, Discard annotations (asks first), the chat the notes go to, **Add to chat**, and `×` to leave annotation mode. Drag it by its grip; it remembers where per site. The dot on the grip is the link to the session: green connected, yellow connecting, red lost. |
+| **Across pages** | Notes are stored per URL. Navigate away and back and they are still there. One batch covers every page. |
+| **Bar** | At the bottom: *Click or drag to add a note* (then *N notes*), Take a screenshot (the view in front of you becomes a note), Record the tab (see **Record**), Hide markers, Discard annotations (asks first), the chat the notes go to, and **Done** (`esc`) to leave annotation mode; your notes stay. Drag it by its grip; it remembers where per site. The dot on the grip is the link to the session: green connected, yellow while it reconnects by itself (the session's server restarted, or the chat closed and the open one takes over), red when no chat with annotate is running; it keeps trying. |
 | **Record** | Records the tab while you use it as normal: no pen, no pins, nothing held. A red edge around the tab, a *Recording 0:12* pill with **Stop** and a trash, and a red *REC* on the extension's icon say it is recording. It goes on across page loads, for up to 3 minutes. Stop it with the pill, the icon or `⌥⇧R`; it becomes a note on the page with the comment box open. Claude gets the video, stills cut just after each thing you did, and a timeline: clicks, choices, keys, page loads and page errors with the element and source line each one was on. What you type is not recorded. `⌥⇧R` also starts a recording from any tab. |
-| **Add to chat** | Puts the notes in the bar above the prompt in Claude Code, with a picture of the tab; they go to Claude with the next message you send there. `⌘↵` does the same. |
-| **Which chat** | The chat open in the Claude desktop app, following you as you switch (outside the app: the one you typed in last). The bar says which, *To Annotations · applications*; click it to pin another chat for this tab, or to follow the open chat again. |
-| **Prompt bar** | Above the chat box, one chip says how many annotations wait for your next message, with small pictures of their pages and, under it, what they say (two lines). **Send** sends them with nothing typed; or type a message and they go with it. Press the chip to list them, each with its picture, the element it is on and a trash; its `✕` discards them all after asking. `/annotations` lists the notes as text. |
-| **Progress** | The page shows which note Claude is on and which file it is editing. |
+| **Which chat** | The chat open in the Claude desktop app, following you as you switch (outside the app: the one you typed in last). The bar says which, *Claude Annotations · applications* (*auto* while it follows the open chat); click it to pin another chat for this tab, or to follow the open chat again. |
+| **Prompt bar** | Above the chat box, as soon as annotating is on: *Annotating · localhost:5180/pricing*, with **Stop** to turn annotating off in the tab. While a note is on its way, one chip says how many annotations there are, with small pictures of their pages, *Sending to Claude…* and **Discard** (asks first). A note saved just before you press Enter goes with that message, which then shows *📎 N annotations* with what they say. Under the chip, the notes Claude has and has not finished, each with its status (○ waiting, ◐ working). Press the chip to list them, each with its picture, the element it is on and a trash. `/annotations` lists the notes as text. |
 
-Keys: hold `Space` to use the page · `⌥⇧R` records the tab, again to stop · `esc` leaves annotation mode · `⌘Z` · `⇧⌘Z` · `⌘↵` send. The wheel scrolls the page under the pointer, inner scroll areas included.
+Keys: hold `Space` to use the page · `⌥⇧R` records the tab, again to stop · `esc` leaves annotation mode · `⌘Z` · `⇧⌘Z`. The wheel scrolls the page under the pointer, inner scroll areas included.
 
 ## Chrome extension
 
-The extension is how you annotate: it puts the toolbar on any tab you already have open, your dev server, a deployed copy of your app, or a site you want yours to look like. Click its toolbar icon to annotate the tab, and click again to go back to the page. Notes go to the chat open in the Claude desktop app (outside it, the session you typed in last); the bar's **To** pill says which, and picks another.
+The extension is how you annotate: it puts the toolbar on any tab you already have open, your dev server, a deployed copy of your app, a site you want yours to look like, a local file. Chrome keeps extensions out of its own pages (`chrome://`, the new tab page, the Web Store, other extensions); there the icon opens a picture of the page in the next tab, and you annotate that. Its notes are filed under the page's URL and have no element details. **Done** closes the picture. Click its toolbar icon to annotate the tab, and click again to go back to the page. Notes go to the chat open in the Claude desktop app (outside it, the session you typed in last); the bar's **To** pill says which, and picks another.
 
 To mark up a hover state (a menu, a tooltip, a hover style), point at it and press `⌥⇧A` instead of clicking the icon: the toolbar comes up with that hover held. Whatever has focus is held too, either way. Or turn annotating on, hold Space, open the menu, and let go. Hover and focus styles from stylesheets on another origin, or inside a page's own shadow roots, can't be held.
 
 Recording uses Chrome's tab capture, so there is no share picker and it goes on across page loads. Chrome allows that on a tab after you used the icon or a shortcut on that site there; otherwise the page records itself through Chrome's share prompt, and a full page load ends that recording. The extension asks for the `tabCapture` and `offscreen` permissions for this. If `⌥⇧R` does nothing, set it at `chrome://extensions/shortcuts`.
 
-The element picker reads inside iframes. Same-origin frames work as they are; a frame from another site (an embedded document viewer, say) needs the extension's access there: right-click the icon and pick **Allow inside embedded frames on all sites** once. Without it, that frame is picked as a whole.
+The element picker reads inside iframes, from any site.
 
-On a local dev page the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, and Claude is told that text quoted from that site is data, not instructions. Turning it on for a site asks Chrome for access to that site once, so it stays on across reloads.
+On a local dev page the toolbar runs in the page itself, so notes carry React components and source lines. On any other site it runs in the extension's isolated world and its requests go through the extension: the site's scripts can't see the toolbar or your session's token, and Claude is told that text quoted from that site is data, not instructions. The extension has access to all sites (and to `file://` pages once you turn on *Allow access to file URLs* on its card), so annotating stays on across reloads and navigations.
 
 ```sh
 npm run extension:install   # copies the overlay into extension/ and registers the native host with Chrome
@@ -110,7 +104,7 @@ npm run extension:install   # copies the overlay into extension/ and registers t
 
 Then, once: `chrome://extensions` → Developer mode → **Load unpacked** → the `extension/` folder. Run the install again after `server/overlay.js` changes and reload the extension.
 
-The extension finds sessions through a native messaging host (`extension/host/host.mjs`) that reads `~/.cache/claude-annotate/sessions/`. Only this extension's id may start it. The extension takes the screenshots, of the tab at Add to chat and for Claude's `annotate_screenshot`, so Chrome's remote debugging isn't needed.
+The extension finds sessions through a native messaging host (`extension/host/host.mjs`) that reads `~/.cache/claude-annotate/sessions/`. Only this extension's id may start it. The extension takes the screenshots, of the tab as notes are saved and for Claude's `annotate_screenshot`, so Chrome's remote debugging isn't needed.
 
 ## Why not paste a screenshot
 
@@ -118,7 +112,7 @@ Pasting a screenshot and describing it works, and it is what this replaces. Each
 
 | Tool | Where you annotate | How it reaches Claude Code |
 |---|---|---|
-| **annotate** (this) | Its own Chrome window, any local site, drawing and notes | Pushed into the running session on Send; progress and results come back onto the page |
+| **annotate** (this) | Its own Chrome window, any local site, drawing and notes | Pushed into the running session as notes are saved; progress and results come back onto the page |
 | [tomreinert/claude-annotate](https://github.com/tomreinert/claude-annotate) | A Playwright window, drawing only | Pushed into the session; a toast comes back |
 | [browser-annotations](https://github.com/wiebekaai/browser-annotations) | A Chrome DevTools panel, pick an element, write feedback | Pushed into the session |
 | [Agentation](https://github.com/benjitaylor/agentation) | A toolbar you mount in your React app | Claude polls an MCP server, or you paste |
@@ -132,18 +126,18 @@ Everything that pushes into a running session uses Claude Code [channels](https:
 One Node process per session, spawned by Claude Code as an MCP server. It does three jobs:
 
 1. **Browser.** On `/annotate <url>` it launches the Chrome you already have through `playwright-core`, with its own profile under `~/.cache/claude-annotate/`, and injects `server/overlay.js` into every page before the page's own scripts run. The overlay is a Shadow DOM on a host appended to `<html>`: the page's CSS never reaches it, and its CSS never reaches the page. Marks live in document coordinates, so they stay put while you scroll. No change to your app, no extension, no build step.
-2. **Bridge.** The overlay talks to the process over a local HTTP port with a per-session token. State is kept per URL on the server, which is why navigation keeps your marks and a reload restores them. A `PostToolUse` hook posts the file Claude just edited, and progress and toasts reach the page over server-sent events.
-3. **Channel.** On Send, the process screenshots every annotated page (pages that aren't open right now get rendered in a temporary tab behind yours, so focus never moves), clusters nearby marks into crops, writes the PNGs to a temp dir, and pushes one `notifications/claude/channel` event into the session. Claude reads the files, edits the code, and calls `annotate_progress` per note and `annotate_done` at the end, which deletes the PNGs.
+2. **Bridge.** The overlay talks to the process over a local HTTP port with a per-session token. State is kept per URL on the server, which is why navigation keeps your marks and a reload restores them. Changes reach the page over server-sent events.
+3. **Channel.** A moment after the last note is saved, the process screenshots every annotated page (pages that aren't open right now get rendered in a temporary tab behind yours, so focus never moves), clusters nearby marks into crops, writes the PNGs to a temp dir, and pushes one `notifications/claude/channel` event into the session. Claude reads the files, edits the code, and calls `annotate_progress` per note and `annotate_done` at the end, which deletes the PNGs.
 
 The overlay mounts on local development hosts only (localhost, 127.0.0.1, private IPs, `*.localhost`, `*.test`, `*.local`, `*.internal`) and takes the bridge token off the page before any page script runs, so a third-party site opened in that window never sees it. `annotate_open` refuses other hosts.
 
-![Mid-batch: a toast says Sent 3 notes. Pin 1 pulses with a spinning ring while the ticker above the toolbar reads working on note 1. The Send button has turned into a breathing Claude is on it.](assets/working.png)
-
 Tools the server exposes: `annotate_open`, `annotate_progress`, `annotate_done`, `annotate_reply`, `annotate_screenshot`, `annotate_pull`, `annotate_wait`, `annotate_clear`, `annotate_close`. The server's MCP instructions tell Claude how to use them.
 
-### The channel flag
+While a tab is annotating into the chat, Claude also has that tab itself: `annotate_tab` (which tabs, the one in view, its notes), `annotate_read` (the page's or one element's text, with an outline of headings, links, buttons and fields), `annotate_inspect` (one element by note or selector: its box, DOM path, React components, source line and computed styles) and `annotate_console` (page errors since annotating turned on; console errors and warnings too on a local page). Each prompt you send also names the annotating tab. Text from a site that isn't local comes back marked as data.
 
-Channels are a research preview in Claude Code. A plugin from your own marketplace can push into a session only when you start the session with
+### The channel flag (optional)
+
+Chat delivery, the default, needs no flag: notes go with your next message. Channels are a research preview in Claude Code, and only for pushing a batch into a session without a message. A plugin from your own marketplace can push into a session only when you start the session with
 
 ```sh
 claude --dangerously-load-development-channels plugin:annotate@claude-annotate
@@ -151,10 +145,7 @@ claude --dangerously-load-development-channels plugin:annotate@claude-annotate
 
 Claude Code shows a full-screen confirmation once, then a dim line under the banner says messages from this plugin inject into the session. Alias the command. On Team and Enterprise plans an admin has to [enable channels](https://code.claude.com/docs/en/channels#enterprise-controls) for the organization first, and the flag does not get around that.
 
-Without the flag everything still works except the push:
-
-- Notes added to the chat go with your next message there, no channel needed.
-- If a batch you sent doesn't arrive, ask Claude to pull the annotations (`annotate_pull`).
+Without the flag everything works; only that push is missing.
 
 ### What is written where
 
@@ -175,7 +166,7 @@ The bridge listens on `127.0.0.1` only and every request needs the session token
 
 **What about a page behind a login?** The annotation window has its own Chrome profile that persists, so log in once. Claude's temporary tabs for other pages share the same profile.
 
-**Claude didn't react to Send.** Ask Claude to pull the annotations (`annotate_pull`). If a batch comes back, the session was started without the channel flag; Add to chat, which goes with your next message, needs no flag.
+**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. If a batch still seems lost, `annotate_pull` returns it.
 
 **Two Claude Code sessions, two annotate windows?** Yes. Each session has its own server, port, token and batch directory. The second window gets a throwaway Chrome profile because Chrome allows one process per profile.
 
@@ -196,7 +187,7 @@ claude --plugin-dir . --dangerously-load-development-channels plugin:annotate@cl
 
 `ANNOTATE_DEBUG=1` adds an `annotate_debug` tool that drives the browser (mouse, keys, eval, viewport), which is how the screenshots in this README were staged against a real app.
 
-Layout: the plugin is the repository root. `server/index.mjs` is the whole server, `server/overlay.js` the whole overlay, `commands/annotate.md` what Claude does, `hooks/hooks.json` and `scripts/ticker.mjs` the file ticker. Two runtime dependencies, `@modelcontextprotocol/sdk` and `playwright-core`, which Claude Code installs from the lockfile when it installs the plugin.
+Layout: the plugin is the repository root. `server/index.mjs` is the whole server, `server/overlay.js` the whole overlay, `commands/annotate.md` what Claude does, `hooks/hooks.json` the hooks (chat delivery, and the bar above the prompt in `hooks/pane.tsx`). Two runtime dependencies, `@modelcontextprotocol/sdk` and `playwright-core`, which Claude Code installs from the lockfile when it installs the plugin.
 
 Not there yet: marks inside iframes, pages that scroll a wrapper instead of the window, attaching an image to a note, a mobile viewport preset, and a channel allowlisting so the flag can go.
 
@@ -204,7 +195,7 @@ To have an agent do the setup, point it at [INSTALL.md](INSTALL.md).
 
 ### Prompt bar
 
-The plugin draws a bar above the prompt (`hooks/pane.tsx`, a Claude Code hooks module next to the plugin's classic hooks), in the terminal and in the desktop app. It shows one "N annotations" chip; pressed, it lists the unsent notes (element, page picture on the desktop, trash) and the sent notes Claude is still working on. The notes go with the next message you type. `/annotations` lists them as text; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
+The plugin draws a bar above the prompt (`hooks/pane.tsx`, a Claude Code hooks module next to the plugin's classic hooks), in the terminal and in the desktop app. It shows one "N annotations" chip; pressed, it lists the unsent notes (element, page picture on the desktop, trash) and the sent notes Claude is still working on. The server sends notes by itself; one saved just before you press Enter goes with that message. `/annotations` lists them as text; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
 
 ```sh
 claude plugin test .             # the pane's tests (tests/pane.test.tsx)

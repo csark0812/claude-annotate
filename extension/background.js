@@ -12,6 +12,8 @@
 // Recording: one tab at a time is recorded with tabCapture into an offscreen document while the user
 // uses the page; the overlay shows that it is recording and gets the video as a note when it stops.
 
+import { relayPage } from "./relay.js";
+
 const HOST = "com.claude_annotate.host";
 const INSTALL_HINT = "Run `npm run extension:install` in the claude-annotate repo, then reload this extension.";
 const ICONS = (kind) => Object.fromEntries([16, 32, 48, 128].map((s) => [s, `icons/${kind}-${s}.png`]));
@@ -23,9 +25,49 @@ function isLocalUrl(url) {
   return /^(localhost|127(\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2})$/.test(h) || /\.(localhost|test|local|internal)$/.test(h);
 }
 
-// http and https pages. Chrome refuses scripts on its own pages and the Web Store anyway.
+// Pages the overlay can be put into: http, https and file pages, every site. Chrome keeps
+// extensions out of its own pages (chrome://, the new tab page, the Web Store, other extensions);
+// those are annotated as a picture instead (snapshot.html).
 function isWebUrl(url) {
-  try { return /^https?:$/.test(new URL(url).protocol); } catch { return false; }
+  try { return /^(https?|file):$/.test(new URL(url).protocol) && !isWebStore(url); } catch { return false; }
+}
+function isWebStore(url) {
+  try { const u = new URL(url); return u.hostname === "chromewebstore.google.com" || (u.hostname === "chrome.google.com" && u.pathname.startsWith("/webstore")); } catch { return false; }
+}
+// Chrome's refusal to run a script in a page, as executeScript words it.
+const isScriptRefusal = (e) => /cannot (access|be scripted)|chrome:\/\/|extensions gallery|file URL/i.test(String(e?.message));
+
+// ---------------------------------------------------------------------------
+// Pictures of pages the overlay can't enter: snapshot.html#<id> shows one and annotates it. The
+// notes are filed under the page's own URL.
+// ---------------------------------------------------------------------------
+const SNAPSHOT_PAGE = chrome.runtime.getURL("snapshot.html");
+const isSnapshotTab = (tab) => String(tab?.url ?? "").startsWith(SNAPSHOT_PAGE);
+async function snapshots() {
+  return (await chrome.storage.session.get("snapshots")).snapshots ?? {};
+}
+// The page a tab is about: the pictured page's URL for a snapshot tab.
+async function pageUrlOf(tab) {
+  if (!isSnapshotTab(tab)) return tab.url;
+  return (await snapshots())[new URL(tab.url).hash.slice(1)]?.url ?? tab.url;
+}
+async function openSnapshot(tab) {
+  if (tab.url?.startsWith("file:") && !(await chrome.extension.isAllowedFileSchemeAccess())) {
+    throw new Error('Turn on "Allow access to file URLs" for Claude Annotate in chrome://extensions to annotate files.');
+  }
+  let image;
+  try {
+    image = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 90 });
+  } catch (e) {
+    throw new Error(`Chrome doesn't let extensions into this page, and it couldn't be captured either (${e.message}).`);
+  }
+  const id = crypto.randomUUID();
+  const all = await snapshots();
+  all[id] = { url: tab.url, title: tab.title || tab.url, image, w: tab.width, h: tab.height, at: Date.now() };
+  // Keep the newest few: storage.session holds 10 MB.
+  for (const old of Object.keys(all).sort((a, b) => all[a].at - all[b].at).slice(0, -4)) delete all[old];
+  await chrome.storage.session.set({ snapshots: all });
+  await chrome.tabs.create({ url: `${SNAPSHOT_PAGE}#${id}`, index: tab.index + 1, openerTabId: tab.id, windowId: tab.windowId });
 }
 
 // ---------------------------------------------------------------------------
@@ -106,21 +148,37 @@ async function unmountOverlay(tabId) {
 // A tab being recorded gets the overlay in recording mode; one whose recording was saved while its
 // page was loading gets the video to make a note of.
 async function mountOverlay(tabId, url, session, { carry = null, automatic = true } = {}) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (isSnapshotTab(tab)) {
+    // Our own page: it can't be scripted, so it asks for its config as it loads.
+    await setTabSession(tabId, session.pid);
+    const { snapshotMounts = {} } = await chrome.storage.session.get("snapshotMounts");
+    snapshotMounts[tabId] = { carry, automatic };
+    await chrome.storage.session.set({ snapshotMounts });
+    await chrome.tabs.reload(tabId);
+    return;
+  }
   await unmountOverlay(tabId); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
-  const version = chrome.runtime.getManifest().version;
   const local = isLocalUrl(url);
   const world = local ? "MAIN" : "ISOLATED";
-  const rec = await getRecording();
-  const recording = rec?.tabId === tabId ? { startedAt: rec.startedAt, phase: rec.phase } : null;
-  const recordingSaved = recording ? null : (await savedVideos())[tabId] ?? null;
-  if (recording) await showRecording(tabId, true); // a page load clears the tab's badge
-  const common = { renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved };
-  const cfg = local ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
+  const cfg = await overlayConfig(tabId, url, session, { carry, automatic });
   await chrome.scripting.executeScript({ target: { tabId }, world, func: (c) => { window.__CLAUDE_ANNOTATE__ = c; }, args: [cfg] });
   await chrome.scripting.executeScript({ target: { tabId }, world, files: ["overlay.js"] });
   await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: relayPage });
   await addFrameHelpers(tabId);
+}
+
+// What the overlay is told. Only a local dev page (the user's own code) holds the endpoint and token;
+// any other page talks to its session through this worker's "annotate" port.
+async function overlayConfig(tabId, url, session, { carry = null, automatic = true, pageUrl = null } = {}) {
+  const version = chrome.runtime.getManifest().version;
+  const rec = await getRecording();
+  const recording = rec?.tabId === tabId ? { startedAt: rec.startedAt, phase: rec.phase } : null;
+  const recordingSaved = recording ? null : (await savedVideos())[tabId] ?? null;
+  if (recording) await showRecording(tabId, true); // a page load clears the tab's badge
+  const common = { renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved, pageUrl };
+  return isLocalUrl(url) && !pageUrl ? { endpoint: session.endpoint, token: session.token, ...common } : { transport: "port", ...common };
 }
 
 // The element picker asks each frame what is under the pointer. overlay.js run inside a frame is
@@ -137,64 +195,6 @@ chrome.webNavigation.onCompleted.addListener(async ({ tabId, frameId }) => {
   await addFrameHelpers(tabId, [frameId]);
 });
 
-// Runs in the page's isolated world and carries the overlay's DOM events (either world) to the worker:
-//  - "claude-annotate:exit" (Esc): turn the tab off, as a click on the icon would.
-//  - "claude-annotate:shoot" (Send): capture the visible tab; the answer comes back as
-//    "claude-annotate:shot" with a data URL, or "" when it could not be captured.
-//  - "claude-annotate:chats" (the chat pill opens): the answer comes back as
-//    "claude-annotate:chat-list", JSON { current, chats }, or "" when the list can't be had.
-//  - "claude-annotate:choose" (a chat was picked), JSON { pid, carry }: the overlay is mounted
-//    again, sending to that chat.
-// Details cross between worlds as strings: an object from the page's world arrives empty.
-function relayPage() {
-  if (window.__claudeAnnotateRelay) return;
-  window.__claudeAnnotateRelay = true;
-  document.addEventListener("claude-annotate:exit", () => {
-    try { chrome.runtime.sendMessage({ type: "exit" }); } catch { /* the extension was reloaded */ }
-  });
-  document.addEventListener("claude-annotate:shoot", async () => {
-    let image = "";
-    try { image = (await chrome.runtime.sendMessage({ type: "shoot" }))?.image || ""; } catch { /* reloaded */ }
-    document.dispatchEvent(new CustomEvent("claude-annotate:shot", { detail: image }));
-  });
-  document.addEventListener("claude-annotate:chats", async () => {
-    let list = "";
-    try { list = JSON.stringify(await chrome.runtime.sendMessage({ type: "chats" })); } catch { /* reloaded */ }
-    document.dispatchEvent(new CustomEvent("claude-annotate:chat-list", { detail: list }));
-  });
-  document.addEventListener("claude-annotate:recheck", async () => {
-    let pid = "";
-    try { pid = String((await chrome.runtime.sendMessage({ type: "recheck" }))?.pid ?? ""); } catch { /* reloaded */ }
-    document.dispatchEvent(new CustomEvent("claude-annotate:retarget", { detail: pid }));
-  });
-  document.addEventListener("claude-annotate:choose", (e) => {
-    let choice;
-    try { choice = JSON.parse(e.detail); } catch { return; }
-    try { chrome.runtime.sendMessage({ type: "choose", pid: choice.pid ?? null, carry: choice.carry ?? null, auto: !!choice.auto, follow: !!choice.follow }); } catch { /* reloaded */ }
-  });
-  // Recording: "rec-start" is answered by "rec-started", JSON { ok, startedAt } or { ok: false, error, code }.
-  document.addEventListener("claude-annotate:rec-start", async () => {
-    let answer = "";
-    try { answer = JSON.stringify(await chrome.runtime.sendMessage({ type: "rec-start" })); } catch { /* reloaded */ }
-    document.dispatchEvent(new CustomEvent("claude-annotate:rec-started", { detail: answer }));
-  });
-  document.addEventListener("claude-annotate:rec-stop", (e) => {
-    let cancel = false;
-    try { cancel = !!JSON.parse(e.detail).cancel; } catch { /* stop */ }
-    try { chrome.runtime.sendMessage({ type: "rec-stop", cancel }); } catch { /* reloaded */ }
-  });
-  document.addEventListener("claude-annotate:rec-event", (e) => {
-    try { chrome.runtime.sendMessage({ type: "rec-event", event: JSON.parse(e.detail) }); } catch { /* reloaded */ }
-  });
-  document.addEventListener("claude-annotate:rec-taken", () => {
-    try { chrome.runtime.sendMessage({ type: "rec-taken" }); } catch { /* reloaded */ }
-  });
-  // How this tab's recording goes, from the background: to the overlay, in either world.
-  chrome.runtime.onMessage.addListener((m) => {
-    if (m?.type === "rec-state") document.dispatchEvent(new CustomEvent("claude-annotate:rec-state", { detail: JSON.stringify(m) }));
-  });
-}
-
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.target === "offscreen") return; // the recorder's
   if (msg?.type === "rec-start" && sender.tab) {
@@ -206,6 +206,23 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.type === "rec-taken" && sender.tab) forgetSavedVideo(sender.tab.id);
   if (msg?.type === "rec-autostop") autostopRecording(msg.reason);
   if (msg?.type === "exit" && sender.tab) turnOff(sender.tab).then(refreshMenu);
+  // A snapshot tab, loaded: the picture and the overlay's config, or null when either is gone.
+  if (msg?.type === "snapshot-ready" && isSnapshotTab(sender.tab)) {
+    const tab = sender.tab;
+    (async () => {
+      const snap = (await snapshots())[msg.id];
+      if (!snap) return null;
+      const { snapshotMounts = {} } = await chrome.storage.session.get("snapshotMounts");
+      const opts = snapshotMounts[tab.id] ?? {};
+      delete snapshotMounts[tab.id];
+      await chrome.storage.session.set({ snapshotMounts });
+      const { session, automatic } = await targetSession(snap.url, tab.id);
+      if (!session) return { snap, cfg: null };
+      await setTabSession(tab.id, session.pid);
+      return { snap, cfg: await overlayConfig(tab.id, snap.url, session, { automatic, ...opts, pageUrl: snap.url }) };
+    })().then(reply, () => reply(null));
+    return true;
+  }
   if (msg?.type === "shoot" && sender.tab) {
     // JPEG keeps a retina screenshot well under the server's upload limit.
     chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 85 })
@@ -214,15 +231,23 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   }
   if (msg?.type === "chats" && sender.tab) {
     const tab = sender.tab;
-    Promise.all([targetSession(tab.url, tab.id), onTabs()])
+    pageUrlOf(tab).then((url) => Promise.all([targetSession(url, tab.id), onTabs()]))
       .then(([{ sessions }, tabs]) => reply({ current: tabs[tab.id] ?? null, chats: sessions.map(chatInfo) }), () => reply(null));
     return true;
   }
   // Following the active chat: which chat this tab should send to now, when that changed.
   if (msg?.type === "recheck" && sender.tab) {
     const tab = sender.tab;
-    Promise.all([targetSession(tab.url, tab.id), onTabs()])
+    pageUrlOf(tab).then((url) => Promise.all([targetSession(url, tab.id), onTabs()]))
       .then(([{ session, automatic }, tabs]) => reply({ pid: automatic && session && session.pid !== tabs[tab.id] ? session.pid : null }), () => reply({ pid: null }));
+    return true;
+  }
+  // The overlay lost its server: ask the host again. The same chat may be back with a new token (its
+  // server restarted), or gone, and then the tab follows the open chat.
+  if (msg?.type === "relink" && sender.tab) {
+    const tab = sender.tab;
+    pageUrlOf(tab).then((url) => targetSession(url, tab.id))
+      .then(({ session }) => reply(!session ? null : isLocalUrl(tab.url) ? { pid: session.pid, endpoint: session.endpoint, token: session.token } : { pid: session.pid }), () => reply(null));
     return true;
   }
   // Back to following the open chat.
@@ -230,7 +255,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     const tab = sender.tab;
     (async () => {
       await chooseForTab(tab.id, null);
-      const { session, automatic } = await targetSession(tab.url, tab.id);
+      const { session, automatic } = await targetSession(await pageUrlOf(tab), tab.id);
       if (session) await mountOverlay(tab.id, tab.url, session, { carry: msg.carry, automatic });
     })().catch(() => {});
   }
@@ -239,28 +264,37 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     const tab = sender.tab;
     (async () => {
       if (!msg.auto) await chooseForTab(tab.id, msg.pid);
-      const { sessions, automatic } = await targetSession(tab.url, tab.id);
+      const { sessions, automatic } = await targetSession(await pageUrlOf(tab), tab.id);
       const session = sessions.find((s) => s.pid === msg.pid);
       if (session) await mountOverlay(tab.id, tab.url, session, { carry: msg.carry, automatic: msg.auto ? true : automatic });
     })().catch(() => {});
   }
 });
 
+// Every page can be annotated: in the page itself where Chrome lets the extension in, else as a
+// picture of it, opened in the next tab.
 async function turnOn(tab, opts) {
-  if (!isWebUrl(tab.url)) throw new Error("Chrome doesn't let extensions draw on this page. Open a website or your dev server.");
-  const { session, automatic } = await targetSession(tab.url, tab.id);
+  const { session, automatic } = await targetSession(await pageUrlOf(tab), tab.id);
   if (!session) throw new Error("No Claude Code session is running with the annotate plugin. Start one, then try again.");
+  if (!isWebUrl(tab.url) && !isSnapshotTab(tab)) return openSnapshot(tab);
   try {
     await mountOverlay(tab.id, tab.url, session, { ...opts, automatic });
   } catch (e) {
     await setTabSession(tab.id, null);
+    if (isScriptRefusal(e)) return openSnapshot(tab);
     throw e;
   }
 }
 
+// A snapshot tab exists to be annotated: turning it off closes it, back to the page it pictures.
 async function turnOff(tab) {
-  await unmountOverlay(tab.id);
   await setTabSession(tab.id, null);
+  if (isSnapshotTab(tab)) {
+    if (tab.openerTabId != null) await chrome.tabs.update(tab.openerTabId, { active: true }).catch(() => {});
+    await chrome.tabs.remove(tab.id).catch(() => {});
+    return;
+  }
+  await unmountOverlay(tab.id);
 }
 
 async function toggle(tab, opts) {
@@ -274,8 +308,8 @@ async function remountAll() {
   for (const id of Object.keys(tabs).map(Number)) {
     const tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab) continue;
-    const { session, automatic } = await targetSession(tab.url, id).catch(() => ({ session: null }));
-    if (!session) { await turnOff({ id }); continue; }
+    const { session, automatic } = await targetSession(await pageUrlOf(tab), id).catch(() => ({ session: null }));
+    if (!session) { await turnOff(tab); continue; }
     await mountOverlay(id, tab.url, session, { automatic }).catch(() => setTabSession(id, null));
   }
 }
@@ -440,6 +474,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => logNavigation
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status === "loading" && (await recordingOf(tabId))) await showRecording(tabId, true); // a page load clears the badge
   if (info.status !== "complete") return;
+  if (isSnapshotTab(tab)) return; // it asks for its overlay as it loads
   if ((await onTabs())[tabId] == null) return;
   if (!isWebUrl(tab.url)) return setTabSession(tabId, null);
   try {
@@ -478,16 +513,8 @@ async function flagIcon(tabId, message) {
   await chrome.action.setTitle({ tabId, title: `Claude Annotate: ${message}` }).catch(() => {});
 }
 
-// Asks for the site so the toolbar comes back after a reload there. Called before any await, while
-// the click still counts as a user gesture. Declined or unavailable, it works until the page reloads.
-function askForSite(tab) {
-  if (!isWebUrl(tab.url) || isLocalUrl(tab.url)) return;
-  chrome.permissions.request({ origins: [`${new URL(tab.url).origin}/*`] }).catch(() => {});
-}
-
 // The toolbar icon is the switch; on a tab being recorded, it stops the recording.
 async function onIconClick(tab) {
-  askForSite(tab);
   if ((await getRecording())?.tabId === tab.id) return stopRecording();
   return toggleFromUser(tab);
 }
@@ -498,13 +525,11 @@ chrome.action.onClicked.addListener(onIconClick);
 async function onShortcut(command, tab) {
   if (!tab) return;
   if (command === "toggle-annotate") {
-    askForSite(tab);
-    if ((await getRecording())?.tabId === tab.id) return stopRecording();
+      if ((await getRecording())?.tabId === tab.id) return stopRecording();
     return toggleFromUser(tab);
   }
   if (command === "toggle-record") {
-    askForSite(tab);
-    if ((await getRecording())?.tabId === tab.id) return stopRecording();
+      if ((await getRecording())?.tabId === tab.id) return stopRecording();
     try {
       if ((await onTabs())[tab.id] == null) await turnOn(tab);
       await startRecording(tab);
@@ -533,8 +558,6 @@ async function refreshMenu() {
   let sessions = [], pinned = null;
   try { ({ sessions, pinned } = await targetSession()); } catch { /* host missing: the menu says so */ }
   await chrome.contextMenus.removeAll();
-  const allSites = await chrome.permissions.contains({ origins: ALL_SITES });
-  if (!allSites) chrome.contextMenus.create({ id: "allow-frames", title: "Allow inside embedded frames on all sites", contexts: ["action"] });
   chrome.contextMenus.create({ id: MENU_PARENT, title: "Send notes to", contexts: ["action"] });
   if (!sessions.length) {
     chrome.contextMenus.create({ id: "none", parentId: MENU_PARENT, title: "No Claude Code session running", enabled: false, contexts: ["action"] });
@@ -557,16 +580,8 @@ function describeSession(s) {
   return `${folder(s.cwd)} · ${s.lastPromptAt ? "typed" : "started"} ${ago}`;
 }
 
-const ALL_SITES = ["http://*/*", "https://*/*"];
 
 chrome.contextMenus.onClicked.addListener(async (info) => {
-  if (info.menuItemId === "allow-frames") {
-    // Embedded frames often come from another site (a document viewer, a payment form). Without
-    // access there, the element picker can only pick the whole frame.
-    const granted = await chrome.permissions.request({ origins: ALL_SITES }).catch(() => false);
-    if (granted) { await remountAll(); refreshMenu(); }
-    return;
-  }
   if (!String(info.menuItemId).startsWith("pid:")) return;
   const pid = info.menuItemId === "pid:auto" ? null : Number(String(info.menuItemId).slice(4));
   await chrome.storage.local.set({ pinnedPid: pid });
@@ -589,9 +604,10 @@ async function sessionForTab(tabId) {
   return pid == null ? null : sessionsByPid[pid] ?? null;
 }
 
-// Forwards the server's event stream (text/event-stream) as one message per event.
-async function relayEvents(port, session, signal) {
-  const res = await fetch(`${session.endpoint}/events?t=${session.token}`, { signal });
+// Forwards the server's event stream (text/event-stream) as one message per event. query names the
+// tab's page, so the server counts the tab as annotating while the stream is open.
+async function relayEvents(port, session, signal, query) {
+  const res = await fetch(`${session.endpoint}/events?t=${session.token}${query ? `&${query}` : ""}`, { signal });
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
   port.postMessage({ open: true });
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -612,25 +628,36 @@ async function relayEvents(port, session, signal) {
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "annotate" || !port.sender?.tab) return port.disconnect();
-  const tabId = port.sender.tab.id;
-  const stop = new AbortController();
-  port.onDisconnect.addListener(() => stop.abort());
+  const tab = port.sender.tab, tabId = tab.id;
+  let relay = null; // the open event stream; the overlay closes it to open another after a drop
+  const endRelay = () => { if (relay) relay.abort(); relay = null; };
+  port.onDisconnect.addListener(endRelay);
+  const ask = (session, m) => fetch(session.endpoint + m.path, {
+    method: m.method,
+    headers: { "Content-Type": "application/json", "X-Annot-Token": session.token },
+    body: m.body === undefined ? undefined : JSON.stringify(m.body),
+  });
 
   port.onMessage.addListener(async (m) => {
-    const session = await sessionForTab(tabId);
+    if (m.unsubscribe) return endRelay();
+    let session = await sessionForTab(tabId);
     if (m.subscribe) {
+      endRelay();
       if (!session) return port.postMessage({ closed: true });
-      relayEvents(port, session, stop.signal).catch(() => {}).finally(() => { if (!stop.signal.aborted) port.postMessage({ closed: true }); });
+      const mine = (relay = new AbortController());
+      relayEvents(port, session, mine.signal, m.query).catch(() => {}).finally(() => { if (!mine.signal.aborted) port.postMessage({ closed: true }); });
       return;
     }
     if (!m.id) return;
     if (!session) return port.postMessage({ id: m.id, ok: false, error: "annotation mode is off in this tab" });
     try {
-      const res = await fetch(session.endpoint + m.path, {
-        method: m.method,
-        headers: { "Content-Type": "application/json", "X-Annot-Token": session.token },
-        body: m.body === undefined ? undefined : JSON.stringify(m.body),
-      });
+      let res = await ask(session, m);
+      // 403: the session's server restarted with a new token. Look it up again and ask once more.
+      if (res.status === 403) {
+        await targetSession(tab.url, tabId).catch(() => {});
+        const fresh = await sessionForTab(tabId);
+        if (fresh && fresh.token !== session.token) res = await ask((session = fresh), m);
+      }
       const data = await res.json().catch(() => ({}));
       port.postMessage({ id: m.id, ok: res.ok, status: res.status, data });
     } catch (e) {

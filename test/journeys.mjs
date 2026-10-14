@@ -9,6 +9,12 @@
 //     timeline of what you did.
 //  3. Record from the shortcut with annotation off, stop from the icon; and Discard throws it away.
 //  4. Where Chrome won't let the extension capture the tab, the page records itself.
+//  5. The link: annotating shows in the session at once, a note is there as soon as it is saved
+//     (no Add to chat), and a restarted server is found again with no one doing anything.
+//  6. Claude's tab tools read, inspect and hear the errors of the tab being annotated; the bar's ✕
+//     in Claude Code turns annotating off.
+//  7. Any page: a site that is not local stays annotated across a reload, and a page Chrome keeps
+//     extensions out of (chrome://) is annotated as a picture, its notes filed under its own URL.
 import { chromium } from "playwright-core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -37,15 +43,24 @@ const EXT_ID = extensionId();
 // The session: the channel server, as Claude Code starts it, in a scratch HOME
 // ---------------------------------------------------------------------------
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "annotate-journeys-"));
-const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, "server", "index.mjs")], env: { ...process.env, HOME: home }, stderr: "pipe" });
-const client = new Client({ name: "journeys", version: "0.0.0" }, { capabilities: {} });
-await client.connect(transport);
 const sessionsDir = path.join(home, ".cache", "claude-annotate", "sessions");
-let sessionFile = null;
-for (let i = 0; i < 50 && !sessionFile; i++) { sessionFile = fs.existsSync(sessionsDir) && fs.readdirSync(sessionsDir).find((f) => f.endsWith(".json")); if (!sessionFile) await sleep(100); }
-assert.ok(sessionFile, "the server wrote its session file");
-const session = { pid: Number(sessionFile.replace(".json", "")), ...JSON.parse(fs.readFileSync(path.join(sessionsDir, sessionFile), "utf8")), title: "Journeys", lastPromptAt: Date.now(), lastPrompt: null, servesPage: true, focusedAt: null };
-const H = { "Content-Type": "application/json", "X-Annot-Token": session.token };
+// Starts the session's server (again, for journey 5: same Claude pid, new port and token).
+async function startServer(previousToken = null) {
+  const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, "server", "index.mjs")], env: { ...process.env, HOME: home }, stderr: "pipe" });
+  const client = new Client({ name: "journeys", version: "0.0.0" }, { capabilities: {} });
+  await client.connect(transport);
+  let found = null;
+  for (let i = 0; i < 50 && !found; i++) {
+    const f = fs.existsSync(sessionsDir) && fs.readdirSync(sessionsDir).find((x) => x.endsWith(".json"));
+    const s = f && JSON.parse(fs.readFileSync(path.join(sessionsDir, f), "utf8"));
+    if (s && s.token !== previousToken) found = { pid: Number(f.replace(".json", "")), ...s };
+    else await sleep(100);
+  }
+  assert.ok(found, "the server wrote its session file");
+  const session = { ...found, title: "Journeys", lastPromptAt: Date.now(), lastPrompt: null, servesPage: true, focusedAt: null };
+  return { client, session, H: { "Content-Type": "application/json", "X-Annot-Token": session.token } };
+}
+let { client, session, H } = await startServer();
 const stateOf = async (url) => (await fetch(`${session.endpoint}/state?url=${encodeURIComponent(url)}`, { headers: H })).json();
 
 // ---------------------------------------------------------------------------
@@ -98,9 +113,9 @@ const SITE = `http://localhost:${site.address().port}`;
 // allowCapture: Chrome lets an extension capture a tab after its icon or shortcut was used there;
 // the tests call the same handlers directly, so this switch stands in for that click. Without it,
 // the overlay falls back to the page recording itself; the other switch accepts that share prompt.
-async function launch({ allowCapture = true } = {}) {
+async function launch({ allowCapture = true, extraArgs = [] } = {}) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "annotate-profile-"));
-  const args = [`--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, "--auto-accept-this-tab-capture", "--auto-select-tab-capture-source-by-title=Fixture"];
+  const args = [...extraArgs, `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, "--auto-accept-this-tab-capture", "--auto-select-tab-capture-source-by-title=Fixture"];
   if (allowCapture) args.push(`--allowlisted-extension-id=${EXT_ID}`);
   const context = await chromium.launchPersistentContext(profile, { channel: "chromium", headless: !HEADED, viewport: null, args: [...args, "--window-size=1280,860"] });
   let sw = context.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${EXT_ID}/`));
@@ -344,6 +359,120 @@ async function journey(name, fn) {
     await comment.press("Enter");
     const note = await until("the recording note", async () => (await stateOf(`${SITE}/`)).notes?.find((n) => n.video && n.text));
     assert.match(note.video.timeline.join("\n"), /click <button#inc>/, "the page's own log made it");
+  });
+  await context.close();
+}
+
+// ---------------------------------------------------------------------------
+// 5. The link: instant, no Add to chat, heals after a server restart
+// ---------------------------------------------------------------------------
+const overviewOf = async () => (await fetch(`${session.endpoint}/overview`, { headers: H })).json();
+async function noteOn(page, selector, text) {
+  const box = await page.locator(selector).boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  const comment = page.locator("claude-annotate .pop textarea");
+  await comment.waitFor();
+  await comment.pressSequentially(text);
+  await comment.press("Enter");
+}
+{
+  const { context, sw, page } = await launch();
+  await journey("the link: annotating and notes reach the session at once, and a restarted server is found again", async () => {
+    await fetch(`${session.endpoint}/clear`, { method: "POST", headers: H });
+    await page.goto(SITE);
+    const tabId = await tabIdOf(sw, SITE);
+    await click(sw, tabId);
+    await until("the overlay", async () => (await overlayMode(page)) === "draw");
+    const tabs = await until("the session knows the tab is annotating", async () => { const o = await overviewOf(); return o.tabs.length === 1 && o.tabs; }, 2000);
+    assert.deepEqual([tabs[0].url, tabs[0].kind, tabs[0].local], [`${SITE}/`, "annotating", true]);
+    assert.equal(await page.locator('claude-annotate .bar [data-act="add"]').count(), 0, "no Add to chat: notes are in the chat's bar already");
+
+    await noteOn(page, "#inc", "before the restart");
+    await until("the note in the session as soon as it is saved", async () => (await overviewOf()).pages.some((p) => p.notes.some((n) => n.text === "before the restart")), 1500);
+
+    // The session's server restarts: same Claude pid, a new port and token. Nobody touches anything.
+    const oldToken = session.token;
+    await client.close();
+    ({ client, session, H } = await startServer(oldToken));
+    await sw.evaluate((s) => { chrome.runtime.sendNativeMessage = async () => ({ ok: true, sessions: [s] }); }, session);
+    await until("the tab back in the new server", async () => (await overviewOf()).tabs.length === 1, 10000);
+    await until("the page's notes restored there", async () => (await stateOf(`${SITE}/`)).notes?.some((n) => n.text === "before the restart"), 5000);
+    assert.ok(await page.evaluate(() => document.querySelector("claude-annotate").classList.contains("link-on")), "the dot is green again");
+    await noteOn(page, "#size", "after the restart");
+    await until("a new note reaches the new server", async () => (await stateOf(`${SITE}/`)).notes?.some((n) => n.text === "after the restart"), 1500);
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. Claude's tab tools, and the bar's ✕
+  // -------------------------------------------------------------------------
+  await journey("tab tools read, inspect and hear the annotating tab; the bar's ✕ turns annotating off", async () => {
+    const said = (r) => r.content.map((c) => c.text || "").join("\n");
+    assert.match(said(await client.callTool({ name: "annotate_read", arguments: {} })), /Add one/, "the page's text");
+    const inspected = said(await client.callTool({ name: "annotate_inspect", arguments: { selector: "#inc" } }));
+    assert.match(inspected, /button#inc/);
+    assert.match(inspected, /"styles"/);
+    const n = (await stateOf(`${SITE}/`)).notes.find((k) => k.text === "after the restart").n;
+    assert.match(said(await client.callTool({ name: "annotate_inspect", arguments: { note: n } })), /select#size/, "the element under a note");
+    await page.evaluate(() => { console.error("journey console error"); setTimeout(() => { throw new Error("journey boom"); }); });
+    await sleep(100);
+    const heard = said(await client.callTool({ name: "annotate_console", arguments: {} }));
+    assert.match(heard, /journey console error/);
+    assert.match(heard, /journey boom/);
+    assert.match(said(await client.callTool({ name: "annotate_tab", arguments: {} })), /"viewport"/);
+
+    await fetch(`${session.endpoint}/stop`, { method: "POST", headers: H });
+    await until("annotating off", async () => (await overlayMode(page)) === "none", 5000);
+    await until("the session no longer lists the tab", async () => (await overviewOf()).tabs.length === 0, 2000);
+  });
+  await context.close();
+}
+
+// ---------------------------------------------------------------------------
+// 7. Any page
+// ---------------------------------------------------------------------------
+{
+  // shop.example: a site that is not local, served by the fixture through Chrome's resolver.
+  const { context, sw, page } = await launch({ extraArgs: [`--host-resolver-rules=MAP shop.example 127.0.0.1:${site.address().port}`] });
+  await journey("any page: a site that is not local survives a reload; a chrome:// page is annotated as a picture", async () => {
+    await fetch(`${session.endpoint}/clear`, { method: "POST", headers: H });
+    const remote = "http://shop.example/";
+    await page.goto(remote);
+    const tabId = await tabIdOf(sw, remote);
+    await click(sw, tabId);
+    await until("the overlay on the remote site", async () => (await overlayMode(page)) === "draw");
+    await page.reload();
+    await until("the overlay back after the reload", async () => (await overlayMode(page)) === "draw", 5000);
+
+    // Following the open chat mounts the overlay again: the old one leaves, and a note saved after
+    // reaches Claude by itself. Then Esc leaves annotating.
+    await page.evaluate((pid) => document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ pid, auto: true }) })), session.pid);
+    await sleep(500);
+    await until("one overlay after the remount", async () => (await page.evaluate(() => document.querySelectorAll("claude-annotate").length)) === 1 && (await overlayMode(page)) === "draw");
+    await noteOn(page, "#inc", "after following the chat");
+    const auto = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json(); // throws when nothing comes
+    assert.match(auto.content, /### Note \d+ — "after following the chat"/, "the note reached the chat hook with no Send");
+    await page.mouse.move(600, 500);
+    await page.keyboard.press("Escape");
+    await until("Esc removes the overlay", async () => (await overlayMode(page)) === "none", 3000);
+
+    // A chrome:// page: Chrome captures it only after a real icon click, so the picture is seeded
+    // here the way openSnapshot stores it after the capture.
+    const chromePage = await context.newPage();
+    await chromePage.goto("chrome://version/");
+    const image = `data:image/png;base64,${(await chromePage.screenshot()).toString("base64")}`;
+    await sw.evaluate(async ({ image }) => {
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      await chrome.storage.session.set({ snapshots: { j7: { url: "chrome://version/", title: "About Version", image, w: tab.width, h: tab.height, at: Date.now() } } });
+      await chrome.tabs.create({ url: chrome.runtime.getURL("snapshot.html#j7"), index: tab.index + 1, openerTabId: tab.id });
+    }, { image });
+    const snap = await until("the picture's tab", async () => context.pages().find((p) => p.url().includes("snapshot.html")));
+    await snap.bringToFront();
+    await until("the overlay on the picture", async () => (await overlayMode(snap)) === "draw");
+    await noteOn(snap, "#snap", "on a chrome page");
+    const sent = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json(); // it goes by itself
+    assert.match(sent.content, /annotated as a picture/, "Claude is told it is a picture");
+    await snap.locator('claude-annotate .bar [data-act="exit"]').click();
+    await until("Done closes the picture", async () => !context.pages().some((p) => p.url().includes("snapshot.html")));
   });
   await context.close();
 }

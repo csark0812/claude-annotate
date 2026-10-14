@@ -1,15 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, Register } from 'claude-code'
 
-import type { Note, Overview, Page, Preview } from '../types'
+import type { Note, Overview, Page, Preview, Ride, Tab } from '../types'
 
-const POLL_MS = 2000
+// The server pushes every change (scripts/watch.mjs); this poll is only the net under it.
+const POLL_MS = 10000
 
 const overview = atom({ plugin: 'annotate', key: 'overview' } as const, { kind: 'no-server' } as Overview)
 const lastError = atom({ plugin: 'annotate', key: 'error' } as const, null as string | null)
 const confirmClear = atom({ plugin: 'annotate', key: 'confirmClear' } as const, false)
 /** Whether the "N annotations" chip above the prompt is open to its list. */
 const expanded = atom({ plugin: 'annotate', key: 'expanded' } as const, false)
+/** The prompts notes rode along with, newest last: each one's row in the transcript names them. */
+const rides = atom({ plugin: 'annotate', key: 'rides' } as const, [] as Ride[])
 
 /** The annotate server this session started: its HTTP bridge and token. */
 type Bridge = { endpoint: string; token: string }
@@ -22,6 +25,7 @@ const INK: Record<string, Color> = { blue: '#3B82F6', pink: '#FF4D8D', sun: '#FF
 // Module variables: a hot reload starts them over, and the next poll finds the server again.
 let bridge: Bridge | null = null
 let lastSeen = ''
+let lastRev: number | null = null
 let cwd = ''
 
 export const register: Register = on => {
@@ -29,33 +33,48 @@ export const register: Register = on => {
     cwd = e.cwd
     await $.command.register({ name: 'annotations', description: 'Show and edit the browser annotations of this session' })
     void refresh($, cwd)
+    void followServer($)
     $.clock.every(POLL_MS, () => refresh($, cwd))
 
     return next(e)
   })
 
-  // Unsent notes ride along with what the user types next: the same text Send hands Claude, read
-  // beside the prompt. Nothing is woken, so this works whatever the chat hook is doing.
+  // Notes go to Claude by themselves a moment after they are saved. One saved just before the user
+  // presses Enter rides along with that prompt instead, text and pictures alike. The server is always asked: the bar's copy can be a
+  // moment behind a note just saved. It answers at once (it never waits on the tab), well inside the
+  // hook's 10 s budget; past that budget the prompt would go without notes the server already took.
   on('prompt.submit', async ($, e, next) => {
     if (!isUsersOwn(e.origin.kind) || e.text.trim().startsWith('/')) return next(e)
+    bridge ??= await findBridge($).catch(() => null)
+    if (!bridge) return next(e)
     const now = await read($, overview)
-    if (now.kind !== 'linked' || now.totals.unsent === 0) return next(e)
-
-    let content: string | undefined
-    try {
-      content = (await call($, 'POST', '/send', { from: 'prompt' })).content
-    } catch {
-      // Nothing left to send, or a Send already running: the prompt goes alone.
+    // Which tab the user is looking at, so "this" and "the page" mean something to Claude.
+    const tabs = now.kind === 'linked' ? now.tabs.filter(isShown).map(t => `Annotating tab: ${t.url} (${t.local ? 'local' : 'not a local page'}${t.visible ? '' : ', in the background'})`) : []
+    const content = await takeUnsent($).catch(() => undefined) // nothing waiting: the prompt goes alone
+    if (content) {
+      await update($, rides, list => [...list, { text: e.text, label: sentLabel(content) }].slice(-MAX_RIDES))
+      void refresh($, cwd)
     }
-    if (!content) return next(e)
-
-    void refresh($, cwd)
-    return next({ ...e, context: [...(e.context ?? []), content] })
+    const extra = [...(tabs.length ? [tabs.join('\n')] : []), ...(content ? [content] : [])]
+    return extra.length ? next({ ...e, context: [...(e.context ?? []), ...extra] }) : next(e)
   })
 
-  // Above the prompt, as Codex does it: one chip, "N annotations", with small pictures of the
-  // pages and a ✕ that discards them all. Pressed, it lists each note: its picture, what it is on,
-  // the words and a trash. Only notes not sent yet: once they go, they are part of the message.
+  // The sent message says what went with it: a line under the prompt the notes rode with, and a
+  // batch the plugin posted drawn as that line instead of the text Claude reads (ctrl+o shows it all).
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const { origin, text, isExpanded } = e.props
+    if (origin.kind === 'plugin' && origin.name === 'annotate' && text.startsWith('Browser annotations')) {
+      return isExpanded ? next(e) : next({ ...e, props: { ...e.props, text: sentLabel(text) } })
+    }
+    if (!isUsersOwn(origin.kind)) return next(e)
+    const ride = (await read($, rides)).findLast(r => r.text === text)
+    return ride ? next({ ...e, props: { ...e.props, text: text ? `${text}\n${ride.label}` : ride.label } }) : next(e)
+  })
+
+  // Above the prompt, as Codex does it. No Send: notes go to Claude as they are saved. While one is
+  // on its way, the "N annotations" chip (pressed, it lists each note: its picture, what it is on,
+  // the words, a trash) and Discard. Under it, dim lines: which tab is annotating, and the notes
+  // Claude has and has not finished.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const now = await read($, overview)
     if (e.props.hasSurvey || now.kind !== 'linked') return next(e)
@@ -66,8 +85,13 @@ export const register: Register = on => {
     const confirming = await read($, confirmClear)
     const error = await read($, lastError)
     const pending = now.pages.flatMap(page => page.notes.filter(note => !note.batch && note.text?.trim()).map(note => ({ url: page.url, note })))
+    const writing = now.pages.flatMap(page => page.notes.filter(note => !note.batch && !note.text?.trim()))
     const marks = now.pages.reduce((n, page) => n + page.shapes, 0)
-    if (pending.length + marks === 0 && !error) return next(e)
+    const tabs = now.tabs.filter(isShown)
+    const hasNotes = pending.length + marks > 0
+    // What Claude has of them: the notes that went out and are not finished, newest last.
+    const open = now.sent.filter(note => note.status === 'pending' || note.status === 'working')
+    if (!hasNotes && !error && !tabs.length && !open.length) return next(e)
 
     // The desktop draws pictures as Svg and borders as thin lines; the terminal's Image takes no
     // JPEG and a border costs it two rows, so there the chip is a line of text.
@@ -78,41 +102,67 @@ export const register: Register = on => {
           <els.Svg source={previewSvg(preview, width, height)} alt={`The page around note ${n}`} width={width} height={height} />
         </Box>
       ) : null
+    const icon = roomy ? <els.Svg source={CHIP_ICON} alt="" width={14} height={14} /> : null
+    const line = (key: string, text: string, color?: Color) => (
+      <Box key={key} paddingLeft={roomy ? 1 : 2}>
+        <Text dimColor={!color} color={color} wrap="truncate">{text}</Text>
+      </Box>
+    )
 
     if (confirming) {
       return (
         <Box key="annotations" flexDirection="row" gap={2} alignItems="center">
           <Box flexGrow={1} flexShrink={1}>
-            <Text wrap="truncate">Discard all pending annotations?</Text>
+            <Text wrap="truncate">{`Discard ${hasNotes ? (pending.length ? plural(pending.length, 'annotation') : plural(marks, 'mark')) : 'all pending annotations'}?`}</Text>
           </Box>
-          <Button key="discard-no" label="Cancel" plain dimColor onPress={() => update($, confirmClear, () => false)} />
-          <Button key="discard-yes" label="Discard" plain color="error" onPress={() => clearAll($)} />
+          <Button key="discard-no" label="Keep" dimColor onPress={() => update($, confirmClear, () => false)} />
+          <Button key="discard-yes" label="Discard" variant="primary" onPress={() => clearAll($)} />
+        </Box>
+      )
+    }
+
+    const where = tabs.length ? tabsLabel(tabs) : null
+
+    // Annotating, nothing marked yet: the bar says so; Stop turns annotating off in the tab.
+    if (!hasNotes) {
+      return (
+        <Box key="annotations" flexDirection="column" gap={0}>
+          <Box key="chip-row" flexDirection="row" gap={1} alignItems="center">
+            {icon}
+            <Box key="where-box" flexGrow={1} flexShrink={1}>
+              <Text key="where" wrap="truncate">{`${roomy ? '' : '✎ '}${where ?? 'Annotations'}`}</Text>
+            </Box>
+            {where && <Button key="stop" label="Stop" dimColor onPress={() => act($, cwd, 'POST', '/stop')} />}
+          </Box>
+          {line('hint', writing.length ? 'Writing a note…' : 'Click an element or drag an area in the page; each note goes to Claude as you save it')}
+          {open.slice(-MAX_OPEN_LINES).map(note => line(`open:${noteKey(note.url, note.n)}`, `${STATUS_MARK[note.status]} ${note.n} ${clip(note.text.replace(/\s+/g, ' ').trim(), 80)}`))}
+          {error && line('error', error, 'error')}
         </Box>
       )
     }
 
     const label = pending.length ? plural(pending.length, 'annotation') : plural(marks, 'mark')
     const strip = pending.filter(({ note }) => note.preview).slice(0, CHIP_PICTURES)
-    const chip = (
+    const header = (
       <Box key="chip-row" flexDirection="row" gap={1} alignItems="center">
         <Box
           key="chip-box"
           flexDirection="row"
           gap={1}
           alignItems="center"
+          flexShrink={0}
           paddingX={roomy ? 1 : 0}
           borderStyle={roomy ? 'round' : undefined}
           borderDimColor
           hover={roomy ? { borderDimColor: false } : undefined}
         >
-          {roomy && <els.Svg source={CHIP_ICON} alt="" width={14} height={14} />}
+          {icon}
           <Button key="chip" label={`${roomy ? '' : '✎ '}${label} ${isOpen ? '▴' : '▾'}`} plain onPress={() => update($, expanded, v => !v)} />
           {!isOpen && strip.map(({ url, note }) => picture(`chip-pic:${noteKey(url, note.n)}`, note.preview, note.n, 30, 20))}
         </Box>
-        {pending.length > 0 && (
-          <Button key="send" label="Send" variant="primary" plain={roomy ? undefined : true} onPress={() => sendAlone($)} />
-        )}
-        <Button key="discard" label="✕" role="dismiss" plain dimColor hover={{ dimColor: false, color: 'error' }} onPress={() => update($, confirmClear, () => true)} />
+        <Box key="spacer" flexGrow={1} />
+        <Text key="going" dimColor>Sending to Claude…</Text>
+        <Button key="discard" label="Discard" dimColor onPress={() => update($, confirmClear, () => true)} />
       </Box>
     )
 
@@ -152,19 +202,23 @@ export const register: Register = on => {
     }
 
     // Closed, what the notes say, two lines at most.
-    const gist = !isOpen && pending.length > 0 && (
+    const gist = !isOpen && pending.length + writing.length > 0 && (
       <Box key="gist" height={2} paddingLeft={roomy ? 1 : 2} overflow="hidden">
-        <Text dimColor wrap="wrap">
-          {pending.map(({ note }) => `${note.n} ${note.text.replace(/\s+/g, ' ').trim()}`).join('  ·  ')}
+        <Text wrap="wrap">
+          {[...pending.map(({ note }) => `${note.n} ${note.text.replace(/\s+/g, ' ').trim()}`), ...writing.map(note => `${note.n} writing…`)].join('  ·  ')}
         </Text>
       </Box>
     )
 
     return (
       <Box key="annotations" flexDirection="column" gap={roomy ? 1 : 0}>
-        {chip}
+        <Box key="head" flexDirection="column" gap={0}>
+          {header}
+          {where && line('hint', where)}
+        </Box>
         {gist}
-        {error && <Text key="error" color="error" wrap="truncate">{error}</Text>}
+        {open.slice(-MAX_OPEN_LINES).map(note => line(`open:${noteKey(note.url, note.n)}`, `${STATUS_MARK[note.status]} ${note.n} ${clip(note.text.replace(/\s+/g, ' ').trim(), 80)}`))}
+        {error && line('error', error, 'error')}
         {isOpen && pending.map(card)}
       </Box>
     )
@@ -181,24 +235,33 @@ export const register: Register = on => {
 }
 
 // The annotate server writes ~/.cache/claude-annotate/sessions/<claude pid>.json.
-// The engine runs `sh` as a child of that same claude process, so sh's $PPID is the key.
-// Older servers wrote no cwd; a session with no pid match falls back to the newest file for this cwd.
-async function findBridge($: EngineInterface, cwd: string): Promise<Bridge | null> {
+// The engine runs `sh` as a child of that same claude process, so sh's $PPID is the key. No file for
+// this pid: no annotate server in this chat. Never another chat's, even one in the same folder.
+async function findBridge($: EngineInterface): Promise<Bridge | null> {
   const { stdout } = await $.process.run(['sh', '-c', 'echo "$HOME"; echo "$PPID"'])
   const [home, pid] = stdout.trim().split('\n')
-  const dir = `${home}/.cache/claude-annotate/sessions`
-  if (!(await $.fs.exists(dir))) return null
+  const own = `${home}/.cache/claude-annotate/sessions/${pid}.json`
+  return (await $.fs.exists(own)) ? JSON.parse(await $.fs.read(own)) : null
+}
 
-  const own = `${dir}/${pid}.json`
-  if (await $.fs.exists(own)) return JSON.parse(await $.fs.read(own))
-
-  let newest: (Bridge & { startedAt: number }) | null = null
-  for (const entry of await $.fs.list(dir)) {
-    if (!entry.name.endsWith('.json')) continue
-    const one = JSON.parse(await $.fs.read(`${dir}/${entry.name}`))
-    if (one.cwd === cwd && (!newest || one.startedAt > newest.startedAt)) newest = one
+// The server's changes, pushed: scripts/watch.mjs holds its event stream open for the session's life
+// and prints "up", "rev N" or "down"; each one is a reason to look again. "up" may be a restarted
+// server with a new token, so the bridge is looked up again first.
+async function followServer($: EngineInterface) {
+  try {
+    let buf = ''
+    for await (const { stream, text } of $.process.spawn({ argv: ['node', `${$.plugin.root}/scripts/watch.mjs`] })) {
+      if (stream !== 'stdout') continue
+      buf += text
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      if (!lines.length) continue
+      if (lines.some(line => line === 'up' || line === 'down')) { bridge = null; lastRev = null }
+      void refresh($, cwd)
+    }
+  } catch {
+    // No node, or the module unloaded: the poll still runs.
   }
-  return newest
 }
 
 async function call($: EngineInterface, method: string, path: string, body?: unknown) {
@@ -213,18 +276,41 @@ async function call($: EngineInterface, method: string, path: string, body?: unk
   return parsed
 }
 
-async function refresh($: EngineInterface, cwd: string) {
+// One look at the server at a time: a call made while one runs makes it look once more after,
+// so an older answer can never land over a newer one.
+let inflight: Promise<void> | null = null
+let again = false
+function refresh($: EngineInterface, _cwd: string): Promise<void> {
+  if (inflight) {
+    again = true
+    return inflight
+  }
+  inflight = (async () => {
+    do {
+      again = false
+      await refreshOnce($)
+    } while (again)
+  })().finally(() => {
+    inflight = null
+  })
+  return inflight
+}
+
+async function refreshOnce($: EngineInterface) {
   let next: Overview
   try {
-    bridge ??= await findBridge($, cwd)
+    bridge ??= await findBridge($)
     if (!bridge) next = { kind: 'no-server' }
     else {
-      const o = await call($, 'GET', '/overview')
-      next = { kind: 'linked', mode: o.mode, totals: o.totals, pages: o.pages, sent: o.sent ?? [], delivery: o.delivery ?? { queued: 0, listening: true } }
+      const o = await call($, 'GET', lastRev == null ? '/overview' : `/overview?since=${lastRev}`)
+      if (o.unchanged) return
+      lastRev = o.rev ?? null
+      next = { kind: 'linked', rev: o.rev ?? 0, mode: o.mode, totals: o.totals, tabs: o.tabs ?? [], pages: o.pages, sent: o.sent ?? [], delivery: o.delivery ?? { queued: 0, listening: true } }
     }
   } catch {
-    // The server restarted or went away: look it up again next tick.
+    // The server restarted or went away: look it up again next time.
     bridge = null
+    lastRev = null
     next = { kind: 'no-server' }
   }
 
@@ -258,9 +344,29 @@ function noteLines(pages: Page[]) {
 
 const noteKey = (url: string, n: number) => `${url}#${n}`
 
+// Tabs the bar names: annotating or recording into this chat.
+const isShown = (t: Tab) => t.kind === 'annotating' || t.kind === 'recording'
+
+// "Annotating · localhost:5180/pricing +1": the tab in view first.
+function tabsLabel(tabs: Tab[]) {
+  const first = [...tabs].sort((a, b) => Number(b.visible) - Number(a.visible))[0]
+  if (!first) return ''
+  let where = first.url
+  try {
+    const u = new URL(first.url)
+    where = `${u.host}${u.pathname === '/' ? '' : u.pathname}`
+  } catch {
+    // not a URL: as it is
+  }
+  const more = tabs.length > 1 ? ` +${tabs.length - 1}` : ''
+  return `${first.kind === 'recording' ? '● Recording' : 'Annotating'} · ${clip(where, 48)}${more}`
+}
+
 // A prompt the user typed, here or through Remote Control; not a notification, a peer or a plugin.
 const isUsersOwn = (kind: string) => kind === 'composer' || kind === 'bridge'
 
+const MAX_OPEN_LINES = 3 // the unfinished notes the bar names
+const MAX_RIDES = 20 // the prompts whose rows still name their notes
 const MAX_PREVIEW_CHARS = 120_000 // an Svg source holds 131072 characters
 const THUMB_W = 96
 const THUMB_H = 60
@@ -275,27 +381,23 @@ function previewSvg(p: Preview, w: number, h: number) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><defs><clipPath id="c"><rect width="${w}" height="${h}" rx="4"/></clipPath></defs><image href="${p.src}" x="${(w - iw) / 2}" y="${(h - ih) / 2}" width="${iw}" height="${ih}" preserveAspectRatio="xMidYMid slice" clip-path="url(#c)"/></svg>`
 }
 
-// Send with nothing typed: the prompt box will not send empty, so the notes go as a message of
-// their own, the same batch they would add to a typed prompt.
-let sendingAlone = false
-async function sendAlone($: EngineInterface) {
-  if (sendingAlone) return
-  sendingAlone = true
-  try {
-    const { content } = await call($, 'POST', '/send', { from: 'prompt' })
-    await update($, expanded, () => false)
-    if (content) await $.prompt.submit({ text: content })
-  } catch (err) {
-    await update($, lastError, () => String((err as Error).message ?? err))
-  } finally {
-    sendingAlone = false
-    await refresh($, cwd)
-  }
+// The unsent notes, taken by the server as one batch for Claude: the text a prompt carries.
+// Rejects with the server's reason; "Nothing to send yet." when nothing waits.
+async function takeUnsent($: EngineInterface): Promise<string | undefined> {
+  return (await call($, 'POST', '/send', { from: 'prompt' })).content
 }
 
 async function clearAll($: EngineInterface) {
   await update($, confirmClear, () => false)
   await act($, cwd, 'POST', '/clear')
+}
+
+// "📎 2 annotations: 1 make it blue · 2 bigger title", read from the batch the server wrote.
+function sentLabel(content: string) {
+  const notes = [...content.matchAll(/^### Note (\d+) — "(.*)"$/gm)].map(m => `${m[1]} ${clip(m[2] ?? '', 60)}`)
+  if (notes.length) return `📎 ${plural(notes.length, 'annotation')}: ${notes.join(' · ')}`
+  const marks = Number(/· (\d+) marks?$/m.exec(content)?.[1] ?? 0)
+  return `📎 ${plural(marks, 'mark')} on the page`
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`

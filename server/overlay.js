@@ -73,7 +73,7 @@
   const api = { ready: false };
   window.__claudeAnnotate = api;
 
-  const pageUrl = () => location.href;
+  const pageUrl = () => CFG.pageUrl || location.href; // a snapshot tab files its notes under the pictured page
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
   const ink = INKS[0];
@@ -91,7 +91,6 @@
   let markersHidden = false; // Hide markers: the pins and marks step aside, annotating goes on
   let spaceHeld = false; // Space held: the page takes the pointer until it is let go
   let sse = null;
-  let quietTimer = null; // fires the "ask Claude to pull" hint when a Send gets no reaction
   const off = new AbortController(); // aborted by unmount(): the extension's toggle turns the overlay off
 
   // ---------------------------------------------------------------------------
@@ -237,20 +236,23 @@
   // ---------------------------------------------------------------------------
   // Transport
   // ---------------------------------------------------------------------------
-  // req(method, path, body) → the server's JSON answer. events() → { onopen, onerror, onmessage, close }.
+  // req(method, path, body) → the server's JSON answer. events(query) → { onopen, onerror, onmessage, close };
+  // query says which page this tab is on, so the server knows it is annotating while the stream is open.
   const transport = VIA_PORT ? portTransport() : INLINE ? inlineTransport() : directTransport();
   const req = transport.req;
 
   function directTransport() {
-    const H = { "Content-Type": "application/json", "X-Annot-Token": CFG.token };
     return {
       async req(method, p, body) {
-        const r = await F(CFG.endpoint + p, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
+        // CFG, not a copy: a relink after the server restarted brings a new endpoint and token.
+        const json = body ? JSON.stringify(body) : undefined;
+        // keepalive: a save as the page unloads still lands (the browser caps such bodies at 64 KB).
+        const r = await F(CFG.endpoint + p, { method, headers: { "Content-Type": "application/json", "X-Annot-Token": CFG.token }, body: json, keepalive: !!json && json.length < 60000 });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.error || r.statusText);
         return j;
       },
-      events: () => new ES(`${CFG.endpoint}/events?t=${CFG.token}`),
+      events: (query) => new ES(`${CFG.endpoint}/events?t=${CFG.token}&${query}`),
     };
   }
 
@@ -258,10 +260,12 @@
   // requests carry an id, server-sent events come back without one.
   function portTransport() {
     const waiting = new Map();
-    let port = null, seq = 0, subscribed = false, closed = false;
+    let port = null, seq = 0, subscribed = false, closed = false, query = "";
     // A message into the extension's worker keeps it from being stopped while the page listens.
     const keepAlive = setInterval(() => { if (port && subscribed) port.postMessage({ ping: true }); }, 20000);
-    const stream = { onopen: null, onerror: null, onmessage: null, close() { closed = true; clearInterval(keepAlive); if (port) port.disconnect(); } };
+    // Closing the stream keeps the port for requests; unmounting closes both.
+    const stream = { onopen: null, onerror: null, onmessage: null, close() { closed = true; subscribed = false; if (port) port.postMessage({ unsubscribe: true }); } };
+    off.signal.addEventListener("abort", () => { closed = true; clearInterval(keepAlive); if (port) port.disconnect(); port = null; }); // a disconnected port throws on use
     // The extension was reloaded or removed: this overlay belongs to a context that is gone.
     const orphaned = () => !(globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.id);
     const connect = () => {
@@ -274,7 +278,7 @@
           if (w) m.ok ? w.resolve(m.data) : w.reject(new Error((m.data && m.data.error) || m.error || `HTTP ${m.status}`));
         } else if (m.open) stream.onopen && stream.onopen();
         else if (m.event != null) stream.onmessage && stream.onmessage({ data: m.event });
-        else if (m.closed) stream.onerror && stream.onerror();
+        else if (m.closed) !closed && stream.onerror && stream.onerror();
       });
       port.onDisconnect.addListener(() => {
         port = null;
@@ -285,7 +289,7 @@
         // The extension's worker restarted: come back and listen again.
         if (subscribed) setTimeout(() => {
           if (closed || port) return;
-          try { connect(); port.postMessage({ subscribe: true }); } catch { /* orphaned: unmounting */ }
+          try { connect(); port.postMessage({ subscribe: true, query }); } catch { /* orphaned: unmounting */ }
         }, 1000);
       });
     };
@@ -299,10 +303,12 @@
           port.postMessage({ id, method, path: p, body });
         });
       },
-      events() {
+      events(q) {
+        query = q;
+        closed = false;
         try { if (!port) connect(); } catch { return stream; }
         subscribed = true;
-        port.postMessage({ subscribe: true });
+        port.postMessage({ subscribe: true, query });
         return stream;
       },
     };
@@ -318,22 +324,27 @@
       events: () => ({ close() {} }),
     };
   }
+  // What the page holds, as the server should have it. Notes and marks that went out stay on the
+  // page while they shrink away (flushOut), but the server took them already: saving them again
+  // would put them back, and they would go to Claude twice.
+  const leaving = new Set();
+  const stateBody = (url) => ({ url, shapes: shapes.filter((x) => !leaving.has(x.id)), notes: notes.filter((n) => !leaving.has(n.id)) });
   let saveTimer = null;
   const save = () => {
     clearTimeout(saveTimer);
     const url = pageUrl(); // not when the timer fires: an SPA navigation may happen in between
     saveTimer = setTimeout(async () => {
       try {
-        const r = await req("PUT", "/state", { url, shapes, notes });
+        const r = await req("PUT", "/state", stateBody(url));
         if (r.totals) { totals = r.totals; renderToolbar(); }
-      } catch { setLink("off"); }
+      } catch { linkLost(); }
     }, 120);
   };
 
   // ---------------------------------------------------------------------------
   // DOM scaffold
   // ---------------------------------------------------------------------------
-  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, ticker, rim, hl, ghost, confirmBox, chatMenu;
+  let host, root, docLayer, svg, shapesG, draftG, pinsLayer, chrome, bar, popover, toasts, rim, hl, ghost, confirmBox, chatMenu;
 
   const CSS = `
 :host { all: initial; position: absolute; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646; display: block; }
@@ -389,7 +400,7 @@ svg.ink g.draft { opacity: .9; }
 .pin.done .tag .txt { text-decoration: line-through; color: rgba(244,241,247,.55); }
 .pin.skipped .tag .txt { color: rgba(244,241,247,.6); }
 /* Send: what went out shrinks away from the page. */
-.pin.flushed { animation: flush .38s cubic-bezier(.4,0,.2,1) both; }
+.pin.flushed { animation: flush .38s cubic-bezier(.4,0,.2,1) both; pointer-events: none; } /* sent: no reopening it */
 svg.ink g.flushed { transform-box: fill-box; transform-origin: center; animation: flush .38s cubic-bezier(.4,0,.2,1) both; }
 
 .chrome { position: fixed; inset: 0; pointer-events: none; color: #F4F1F7; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
@@ -490,12 +501,6 @@ svg.ink g.flushed { transform-box: fill-box; transform-origin: center; animation
 .danger.armed { width: auto; padding: 0 12px; gap: 6px; display: flex; align-items: center; color: #FF8A8A; background: rgba(255,92,92,.16); box-shadow: inset 0 0 0 1px rgba(255,92,92,.4); font-weight: 600; }
 .danger.glow { animation: glow 1.6s ease-in-out infinite; color: #F4F1F7; }
 
-.ticker { position: fixed; left: 50%; bottom: 72px; transform: translateX(-50%); padding: 6px 12px; border-radius: 999px; white-space: nowrap;
-  background: rgba(20,17,26,.78); color: rgba(244,241,247,.8); font-size: 12px; font-weight: 500; letter-spacing: .01em;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 1px rgba(255,255,255,.06); opacity: 0; transition: opacity .3s; pointer-events: none; }
-.ticker.show { opacity: 1; }
-.ticker .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: #F4F1F7; }
-
 .toasts { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
 .toast { max-width: min(560px, 90vw); padding: 10px 14px 11px; border-radius: 14px; background: rgba(20,17,26,.9); color: #F4F1F7; font-size: 13px; line-height: 1.35; font-weight: 500;
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
@@ -555,10 +560,17 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
 .ghost.hidden { display: none; }
 :host(.space) svg.ink { pointer-events: none; }
 :host(.space) .hl, :host(.space) .ghost { display: none; }
-/* The bar at the bottom: grip · Annotating · N · screenshot · hide markers · discard · Send · ×. */
+/* The bar at the bottom: grip · what to do / N notes · screenshot · record · hide markers · discard · the chat · Done. */
 .bar { gap: 4px; padding: 5px 6px; border-radius: 14px; background: rgba(24,24,27,.94); }
 .bar .grip { padding: 0 4px; }
-.bar .count { padding: 0 8px 0 2px; font-size: 13px; font-weight: 500; color: #F4F1F7; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.bar .count { min-width: 168px; padding: 0 10px 0 2px; display: flex; flex-direction: column; gap: 2px; color: #F4F1F7; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.bar .count b { font-size: 13px; font-weight: 600; line-height: 1.15; }
+.bar .count small { font-size: 11px; font-weight: 500; line-height: 1.15; color: rgba(244,241,247,.55); }
+.bar .done { height: 30px; padding: 0 12px; border: 0; border-radius: 9px; cursor: pointer; background: #F4F1F7; color: #18181B;
+  font: 600 12.5px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; transition: filter .15s, transform .15s; }
+.bar .done:hover { filter: brightness(.92); }
+.bar .done:active { transform: scale(.96); }
+.bar .done:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 .tb { width: 32px; height: 32px; border-radius: 9px; }
 .tb.on { background: rgba(255,255,255,.12); color: #F4F1F7; box-shadow: none; }
 .tb[disabled] { opacity: .35; cursor: default; }
@@ -639,7 +651,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   .bar { left: 8px; right: 8px; bottom: 8px; width: fit-content; max-width: calc(100vw - 16px); margin: 0 auto; transform: none; animation-name: riseN;
     flex-wrap: wrap; justify-content: center; row-gap: 4px; border-radius: 24px; }
   .bar .grip, .bar .sep { display: none; }
-  .ticker { bottom: 108px; max-width: calc(100vw - 24px); overflow: hidden; text-overflow: ellipsis; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 `;
@@ -671,9 +682,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     toasts = el("div", "toasts");
     toasts.setAttribute("aria-live", "polite");
     chrome.appendChild(toasts);
-    ticker = el("div", "ticker");
-    ticker.setAttribute("aria-live", "polite");
-    chrome.appendChild(ticker);
     hl = el("div", "hl hidden", '<span class="lab"></span>');
     chrome.appendChild(hl);
     ghost = el("div", "ghost hidden");
@@ -1131,10 +1139,12 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     openPopover(note, d.isNew, d.text);
   }
   // New: a pill beside the pin, "Add a comment…", a check once there is text. Enter saves,
-  // Shift+Enter breaks the line, Esc drops it only while empty. Saved: a card to retype it, with
-  // a trash, Cancel and Save.
+  // Shift+Enter breaks the line, Esc saves it (drops it while empty). Saved: a card to retype it,
+  // with a trash, Cancel and Save. A saved note open in its card is marked editing, so the server
+  // does not send it to Claude while it is being changed.
   function openPopover(note, isNew = false, text = note.text) {
     popNote = note;
+    if (!isNew && !note.editing) { note.editing = true; save(); }
     const inkDef = INKS.find((i) => i.id === note.color) || INKS[0];
     popover.style.setProperty("--ink", inkDef.hex);
     popover.style.setProperty("--ink-dark", inkDef.dark);
@@ -1167,11 +1177,21 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     ta.setSelectionRange(ta.value.length, ta.value.length);
     ta.addEventListener("keydown", (e) => {
       e.stopPropagation();
+      // A caret key the comment can't use any more goes on to scroll the page in Chrome: the page
+      // under the comment stays where it was.
+      if (e.key === "PageUp" || e.key === "PageDown") e.preventDefault();
+      if (/^(Home|End|ArrowUp|ArrowDown)$/.test(e.key)) {
+        const at = [scrollX, scrollY];
+        const back = () => { if (scrollX !== at[0] || scrollY !== at[1]) scrollTo({ left: at[0], top: at[1], behavior: "instant" }); };
+        addEventListener("scroll", back, { passive: true });
+        setTimeout(() => removeEventListener("scroll", back), 400); // the browser's smooth scroll runs a while
+      }
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitPopover(); }
       if (e.key === "Escape") {
         e.preventDefault();
         if (!isNew) closePopover(); // Cancel: the saved words stay
         else if (!ta.value.trim()) cancelPopover(true);
+        else commitPopover(); // typed words are never lost, and the next Esc leaves annotating
       }
     });
     if (ok) ok.addEventListener("click", commitPopover);
@@ -1218,6 +1238,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     popover.innerHTML = "";
     popNote = null;
     stashDraft(null);
+    if (was && was.editing) { delete was.editing; save(); } // it may go to Claude again
     pinsLayer.querySelector(".pin.editing")?.classList.remove("editing");
     if (was && was.shape) renderInk();
     // Focus goes back to what the held page had focused, so Space, Esc and ⌘Z work at once; with
@@ -1283,6 +1304,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // stay, as in Codex, and come back when Annotate is pressed again.
   // Annotating holds the page still; browsing and recording leave it to the user.
   function setMode(m) {
+    if (m !== mode && (m === "record" || mode === "record")) postPresence({ kind: m === "record" ? "recording" : "annotating" });
     mode = m;
     host.classList.toggle("draw", m === "draw");
     host.classList.toggle("browse", m === "browse");
@@ -1314,17 +1336,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     host.classList.toggle("link-connecting", s === "connecting");
     host.classList.toggle("link-off", s === "off");
   }
-  // Where this page's notes stand, for the Send button's title and the ticker.
-  function streamState() {
-    const waiting = waitingComments();
-    if (phase === "sending") return { label: "Sending…", cls: "sending" };
-    if (waiting) return { label: `${waiting} to send`, cls: "idle" };
-    if (phase === "sent" && totals.open > 0) return { label: "Claude is on it", cls: "sent" };
-    if (phase === "done" && totals.batches > 0) return { label: "Done", cls: "done" };
-    return { label: "Nothing to send", cls: "idle" };
-  }
+
   // Off: one Annotate button. On: grip · Annotating · N · screenshot · record · hide markers ·
-  // discard · the chat the notes go to · Add to chat · ×. Recording: grip · Recording 0:12 · Stop · discard.
+  // discard · the chat the notes go to · ×. Recording: grip · Recording 0:12 · Stop · discard.
+  // No Add or Send: a note goes to Claude Code by itself a moment after it is saved.
   let lastBar = "";
   function renderToolbar() {
     if (!bar) return;
@@ -1342,12 +1357,15 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       return;
     }
     bar.classList.remove("recbar");
-    const status = `<span class="count" role="status" aria-live="polite">Annotating · ${waiting}</span>`;
+    // How many notes, or what to do when there are none yet.
+    const status = waiting
+      ? `<span class="count" role="status" aria-live="polite"><b>${waiting} note${waiting === 1 ? "" : "s"}</b></span>`
+      : `<span class="count" role="status" aria-live="polite"><b>Click or drag to add a note</b><small>Each note goes to Claude as you save it · Hold Space to use the page</small></span>`;
     const heldWhat = held && [held.hover.length ? "Hover" : "", held.focus ? "focus" : ""].filter(Boolean).join(" & ");
     const heldBadge = heldWhat ? `<span class="frozen" title="The page is held as it was: hover and focus styles stay, and the page doesn't hear the pointer or focus leave. Hold Space to use the page.">${heldWhat[0].toUpperCase() + heldWhat.slice(1)} held</span>` : "";
     const canRecord = CFG.startMode === "draw" || !!navigator.mediaDevices?.getDisplayMedia;
     const to = CHOOSES_CHAT
-      ? `<button class="to" type="button" data-act="chats" aria-haspopup="menu" aria-expanded="${chatMenuOpen}" title="${esc(CFG.sendsPrompt ? `Last message there: ${CFG.sendsPrompt}` : "Click to pick another chat")}"><span class="lbl">To</span><span class="name">${esc(chatLabel())}</span>${CFG.automatic ? '<span class="auto">open chat</span>' : ""}${svgIcon("chevron", 13)}</button>`
+      ? `<button class="to" type="button" data-act="chats" aria-haspopup="menu" aria-expanded="${chatMenuOpen}" title="${esc(CFG.sendsPrompt ? `Last message there: ${CFG.sendsPrompt}` : "Click to pick another chat")}"><span class="lbl">Claude</span><span class="name">${esc(chatLabel())}</span>${CFG.automatic ? '<span class="auto" title="Follows the chat you have open in Claude">auto</span>' : ""}${svgIcon("chevron", 13)}</button>`
       : "";
     const html = mode !== "draw"
       ? `${grip}<button class="go start" type="button" data-act="annotate" aria-label="Annotate">${svgIcon("annotate", 15)}<span>Annotate</span></button>`
@@ -1358,8 +1376,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       ${tb("hide", markersHidden ? "eye" : "eyeoff", markersHidden ? "Show markers" : "Hide markers", markersHidden ? "on" : "", `aria-pressed="${markersHidden}"`)}
       ${tb("discard", "trash", "Discard annotations", "", shapes.length || notes.length ? "" : "disabled")}
       <span class="sep"></span>${to}
-      <button class="go" type="button" data-act="add" title="The notes wait above the prompt in Claude Code and go with your next message (⌘↵)" ${!waiting ? "disabled" : ""}><span>Add to chat</span></button>
-      ${tb("exit", "x", "Exit annotation mode")}`;
+      <button class="done" type="button" data-act="exit" title="Stop annotating (Esc). Your notes stay.">Done</button>`;
     if (html !== lastBar) { lastBar = html; bar.innerHTML = html; bar.classList.toggle("off", mode !== "draw"); }
   }
 
@@ -1496,6 +1513,29 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   // What the user does while recording, with the time: the timeline Claude reads beside the stills.
   // Page navigations are the extension's to write down (it sees them across page loads).
+  // What went wrong on the page while annotating, for Claude's annotate_console. Page errors
+  // everywhere; console errors and warnings only in the page's own world (local pages), the one
+  // world whose console this overlay can see.
+  const PAGE_LOG_MAX = 100;
+  const pageLog = [];
+  function logPage(kind, text) {
+    pageLog.push({ t: Date.now(), kind, text: String(text).slice(0, 500) });
+    if (pageLog.length > PAGE_LOG_MAX) pageLog.shift();
+  }
+  function bindPageLog(signal) {
+    addEventListener("error", (e) => { if (e.message) logPage("error", `${e.message}${e.filename ? ` (${relPath(e.filename)}:${e.lineno})` : ""}`); }, { signal });
+    addEventListener("unhandledrejection", (e) => logPage("rejection", (e.reason && e.reason.stack) || (e.reason && e.reason.message) || e.reason), { signal });
+    if (VIA_PORT) return;
+    for (const level of ["error", "warn"]) {
+      const orig = console[level];
+      const wrapped = function (...a) {
+        logPage(level, a.map((x) => (x instanceof Error ? x.stack || x.message : typeof x === "string" ? x : (() => { try { return JSON.stringify(x); } catch { return String(x); } })())).join(" "));
+        return orig.apply(this, a);
+      };
+      console[level] = wrapped;
+      signal.addEventListener("abort", () => { if (console[level] === wrapped) console[level] = orig; });
+    }
+  }
   function bindRecordingLog(signal) {
     const log = (kind, extra) => {
       if (!rec || rec.phase !== "recording") return;
@@ -1545,8 +1585,8 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Claude's annotate_screenshot: the tab in view on that page captures itself
   // ---------------------------------------------------------------------------
   const samePage = (url) => { try { const u = new URL(url, location.href); return u.origin === location.origin && u.pathname.replace(/\/$/, "") === location.pathname.replace(/\/$/, ""); } catch { return false; } };
-  async function verifyShot(m) {
-    if (CFG.startMode !== "draw" || document.visibilityState !== "visible" || (m.url && !samePage(m.url))) return;
+  async function shotAnswer(m) {
+    if (CFG.startMode !== "draw" || document.visibilityState !== "visible") return undefined; // only the extension captures, only what is in view
     let target = null;
     if (m.selector) {
       try { target = document.querySelector(m.selector); } catch { /* not a selector */ }
@@ -1560,7 +1600,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     let image = null;
     try { image = await askExtensionForShot(); } catch { /* none */ }
     host.style.display = "";
-    if (!image) return;
+    if (!image) return undefined;
     if (target) {
       try {
         const shot = await decodeDataUrl(image);
@@ -1573,7 +1613,75 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         image = canvas.toDataURL("image/jpeg", 0.9);
       } catch { /* the whole view goes */ }
     }
-    await req("POST", "/verify-shot", { id: m.id, image }).catch(() => {});
+    return image;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Claude's questions about this tab (askTab on the server): the tab in view answers at once, a
+  // hidden one a moment later, the first answer wins. An answer of undefined is no answer.
+  // ---------------------------------------------------------------------------
+  const ASK_HIDDEN_DELAY_MS = 400;
+  const ANSWERS = { shot: shotAnswer, tab: tabAnswer, read: readAnswer, inspect: inspectAnswer, console: consoleAnswer };
+  async function answerAsk(m) {
+    const answer = ANSWERS[m.kind];
+    if (!answer || (m.url && !samePage(m.url))) return;
+    if (document.visibilityState !== "visible") await new Promise((r) => setTimeout(r, ASK_HIDDEN_DELAY_MS));
+    let data;
+    try { data = await answer(m); } catch (e) { data = { error: e.message }; }
+    if (data !== undefined) req("POST", "/answer", { id: m.id, data }).catch(() => {});
+  }
+  function tabAnswer() {
+    return {
+      url: pageUrl(), title: document.title, visible: document.visibilityState === "visible",
+      viewport: { w: innerWidth, h: innerHeight }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
+      document: { w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight },
+      notes: notes.map((n) => ({ n: n.n, text: n.text, status: n.status || null, on: n.ctx?.selector || null })),
+    };
+  }
+  // The element a question is about: a selector, or the element under a note's pin.
+  function askedElement(m) {
+    if (m.selector) {
+      let e = null;
+      try { e = document.querySelector(m.selector); } catch { throw new Error(`not a selector: ${m.selector}`); }
+      if (!e) throw new Error(`nothing on the page matches ${m.selector}`);
+      return e;
+    }
+    if (m.note) {
+      const n = notes.find((k) => k.n === m.note);
+      if (!n) throw new Error(`no note ${m.note} on this page`);
+      if (n.y < scrollY || n.y > scrollY + innerHeight) scrollTo({ top: Math.max(0, n.y - innerHeight / 2) }); // the pin into view: hit testing sees only the viewport
+      const e = elementAt(n.x, n.y);
+      if (!e) throw new Error(`note ${m.note} is not over an element`);
+      return e;
+    }
+    return null;
+  }
+  const OUTLINE_SEL = "h1,h2,h3,h4,h5,h6,[role=heading],main,nav,header,footer,aside,[role=main],[role=navigation],[role=dialog],dialog,form,a[href],button,[role=button],[role=tab],[role=menuitem],input:not([type=hidden]),select,textarea";
+  const OUTLINE_MAX = 300;
+  function readAnswer(m) {
+    const scope = askedElement(m) || document.body;
+    const text = (scope.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
+    const max = m.maxChars || 20000;
+    const outline = [];
+    for (const e of scope.querySelectorAll(OUTLINE_SEL)) {
+      if (outline.length >= OUTLINE_MAX) break;
+      if (host.contains(e) || !e.getClientRects().length) continue; // ours, or not rendered
+      outline.push(actionLabel(e) + (e.tagName === "A" ? ` → ${e.getAttribute("href")}` : ""));
+    }
+    return { url: pageUrl(), scope: scope === document.body ? "page" : shortSel(scope), text: text.length > max ? `${text.slice(0, max)}…` : text, truncated: text.length > max, outline };
+  }
+  const STYLE_KEYS = ["display", "position", "top", "left", "width", "height", "margin", "padding", "box-sizing", "flex-direction", "align-items", "justify-content", "gap", "grid-template-columns", "font-family", "font-size", "font-weight", "line-height", "letter-spacing", "color", "background-color", "background-image", "border", "border-radius", "box-shadow", "z-index", "opacity", "overflow", "transform", "visibility"];
+  function inspectAnswer(m) {
+    const e = askedElement(m);
+    if (!e) throw new Error("Pass note or selector.");
+    const cs = getComputedStyle(e);
+    const styles = {};
+    for (const k of STYLE_KEYS) { const v = cs.getPropertyValue(k); if (v && v !== "none" && v !== "normal" && v !== "auto") styles[k] = v; }
+    return { url: pageUrl(), ...describe(e), styles };
+  }
+  function consoleAnswer(m) {
+    const since = Number(m.since) || 0;
+    return { url: pageUrl(), capturing: VIA_PORT ? "page errors only: this overlay can't see the page's console on a site that isn't local" : "page errors and console errors and warnings", entries: pageLog.filter((x) => x.t > since) };
   }
 
   // Discard all pending annotations? Cancel / Discard, as Codex asks.
@@ -1663,7 +1771,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "shot": return screenshotView();
         case "hide": return setMarkersHidden(!markersHidden);
         case "discard": return openDiscard();
-        case "add": return addToChat();
         case "record": return startRecording();
         case "rec-stop": return stopRecording();
         case "rec-cancel": return stopRecording(true);
@@ -1721,6 +1828,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const { signal } = off;
     bindHold(signal);
     bindRecordingLog(signal);
+    bindPageLog(signal);
     document.addEventListener("claude-annotate:rec-state", (e) => { try { onRecState(JSON.parse(e.detail)); } catch { /* not ours */ } }, { signal });
     // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
     document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
@@ -1757,6 +1865,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     }
     window.addEventListener("popstate", fire, { signal });
     window.addEventListener("hashchange", fire, { signal });
+    document.addEventListener("visibilitychange", () => postPresence({ visible: document.visibilityState === "visible" }), { signal });
+    // A reload or a link away right after saving a note: the save waiting on its timer goes now.
+    window.addEventListener("pagehide", () => {
+      if (!saveTimer) return;
+      clearTimeout(saveTimer); saveTimer = null;
+      req("PUT", "/state", stateBody(pageUrl())).catch(() => {});
+    }, { signal });
     bindShield(signal); // after onKey: the overlay's keys reach onKey before the shield stops them
   }
   let currentUrl = location.href;
@@ -1765,6 +1880,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     currentUrl = location.href;
     closePopover();
     hydrate();
+    postPresence({ url: pageUrl(), title: document.title.slice(0, 200) });
   }
 
   // A click marks the element under it; a drag selects an area (see onMove).
@@ -1957,7 +2073,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
   }
   // Keys while annotating: Space held lets the page have the pointer; Esc backs out one step
-  // (the discard dialog, the chat list, then annotation mode); ⌘Z / ⇧⌘Z undo and redo; ⌘↵ sends.
+  // (the discard dialog, the chat list, then annotation mode); ⌘Z / ⇧⌘Z undo and redo.
   // While the page is held, its focused field and its shortcuts hear none of it.
   function onKey(e) {
     if (RENDER_ONLY) return;
@@ -1970,7 +2086,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     else if (editing) return; // the page's own inputs, while Space lets the page have them
     const meta = e.metaKey || e.ctrlKey;
     if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
-    if (meta && e.key === "Enter") { e.preventDefault(); addToChat(); return; }
     if (meta || e.altKey) return;
     if (e.key === " " && !inOurs) {
       e.preventDefault(); // not a page scroll: Space is held to use the page
@@ -2035,7 +2150,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     let list = null;
     try { list = json ? JSON.parse(json) : null; } catch { /* below */ }
     if (!list || !Array.isArray(list.chats)) {
-      chatMenu.innerHTML = `<div class="hd">Add notes to</div><div class="msg">Couldn't list the chats. Reload the extension and try again.</div>`;
+      chatMenu.innerHTML = `<div class="hd">Add notes to</div><div class="msg">Couldn't list the chats just now. Open this menu again in a moment.</div>`;
       return placeChatMenu();
     }
     const item = (c) => `<button type="button" role="menuitemradio" aria-checked="${!CFG.automatic && c.pid === list.current}" data-pid="${c.pid}">
@@ -2057,17 +2172,16 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Switching chats: what this chat has already got stays with it; unsent marks and comments go
   // along to the new one. The extension then mounts the overlay again for that chat.
   // auto: the open chat changed and the tab follows it (a pick in the menu holds instead).
-  // add: the notes were on their way to the chat: the new overlay adds them there.
-  async function chooseChat(pid, { auto = false, add = false } = {}) {
+  async function chooseChat(pid, { auto = false } = {}) {
     closeChatMenu();
     if (pid === CFG.chat) return;
     if (popNote) commitPopover();
     const url = pageUrl();
-    const carry = { url, add, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
+    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
     shapes = shapes.filter((x) => x.batch);
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
-    await req("PUT", "/state", { url, shapes, notes }).catch(() => {});
+    await req("PUT", "/state", stateBody(url)).catch(() => {});
     document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ pid, carry, auto }) }));
   }
   // The chat open in Claude Code changed: a tab on Automatic follows it, unsent notes and all.
@@ -2089,7 +2203,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     shapes = shapes.filter((x) => x.batch);
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
-    await req("PUT", "/state", { url, shapes, notes }).catch(() => {});
+    await req("PUT", "/state", stateBody(url)).catch(() => {});
     document.dispatchEvent(new CustomEvent("claude-annotate:choose", { detail: JSON.stringify({ follow: true, carry }) }));
   }
 
@@ -2098,7 +2212,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const c = carried;
     carried = null;
     if (!c || c.url !== pageUrl() || !(c.notes.length || c.shapes.length)) return;
-    if (c.add) setTimeout(addToChat, 0); // after hydrate has drawn them
     for (const n of c.notes) {
       try { n.n = (await req("POST", "/note/next")).n; } catch { n.n = Math.max(0, ...notes.map((k) => k.n)) + 1; }
       n.status = "draft";
@@ -2111,24 +2224,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // ---------------------------------------------------------------------------
   // Send / clear
   // ---------------------------------------------------------------------------
-  // Notes wait on the page until Send: the sidebar's button (the server asks the tab the user looks
-  // at, so its screenshot goes along) or ⌘↵ here. What went out then leaves the page.
+  // A saved note is in Claude Code's bar at once and goes with the user's next message there, or
+  // with the bar's Send (the server asks the tab in view to send, so its screenshot goes along).
+  // What went out then leaves the page.
   const waitingComments = () => notes.filter((n) => !n.batch && n.text).length;
-  // Add to chat: the notes wait in Claude Code's bar above the prompt and go with the next message
-  // there. The tab's picture goes along now, so the notes reach Claude with the page as it was.
-  async function addToChat() {
-    if (popNote) commitPopover();
-    if (!waitingComments() && !shapes.some((sh) => !sh.batch)) return;
-    if (CHOOSES_CHAT && CFG.automatic) {
-      const pid = Number(await askExtension("claude-annotate:recheck", "claude-annotate:retarget"));
-      if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) return chooseChat(pid, { auto: true, add: true }); // that chat's overlay adds them
-    }
-    clearTimeout(saveTimer); saveTimer = null;
-    try { await req("PUT", "/state", { url: pageUrl(), shapes, notes }); } catch (e) { return toast(`Couldn't add them: ${e.message}`); }
-    if (CFG.startMode === "draw") await uploadView();
-    toast(`Added to ${chatLabel()}. Send your message there when you're ready.`, "ok");
-    exitAnnotating();
-  }
   async function send() {
     if (phase === "sending") return;
     if (popNote) commitPopover(); // a comment being written goes with this Send
@@ -2136,17 +2235,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     phase = "sending";
     renderToolbar();
     clearTimeout(saveTimer);
-    try { await req("PUT", "/state", { url: pageUrl(), shapes, notes }); } catch { /* fallthrough */ }
+    try { await req("PUT", "/state", stateBody(pageUrl())); } catch { /* fallthrough */ }
     if (CFG.startMode === "draw") await uploadView(); // the extension put us up: it takes the screenshot
     try {
       const r = await req("POST", "/send");
       totals = r.totals || totals;
       phase = "sent";
-      tick(`sent ${r.notes} note${r.notes === 1 ? "" : "s"} to Claude`);
       await flushOut(r.ids || []);
-      // The server cannot tell whether the channel is on. If nothing comes back, say what to do.
-      clearTimeout(quietTimer);
-      quietTimer = setTimeout(() => { if (phase === "sent") toast("Nothing from Claude yet? In the session, ask Claude to pull the annotations."); }, 20000);
     } catch (e) {
       phase = "idle";
       renderToolbar();
@@ -2161,6 +2256,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const out = new Set(ids);
     const going = [...notes, ...shapes].filter((x) => out.has(x.id));
     if (!going.length) return renderToolbar();
+    for (const x of going) leaving.add(x.id);
     if (popNote && out.has(popNote.id)) closePopover();
     for (const x of going) {
       pinsLayer.querySelector(`.pin[data-id="${x.id}"]`)?.classList.add("flushed");
@@ -2169,7 +2265,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     await new Promise((r) => setTimeout(r, FLUSH_MS));
     notes = notes.filter((n) => !out.has(n.id));
     shapes = shapes.filter((x) => !out.has(x.id));
-    for (const id of out) anchors.delete(id);
+    for (const id of out) { anchors.delete(id); leaving.delete(id); }
     undo.length = 0; redo.length = 0;
     renderInk(); renderPins(); renderToolbar();
   }
@@ -2185,6 +2281,8 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     try { image = await askExtensionForShot(); } catch { /* none */ }
     api.capture(false);
     if (!image || !notes.includes(note)) return;
+    // The same picture is the tab's view for the batch, kept current as notes are made.
+    req("POST", "/view", { url: pageUrl(), image, viewport: { w: innerWidth, h: innerHeight }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) } }).catch(() => {});
     try {
       const shot = await decodeDataUrl(image);
       const shape = note.shape && shapes.find((s) => s.id === note.shape);
@@ -2243,19 +2341,12 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
 
   // ---------------------------------------------------------------------------
-  // Toasts / ticker
+  // Toasts
   // ---------------------------------------------------------------------------
   function toast(text, kind = "") {
     const t = el("div", `toast ${kind}`, `${svgIcon(kind === "ok" ? "check" : "note", 16)}<span>${esc(text)}</span>`);
     toasts.appendChild(t);
     setTimeout(() => { t.classList.add("out"); setTimeout(() => t.remove(), 260); }, kind === "ok" ? 3800 : 6000);
-  }
-  let tickerTimer = null;
-  function tick(text, mono) {
-    ticker.innerHTML = mono ? `Claude · <span class="mono">${esc(text)}</span>` : esc(text);
-    ticker.classList.add("show");
-    clearTimeout(tickerTimer);
-    tickerTimer = setTimeout(() => ticker.classList.remove("show"), 6000);
   }
 
   // ---------------------------------------------------------------------------
@@ -2273,43 +2364,87 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       else if (totals.batches > 0 && totals.unsent === 0) phase = "done";
       renderInk(); renderPins(); renderToolbar();
       reopenDraft();
-    } catch { setLink("off"); }
+    } catch { linkLost(); }
   }
+  // The link to the session's server heals itself: a stream that drops (the server restarted, the
+  // extension's worker slept, the chat closed) is opened again, after asking the extension where the
+  // chat is now. Yellow while it tries; red only after LINK_GIVE_UP_MS with no chat at all, and it
+  // keeps trying. Nothing for the user to do.
+  const RELINK_MS = [250, 500, 1000, 2000, 5000];
+  const LINK_GIVE_UP_MS = 10000;
+  let tabId = null, relinkTimer = null, relinkTries = 0, linkLostAt = 0, restoreOnHello = false;
+  const presenceQuery = () => new URLSearchParams({ url: pageUrl(), title: document.title.slice(0, 200), kind: mode === "record" ? "recording" : "annotating", visible: document.visibilityState === "visible" ? "1" : "0" }).toString();
   function connectSse() {
     if (INLINE) return;
     setLink("connecting");
-    sse = transport.events();
-    sse.onopen = () => setLink("on");
-    sse.onerror = () => setLink("off");
-    sse.onmessage = (ev) => {
+    openStream();
+  }
+  function openStream() {
+    if (sse) { sse.onerror = null; sse.close(); }
+    sse = transport.events(presenceQuery());
+    sse.onerror = linkLost;
+    sse.onmessage = onServerEvent;
+  }
+  function linkLost() {
+    if (INLINE || off.signal.aborted || relinkTimer) return;
+    if (sse) { sse.onerror = null; sse.close(); sse = null; }
+    tabId = null;
+    linkLostAt ||= Date.now();
+    setLink(Date.now() - linkLostAt > LINK_GIVE_UP_MS ? "off" : "connecting");
+    relinkTimer = setTimeout(relink, RELINK_MS[Math.min(relinkTries++, RELINK_MS.length - 1)]);
+  }
+  async function relink() {
+    relinkTimer = null;
+    if (off.signal.aborted) return;
+    if (CHOOSES_CHAT) {
+      // The extension asks the native host again: the same chat with a new token, another chat, or none.
+      let at = null;
+      try { at = JSON.parse((await askExtension("claude-annotate:relink", "claude-annotate:relinked")) || "null"); } catch { /* none */ }
+      if (!at || !at.pid) return linkLost();
+      if (at.pid !== CFG.chat) {
+        if (!CFG.automatic) toast(`${chatLabel()} is gone. Notes now go to the chat open in Claude Code.`);
+        return chooseChat(at.pid, { auto: true }); // remounts for that chat, unsent notes carried
+      }
+      if (at.endpoint) { CFG.endpoint = at.endpoint; CFG.token = at.token; }
+    }
+    restoreOnHello = true;
+    openStream();
+  }
+  // The server tracks this tab while its stream is open; these keep what it knows current.
+  function postPresence(change) {
+    if (tabId) req("POST", "/presence", { tab: tabId, ...change }).catch(() => {});
+  }
+  function onServerEvent(ev) {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === "progress" || m.type === "done" || m.type === "status" || m.type === "toast") clearTimeout(quietTimer);
       switch (m.type) {
-        case "hello": setLink("on"); if (m.totals) { totals = m.totals; renderToolbar(); } break;
+        case "hello":
+          if (m.tab !== undefined) tabId = m.tab; // annotate_open's hello names no tab
+          linkLostAt = 0; relinkTries = 0; setLink("on");
+          if (m.totals) { totals = m.totals; renderToolbar(); }
+          // Back after a drop: a restarted server starts empty, so this page's notes go to it again.
+          if (restoreOnHello) { restoreOnHello = false; if (notes.length || shapes.length) { clearTimeout(saveTimer); req("PUT", "/state", stateBody(pageUrl())).catch(() => {}); } }
+          break;
         case "progress": {
           const n = notes.find((k) => k.n === m.n);
           if (n) { n.status = m.status; updatePin(n); }
-          tick(m.status === "working" ? `working on note ${m.n}` : `note ${m.n} ${m.status}`); // Claude's words stay in Claude Code
           if (m.status === "done") { const d = pinsLayer.querySelector(`.pin[data-id="${n ? n.id : ""}"] .dot`); if (d) d.classList.add("wiggle"); }
           break;
         }
-        case "status": tick(m.text, true); break;
         case "toast": toast(m.text); break;
-        case "sent": phase = "sent"; if (m.totals) totals = m.totals; flushOut(m.ids || []); break; // this or another tab sent
-        case "send-request": // Send, pressed in the sidebar: the tab in view sends, with its screenshot when it has notes of its own
-          if (document.visibilityState !== "visible") break;
-          if (waitingComments() || shapes.some((sh) => !sh.batch)) send();
-          else req("POST", "/send").catch(() => {}); // the notes are on other pages: send them without waiting for a tab that has them
+        case "sent": // the server sent what was on the pages, this tab's notes among them or not
+          phase = "sent"; if (m.totals) totals = m.totals;
+          if ((m.ids || []).some((id) => notes.some((n) => n.id === id))) toast(`Sent to ${chatLabel()}.`, "ok");
+          flushOut(m.ids || []);
           break;
         case "changed": if (m.url === pageUrl() && !draft && !popNote && !drag) hydrate(); break; // edited from outside the page
         case "chats": followOpenChat(); break; // a chat was opened, typed in, started or ended
-        case "verify-shot": verifyShot(m); break; // Claude's annotate_screenshot
+        case "ask": answerAsk(m); break; // Claude's annotate_screenshot, annotate_read, annotate_inspect…
+        case "stop": exitAnnotating(); break; // the ✕ on the bar in Claude Code
         case "done":
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";
           totals.open = 0;
           renderToolbar();
-          toast("Done. Claude's notes are in Claude Code.", "ok");
           wigglePins(70);
           break;
         case "clear":
@@ -2318,7 +2453,6 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
           closePopover(); renderInk(); renderPins(); renderToolbar();
           break;
       }
-    };
   }
 
   // ---------------------------------------------------------------------------
@@ -2329,15 +2463,16 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Removes the overlay and everything it hooked into the page. Unsaved edits are saved first.
   api.unmount = async () => {
     if (off.signal.aborted) return;
+    if (popNote) commitPopover(); // an open comment is saved, and stops holding its note back
     if (saveTimer) {
       clearTimeout(saveTimer);
-      await req("PUT", "/state", { url: pageUrl(), shapes, notes }).catch(() => {});
+      await req("PUT", "/state", stateBody(pageUrl())).catch(() => {});
     }
     releasePage();
     if (rec && rec.via === "page") { rec.cancel = true; rec.recorder.onstop = null; for (const t of rec.stream.getTracks()) t.stop(); }
     off.abort();
-    if (sse) sse.close();
-    for (const t of [quietTimer, tickerTimer]) clearTimeout(t);
+    if (sse) { sse.onerror = null; sse.close(); }
+    clearTimeout(relinkTimer);
     clearInterval(recTimer);
     if (host) host.remove();
     if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;

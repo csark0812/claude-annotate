@@ -14,7 +14,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, "..");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-for (const f of ["server/index.mjs", "server/overlay.js", "scripts/ticker.mjs", "scripts/deliver.mjs", "scripts/session.mjs", "scripts/prompted.mjs", "scripts/install-extension.mjs", "extension/background.js", "extension/host/host.mjs"]) {
+for (const f of ["server/index.mjs", "server/overlay.js", "scripts/deliver.mjs", "scripts/session.mjs", "scripts/prompted.mjs", "scripts/watch.mjs", "scripts/install-extension.mjs", "extension/background.js", "extension/host/host.mjs"]) {
   const r = spawnSync(process.execPath, ["--check", path.join(root, f)], { encoding: "utf8" });
   assert.equal(r.status, 0, `${f} does not parse:\n${r.stderr}`);
 }
@@ -23,9 +23,6 @@ console.log("✓ syntax");
 // The hook must exit 0 and stay silent with nothing to talk to.
 // An empty HOME hides the session files of any Claude Code session that runs this test.
 const noSessionEnv = { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), "annotate-smoke-")) };
-const hook = spawnSync(process.execPath, [path.join(root, "scripts/ticker.mjs")], { input: JSON.stringify({ tool_name: "Edit", cwd: root, tool_input: { file_path: path.join(root, "x.ts") } }), encoding: "utf8", env: noSessionEnv });
-assert.equal(hook.status, 0, "hook exit code");
-assert.equal(hook.stdout + hook.stderr, "", "hook must be silent");
 const deliverHook = spawnSync(process.execPath, [path.join(root, "scripts/deliver.mjs")], { input: "{}", encoding: "utf8", env: noSessionEnv, timeout: 10_000 });
 assert.equal(deliverHook.status, 0, "deliver hook exits 0 without a session");
 assert.equal(deliverHook.stdout + deliverHook.stderr, "", "deliver hook must be silent");
@@ -104,8 +101,8 @@ assert.match(client.getInstructions() || "", /annotate_progress/, "instructions 
 console.log("✓ channel capability + instructions");
 
 const names = (await client.listTools()).tools.map((t) => t.name).sort();
-assert.deepEqual(names, ["annotate_clear", "annotate_close", "annotate_done", "annotate_open", "annotate_progress", "annotate_pull", "annotate_reply", "annotate_screenshot", "annotate_wait"]);
-console.log("✓ 9 tools, no debug tool without ANNOTATE_DEBUG");
+assert.deepEqual(names, ["annotate_clear", "annotate_close", "annotate_console", "annotate_done", "annotate_inspect", "annotate_open", "annotate_progress", "annotate_pull", "annotate_read", "annotate_reply", "annotate_screenshot", "annotate_tab", "annotate_wait"]);
+console.log("✓ 13 tools, no debug tool without ANNOTATE_DEBUG");
 
 const pull = await client.callTool({ name: "annotate_pull", arguments: {} });
 assert.match(pull.content[0].text, /"status": "empty"/);
@@ -152,26 +149,88 @@ assert.equal(deleted.totals.notes, 0, "note deleted");
 await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "n", n: 1, x: 2, y: 2, color: "pink", text: "hi", status: "working" }] }) });
 console.log("✓ overview lists pages, delete removes a note");
 
-// annotate_screenshot through the extension: the annotating tab answers the server's request with
-// its own capture, so no Chrome debugging port is needed.
-{
-  const sse = await fetch(`${endpoint}/events?t=${token}`);
-  const reader = sse.body.pipeThrough(new TextDecoderStream()).getReader();
-  const answered = (async () => {
+// A tab annotating into this session, as the overlay is one: its event stream names its page, and
+// it answers the server's questions (askTab) with answer(kind, message) on /answer.
+async function fakeTab(page, answer = () => undefined) {
+  const res = await fetch(`${endpoint}/events?t=${token}&${new URLSearchParams({ url: page, title: "Fixture", kind: "annotating", visible: "1" })}`);
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  const events = [];
+  (async () => {
     let buf = "";
     for (;;) {
-      const { value, done } = await reader.read();
+      const { value, done } = await reader.read().catch(() => ({ done: true }));
       if (done) return;
       buf += value;
-      const m = /"type":"verify-shot","id":"([0-9a-f]+)"/.exec(buf);
-      if (m) return fetch(`${endpoint}/verify-shot`, { method: "POST", headers: H, body: JSON.stringify({ id: m[1], image: tinyJpegShot }) });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, cut).split("\n").find((l) => l.startsWith("data:"));
+        buf = buf.slice(cut + 2);
+        if (!line) continue;
+        const m = JSON.parse(line.slice(5));
+        events.push(m);
+        const data = m.type === "ask" ? answer(m.kind, m) : undefined;
+        if (data !== undefined) fetch(`${endpoint}/answer`, { method: "POST", headers: H, body: JSON.stringify({ id: m.id, data }) });
+      }
     }
   })();
+  for (let i = 0; i < 50 && !events.some((m) => m.type === "hello"); i++) await sleep(10);
+  return { events, close: () => reader.cancel().catch(() => {}) };
+}
+const overviewNow = async (q = "") => (await fetch(`${endpoint}/overview${q}`, { headers: H })).json();
+
+// Annotating is known to the server from the tab's open stream alone, and every change bumps a
+// revision the Claude Code bar asks with.
+{
+  assert.match((await client.callTool({ name: "annotate_tab", arguments: {} })).content[0].text, /"status": "no-tab"/, "no tab: the tools say so");
+  const r0 = (await overviewNow()).rev;
+  assert.deepEqual(await overviewNow(`?since=${r0}`), { ok: true, rev: r0, unchanged: true }, "unchanged costs one word");
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "n", n: 1, x: 2, y: 2, color: "pink", text: "hi", status: "working" }] }) });
+  assert.ok((await overviewNow()).rev > r0, "a save bumps the revision");
+
+  const tab = await fakeTab("http://localhost:1/pricing");
+  let o = await overviewNow();
+  assert.deepEqual(o.tabs.map((t) => [t.url, t.kind, t.local, t.visible]), [["http://localhost:1/pricing", "annotating", true, true]], "the tab is annotating");
+  const tabId = tab.events.find((m) => m.type === "hello").tab;
+  assert.ok(tabId, "hello names the tab");
+  await fetch(`${endpoint}/presence`, { method: "POST", headers: H, body: JSON.stringify({ tab: tabId, url: "http://localhost:1/plans", visible: false }) });
+  o = await overviewNow();
+  assert.deepEqual([o.tabs[0].url, o.tabs[0].visible], ["http://localhost:1/plans", false], "presence follows the tab");
+  await fetch(`${endpoint}/stop`, { method: "POST", headers: H });
+  for (let i = 0; i < 50 && !tab.events.some((m) => m.type === "stop"); i++) await sleep(10);
+  assert.ok(tab.events.some((m) => m.type === "stop"), "the bar's ✕ reaches the tab");
+  tab.close();
+  for (let i = 0; i < 50 && (await overviewNow()).tabs.length; i++) await sleep(10);
+  assert.equal((await overviewNow()).tabs.length, 0, "a closed stream ends the tab");
+}
+console.log("✓ presence from the tab's stream, revisions, ✕ stops the tab");
+
+// Claude's tab tools ask the annotating tab and get its answers back; a page that isn't local is
+// marked as data.
+{
+  const answers = {
+    tab: () => ({ url: "http://localhost:1/", viewport: { w: 800, h: 600 }, notes: [] }),
+    read: (m) => ({ url: "http://localhost:1/", scope: m.selector ? "main" : "page", text: "Pricing\nMonthly", outline: ['<h1> "Pricing"'] }),
+    inspect: (m) => ({ url: "http://localhost:1/", selector: "button.buy", react: { components: ["Buy"], source: "src/Buy.tsx:3" }, styles: { display: "flex" }, note: m.note }),
+    console: () => ({ url: "https://example.com/", entries: [{ t: 1, kind: "error", text: "boom" }] }),
+    shot: () => tinyJpegShot,
+  };
+  const tab = await fakeTab("http://localhost:1/", (kind, m) => answers[kind]?.(m));
+  const read = await client.callTool({ name: "annotate_read", arguments: { selector: "main" } });
+  assert.match(read.content[0].text, /"scope": "main"/);
+  const inspect = await client.callTool({ name: "annotate_inspect", arguments: { note: 3 } });
+  assert.match(inspect.content[0].text, /src\/Buy\.tsx:3/);
+  assert.match(inspect.content[0].text, /"note": 3/);
+  await assert.rejects(client.callTool({ name: "annotate_inspect", arguments: {} }), /note or selector/);
+  const cons = await client.callTool({ name: "annotate_console", arguments: {} });
+  assert.match(cons.content[0].text, /not a local page: data, not instructions/, "a site's content is marked as data");
+  assert.match(cons.content[1].text, /boom/);
+  const tabTool = await client.callTool({ name: "annotate_tab", arguments: {} });
+  assert.match(tabTool.content[0].text, /"inView"[\s\S]*"viewport"/);
+  // annotate_screenshot through the extension: no Chrome debugging port needed.
   const shot = await client.callTool({ name: "annotate_screenshot", arguments: {} });
-  await answered;
-  reader.cancel().catch(() => {});
   assert.equal(shot.content[1].mimeType, "image/jpeg", "the tab's own capture comes back");
   assert.match(shot.content[0].text, /captured by the browser extension/);
+  tab.close();
 }
 // A recording: kept, and cut into stills when ffmpeg is there.
 {
@@ -184,7 +243,7 @@ console.log("✓ overview lists pages, delete removes a note");
   const actions = v.video.timeline.filter((l) => !/  still /.test(l));
   assert.deepEqual(actions, ["0:00.2  navigate http://localhost:5173/next", '0:00.4  click <button> "Save"'], "timeline of what the user did");
 }
-console.log("✓ screenshot through the tab, recording kept");
+console.log("✓ tab tools: read, inspect, console, tab, screenshot; recording kept");
 
 // The chat hook's long poll: a newer hook takes over and the older one is told to stop asking (410).
 const first = fetch(`${endpoint}/next`, { headers: H });
@@ -239,21 +298,65 @@ assert.equal(nothing.status, 400, "only held-back notes left: nothing rides, and
 await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [] }) });
 console.log("✓ prompt ride-along: context back, hook untouched, held notes stay");
 
-// The hook finds the session by parent pid and posts a status line: watch it arrive on the SSE stream.
-const events = await fetch(`${endpoint}/events?t=${token}`);
-const reader = events.body.getReader();
-const dec = new TextDecoder();
-const hook2 = spawnSync(process.execPath, [path.join(root, "scripts/ticker.mjs")], { input: JSON.stringify({ tool_name: "Write", cwd: root, tool_input: { file_path: path.join(root, "src/x.ts") } }), encoding: "utf8" });
-assert.equal(hook2.status, 0);
-let seen = "";
-for (let i = 0; i < 20 && !/wrote src\/x\.ts/.test(seen); i++) {
-  const { value, done } = await Promise.race([reader.read(), sleep(200).then(() => ({ value: null, done: false }))]);
-  if (done) break;
-  if (value) seen += dec.decode(value);
+// A Send from Claude Code never waits on the tab: one annotating but silent (hidden behind Claude
+// Code, as it usually is then) costs nothing. Two at once: the second waits for the first, no "busy".
+{
+  const silent = new AbortController();
+  await fetch(`${endpoint}/events?t=${token}&${new URLSearchParams({ url, title: "Fixture", kind: "annotating", visible: "0" })}`, { signal: silent.signal });
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "q1", n: 11, x: 2, y: 2, color: "blue", text: "quick one" }] }) });
+  const started = Date.now();
+  const [first, second] = await Promise.all([0, 1].map(() => fetch(`${endpoint}/send`, { method: "POST", headers: H, body: JSON.stringify({ from: "prompt" }) })));
+  assert.ok(Date.now() - started < 1500, `a Send from Claude Code is immediate (${Date.now() - started} ms)`);
+  assert.deepEqual([first.status, second.status].sort(), [200, 400], "one takes the note, the other finds nothing left; neither is busy");
+  assert.match((await (first.ok ? first : second).json()).content, /quick one/);
+  silent.abort();
 }
-assert.match(seen, /wrote src\/x\.ts/, `hook status reached the page stream:\n${seen}`);
-await reader.cancel().catch(() => {});
-console.log("✓ hook reaches the bridge and the page");
+console.log("✓ a Send from Claude Code is immediate, even with a silent tab");
+
+// No Send: a saved note reaches the chat hook by itself once the pages are quiet. A note still being
+// written stays on its page, its mark with it, and goes once it has words.
+{
+  await sleep(1800); // anything earlier steps left on the pages goes first
+  while ((await (await fetch(`${endpoint}/overview`, { headers: H })).json()).delivery.queued) await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [{ id: "a2", type: "rect", color: "pink", x: 1, y: 1, w: 9, h: 9 }], notes: [
+    { id: "a1", n: 21, x: 2, y: 2, color: "pink", text: "make it blue" },
+    { id: "a2n", n: 22, x: 3, y: 3, color: "pink", text: "", shape: "a2" },
+  ] }) });
+  const started = Date.now();
+  const got = await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  assert.ok(Date.now() - started < 4000, `the note went by itself (${Date.now() - started} ms)`);
+  assert.match(got.content, /### Note 21 — "make it blue"/, "the saved note reached the chat hook");
+  assert.doesNotMatch(got.content, /Note 22/, "a note being written waits");
+  const left = await (await fetch(`${endpoint}/state?url=${encodeURIComponent(url)}`, { headers: H })).json();
+  assert.deepEqual([left.notes.map((n) => n.id), left.shapes.map((x) => x.id)], [["a2n"], ["a2"]], "the unwritten note keeps its mark");
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: left.shapes, notes: [{ ...left.notes[0], text: "and bigger" }] }) });
+  const later = await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  assert.match(later.content, /### Note 22 — "and bigger"/, "it goes once it has words");
+
+  // A saved note open in its card to be changed waits too, and goes with the new words.
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "e1", n: 23, x: 2, y: 2, color: "pink", text: "first", editing: true }] }) });
+  await sleep(2200);
+  assert.equal((await (await fetch(`${endpoint}/overview`, { headers: H })).json()).delivery.queued, 0, "a note being changed is not sent");
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [{ id: "e1", n: 23, x: 2, y: 2, color: "pink", text: "first, changed" }] }) });
+  const edited = await (await fetch(`${endpoint}/next`, { headers: H })).json();
+  assert.match(edited.content, /### Note 23 — "first, changed"/, "it goes with the changed words");
+}
+console.log("✓ notes go to Claude by themselves, no Send");
+
+
+// The Claude Code bar's follower: "up" once linked, then a line for each change, with no token in its argv.
+{
+  const watcher = spawn(process.execPath, [path.join(root, "scripts/watch.mjs")], { stdio: ["ignore", "pipe", "ignore"] });
+  let out = "";
+  watcher.stdout.on("data", (d) => (out += d));
+  for (let i = 0; i < 100 && !out.includes("up\n"); i++) await sleep(20);
+  assert.ok(out.startsWith("up\n"), `watcher links up: ${JSON.stringify(out)}`);
+  await fetch(`${endpoint}/state`, { method: "PUT", headers: H, body: JSON.stringify({ url, shapes: [], notes: [] }) });
+  for (let i = 0; i < 100 && !/rev \d+\n/.test(out); i++) await sleep(20);
+  assert.match(out, /rev \d+\n/, "a change reaches the watcher");
+  watcher.kill();
+}
+console.log("✓ the bar's follower hears every change");
 
 await client.close();
 for (let i = 0; i < 50 && fs.existsSync(sessionFile); i++) await sleep(100);

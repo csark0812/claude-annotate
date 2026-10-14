@@ -37,13 +37,19 @@ export type Totals = { notes: number; shapes: number; pages: number; unsent: num
 /** Batches sent but not yet in Claude's hands; `listening` is false when no chat hook waits to wake Claude. */
 export type Delivery = { queued: number; listening: boolean }
 
+/** A browser tab annotating (or recording) into this session: one while its event stream is open. */
+export type Tab = { id: string; url: string; title: string; kind: 'annotating' | 'recording'; local: boolean; visible: boolean; since: number }
+
 /** What the annotate server's GET /overview answers, or why there is nothing to show. */
 export type Overview =
-  | { kind: 'linked'; mode: string; totals: Totals; pages: Page[]; sent: SentNote[]; delivery: Delivery }
+  | { kind: 'linked'; rev: number; mode: string; totals: Totals; tabs: Tab[]; pages: Page[]; sent: SentNote[]; delivery: Delivery }
   | { kind: 'no-server' }
+
+/** Notes that went out with a prompt the user typed: the prompt's text and the line its row shows under it. */
+export type Ride = { text: string; label: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    annotate: { overview: Overview; error: string | null; confirmClear: boolean; expanded: boolean }
+    annotate: { overview: Overview; error: string | null; confirmClear: boolean; expanded: boolean; sending: string | null; rides: Ride[] }
   }
 }
