@@ -76,6 +76,7 @@ const VIDEO_AFTER_S = 0.7; // a still this long after each action shows what it 
 // Notes go to Claude by themselves: this long after the last change on the pages, so a burst of
 // notes goes as one message and a note being written waits for its words.
 const AUTO_SEND_MS = 1500;
+const SENT_KEEP = 200; // finished notes kept in the sent list (and in every /overview)
 // This server's life: a tab that sees another one after a drop knows notes it sent are gone with the old.
 const BOOT = crypto.randomBytes(6).toString("hex");
 const VIEW_FRESH_MS = 30 * 60000; // the page's Add to chat uploads its view; the notes may wait in the chat's bar this long before they go
@@ -528,13 +529,21 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
     }
     const ids = new Set([...snap.notes, ...snap.shapes].map((x) => x.id).filter((id) => !kept.has(id)));
     for (const id of ids) state.sentIds.add(id);
-    for (const n of snap.notes) state.sent.push({ url, n: n.n, text: n.text, color: n.color, batch: id, status: "pending", result: "", preview: n.preview || null });
+    // No picture: it went out in the batch's files, and every /overview carries this list.
+    for (const n of snap.notes) state.sent.push({ url, n: n.n, text: n.text, color: n.color, batch: id, status: "pending", result: "", preview: null });
     if (!live) continue;
     live.notes = live.notes.filter((n) => !ids.has(n.id));
     live.shapes = live.shapes.filter((s) => !ids.has(s.id));
     if (!live.notes.length && !live.shapes.length) state.pages.delete(url);
   }
   batch.ids = batch.ids.filter((id) => !kept.has(id)); // the tabs keep those on their pages
+  // The sent list keeps the open notes and the latest finished ones.
+  if (state.sent.length > SENT_KEEP) {
+    const open = (k) => k.status === "pending" || k.status === "working";
+    const finished = state.sent.filter((k) => !open(k));
+    const drop = new Set(finished.slice(0, Math.max(0, state.sent.length - SENT_KEEP)));
+    state.sent = state.sent.filter((k) => !drop.has(k));
+  }
   if (kept.size) scheduleAutoSend();
   return batch;
 }
@@ -579,6 +588,7 @@ async function sendNow({ browser = true } = {}) {
     const pushed = riding ? (state.batches.push(batch), false) : await deliver(batch);
     log(`batch ${batch.id}: ${batch.notes} notes on ${batch.pages} page(s) → ${riding ? "attached to the user's prompt" : pushed ? "written to the channel" : { chat: "handed to the chat hook", poll: "handed to waiter", channel: "queued (pull)" }[state.mode]}`);
     broadcast({ type: "sent", batch: batch.id, ids: batch.ids, notes: batch.notes, pages: batch.pages, pushed, mode: state.mode, totals: totals() });
+    if (riding || pushed) broadcast({ type: "delivered", batch: batch.id }); // the prompt or the channel carried it
     changed();
     return { batch, pushed };
   } finally {
@@ -646,7 +656,9 @@ function handToHook(batch) {
   changed();
 }
 
-function takePending(batch) { state.pending = state.pending.filter((b) => b !== batch); changed(); return batch; }
+// Handed to Claude (the chat hook, a pull, the bar): the tabs know Claude has it now, and won't send
+// it again if this server goes while Claude is still reading it.
+function takePending(batch) { state.pending = state.pending.filter((b) => b !== batch); broadcast({ type: "delivered", batch: batch.id }); changed(); return batch; }
 
 async function removeBatchFiles(batch) {
   if (!batch || !batch.dir) return;
@@ -930,15 +942,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     case "annotate_done": {
       const summary = String(args.summary || "").trim();
-      // Without an id: the oldest batch still open, never a newer one Claude hasn't read yet.
-      const batch = args.batch ? state.batches.find((b) => b.id === Number(args.batch)) : state.batches.find((b) => !b.done);
-      if (batch) {
+      // Without an id: every batch Claude has (one turn often handles several), never one still
+      // waiting for it unread. With one: that batch.
+      const open = state.batches.filter((b) => !b.done);
+      const batches = args.batch ? open.filter((b) => b.id === Number(args.batch)) : open.filter((b) => !state.pending.includes(b));
+      for (const [i, batch] of batches.entries()) {
         for (const note of state.sent) if (note.batch === batch.id && (note.status === "pending" || note.status === "working")) note.status = "done";
         batch.done = true;
         await removeBatchFiles(batch);
-        takePending(batch);
+        if (state.pending.includes(batch)) takePending(batch);
+        broadcast({ type: "done", summary: i === batches.length - 1 ? summary : "", batch: batch.id, last: i === batches.length - 1 });
       }
-      broadcast({ type: "done", summary, batch: batch ? batch.id : null });
+      if (!batches.length) broadcast({ type: "done", summary, batch: null, last: true });
       changed();
       return text("ok");
     }
@@ -1327,6 +1342,8 @@ const server = http.createServer(async (req, res) => {
       // The chat hook's long poll. 200 carries a batch, 204 means ask again, 409 and 410 mean stop.
       if (state.mode !== "chat") return json(res, 409, { ok: false, error: `delivery is ${state.mode}` });
       if (state.pending[0]) return json(res, 200, { ok: true, content: takePending(state.pending[0]).content });
+      // wait=0: Claude Code's bar takes a batch no hook is waiting for (a turn stopped with Esc arms none).
+      if (url.searchParams.get("wait") === "0") { res.writeHead(204, cors); return res.end(); }
       // One hook waits at a time. The older one gets 410 and exits, so two armed hooks never take turns.
       if (state.hookWaiter) state.hookWaiter(null, true);
       const waiter = (batch, superseded = false) => {
@@ -1369,6 +1386,20 @@ server.on("error", (e) => log(`http server error: ${e}`));
 // ---------------------------------------------------------------------------
 // Housekeeping
 // ---------------------------------------------------------------------------
+// Each server's screenshots live in SHOTS_ROOT/<session>/, with an "owner" file naming its process.
+// One killed outright leaves its folder: the next server to start removes those whose owner is gone.
+async function sweepShots() {
+  await fsp.mkdir(SHOTS_DIR, { recursive: true });
+  await fsp.writeFile(path.join(SHOTS_DIR, "owner"), String(process.pid));
+  for (const name of await fsp.readdir(SHOTS_ROOT).catch(() => [])) {
+    if (name === SESSION) continue;
+    const dir = path.join(SHOTS_ROOT, name);
+    const owner = Number(await fsp.readFile(path.join(dir, "owner"), "utf8").catch(() => "0"));
+    if (!owner) continue; // an older server's, or not ours: left alone
+    try { process.kill(owner, 0); } catch (e) { if (e.code === "ESRCH") await fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+  }
+}
+
 async function writeSessionFile() {
   await fsp.mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
   await fsp.chmod(SESSIONS_DIR, 0o700).catch(() => {});
@@ -1425,6 +1456,7 @@ server.listen(0, "127.0.0.1", async () => {
   endpoint = `http://127.0.0.1:${server.address().port}`;
   markReady();
   await writeSessionFile().catch((e) => log(`session file: ${e.message}`));
+  sweepShots().catch(() => {});
   watchChats();
   log(`v${VERSION} ready at ${endpoint}`);
 });

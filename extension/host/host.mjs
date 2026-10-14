@@ -3,6 +3,7 @@
 // talks over stdio: a 4-byte little-endian length, then that many bytes of JSON, each way.
 //
 // { type: "sessions", url? } → { ok, sessions: [{ pid, endpoint, token, cwd, startedAt, lastPromptAt, title, lastPrompt, servesPage }] }
+// { type: "alive", pid } → { ok, alive }: whether that chat's Claude Code process still runs
 // Live sessions only (the Claude Code process named by the file still runs and its annotate
 // server answers). Order: with a local url, the sessions working in the folder of the dev server
 // behind that page come first (servesPage, deepest folder first); then the one the user typed in
@@ -179,6 +180,8 @@ async function reachableSessions(url) {
 
 async function answer(message) {
   if (message?.type === "sessions") return { ok: true, sessions: await reachableSessions(message.url) };
+  // Is this chat still running (its Claude Code process, whatever its server is doing)?
+  if (message?.type === "alive") return { ok: true, alive: Number.isInteger(message.pid) && message.pid > 1 && isAlive(message.pid) };
   return { ok: false, error: `unknown message type: ${message?.type}` };
 }
 

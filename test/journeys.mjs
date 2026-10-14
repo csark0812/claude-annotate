@@ -21,6 +21,9 @@
 //  9. Pages built the modern way: an element inside a cross-origin frame and inside a web
 //     component's shadow root is picked, read and inspected; a client-side route change files
 //     each note under its own URL.
+// 10. Several chats: tabs that follow the open chat at the same moment all go to it; a note the
+//     chat it went to never handed to Claude goes again when that chat closes; one Claude already
+//     has is not sent twice when its chat's server dies.
 import { chromium } from "playwright-core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -159,7 +162,7 @@ async function launch({ allowCapture = true, extraArgs = [] } = {}) {
   const page = context.pages()[0] || (await context.newPage());
   return { context, sw, page, profile };
 }
-const tabIdOf = (sw, url) => sw.evaluate(async (u) => (await chrome.tabs.query({})).find((t) => t.url.startsWith(u))?.id, url);
+const tabIdOf = (sw, url) => sw.evaluate(async (u) => (await chrome.tabs.query({})).find((t) => (t.url || t.pendingUrl || "").startsWith(u))?.id, url);
 const click = (sw, tabId) => sw.evaluate((id) => self.claudeAnnotate.click(id), tabId);
 const shortcut = (sw, command, tabId) => sw.evaluate(([c, id]) => self.claudeAnnotate.shortcut(c, id), [command, tabId]);
 const badge = (sw, tabId) => sw.evaluate((id) => chrome.action.getBadgeText({ tabId: id }), tabId);
@@ -519,6 +522,72 @@ async function noteOn(page, selector, text) {
     await until("Done closes the picture", async () => !context.pages().some((p) => p.url().includes("snapshot.html")));
   });
   await context.close();
+}
+
+// ---------------------------------------------------------------------------
+// 10. Several chats
+// ---------------------------------------------------------------------------
+// Another chat: its own server under its own HOME, listed to the extension by a pid of our choosing.
+async function otherChat(name, pid) {
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), `annotate-${name}-`));
+  const dir = path.join(own, ".cache", "claude-annotate", "sessions");
+  const c = new Client({ name, version: "0.0.0" }, { capabilities: {} });
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, "server", "index.mjs")], env: { ...process.env, HOME: own }, stderr: "pipe" }));
+  let s = null;
+  for (let i = 0; i < 50 && !s; i++) { const f = fs.existsSync(dir) && fs.readdirSync(dir).find((x) => x.endsWith(".json")); if (f) s = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); else await sleep(100); }
+  return { client: c, home: own, s: { ...s, pid, title: name, cwd: "/tmp", startedAt: 1, lastPromptAt: null, servesPage: false, focusedAt: null } };
+}
+{
+  const { context, sw } = await launch();
+  const A = await otherChat("A", 70001), B = await otherChat("B", 70002);
+  // The native host: the chats listed (the first is the open one) and the ones still running.
+  const host = (list, alive) => sw.evaluate(([l, a]) => { chrome.runtime.sendNativeMessage = async (_h, m) => (m.type === "alive" ? { ok: true, alive: a.includes(m.pid) } : { ok: true, sessions: l }); }, [list, alive]);
+  const take = async (c, ms = 5000) => { try { const r = await fetch(`${c.s.endpoint}/next`, { headers: { "X-Annot-Token": c.s.token }, signal: AbortSignal.timeout(ms) }); return r.status === 200 ? (await r.json()).content : null; } catch { return null; } };
+  const remount = (id) => sw.evaluate((i) => self.claudeAnnotate.remount(i), id);
+  await journey("several chats: tabs follow together; a note never handed over goes again; none twice", async () => {
+    await host([A.s, B.s], [70001, 70002]);
+    const tabs = [];
+    for (const p of ["/one", "/two", "/three", "/four"]) {
+      const pg = await context.newPage();
+      await pg.goto(`${SITE}${p}`);
+      const id = await tabIdOf(sw, `${SITE}${p}`);
+      await click(sw, id);
+      await until("the overlay", async () => (await overlayMode(pg)) === "draw");
+      tabs.push({ pg, id });
+    }
+    // The open chat becomes B: all four remount at the same moment.
+    await host([B.s, A.s], [70001, 70002]);
+    await Promise.all(tabs.map((t) => remount(t.id)));
+    await sleep(800);
+    for (const [i, t] of tabs.entries()) await noteOn(t.pg, "#inc", `four tabs ${i}`);
+    const inB = [await take(B), await take(B, 2500)].join("\n");
+    assert.ok([0, 1, 2, 3].every((i) => inB.includes(`"four tabs ${i}"`)), "every tab's note went to B");
+    assert.equal(await take(A, 1500), null, "none to A");
+    for (const t of tabs.slice(1)) await t.pg.close();
+    const { pg, id } = tabs[0];
+
+    // A note waits in A, unread; the tab follows B; A closes: it goes to B.
+    await host([A.s, B.s], [70001, 70002]); await remount(id); await sleep(800);
+    await noteOn(pg, "#size", "waiting in A");
+    await until("queued in A", async () => (await (await fetch(`${A.s.endpoint}/overview`, { headers: { "X-Annot-Token": A.s.token } })).json()).delivery.queued === 1, 5000);
+    await host([B.s, A.s], [70001, 70002]); await remount(id); await sleep(800);
+    await host([B.s], [70002]); // A closed
+    assert.match((await take(B, 12000)) ?? "", /"waiting in A"/, "the note A never handed over went to B");
+    while (await take(A, 500)); // what A still held
+
+    // A note A's hook takes; the tab follows B; A's server dies while A runs on: not sent again.
+    await host([A.s, B.s], [70001, 70002]); await remount(id); await sleep(800);
+    await noteOn(pg, "#inc", "taken by A");
+    assert.match((await take(A)) ?? "", /"taken by A"/, "A's hook took it");
+    await host([B.s, A.s], [70001, 70002]); await remount(id); await sleep(800);
+    await A.client.close();
+    await host([B.s], [70001, 70002]);
+    assert.equal(await take(B, 10000), null, "A already has it: not sent to B too");
+  });
+  await context.close();
+  await B.client.close().catch(() => {});
+  await A.client.close().catch(() => {});
+  for (const c of [A, B]) fs.rmSync(c.home, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const SESSIONS = '/home/me/.cache/claude-annotate/sessions'
 const BRIDGE = { endpoint: 'http://127.0.0.1:4000', token: 't0k', cwd: '/repo', startedAt: 1 }
@@ -375,4 +375,38 @@ test('the annotating tab goes with a prompt even when no notes wait', async ($, 
   await $.command.run({ command: 'annotations', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
   await $.prompt.submit({ text: 'why is this misaligned?', origin: { kind: 'composer' } } as never)
   expect(reached.at(-1)?.context?.join('\n')).toContain('Annotating tab: http://localhost:3000/pricing (local)')
+})
+
+test('notes no hook is waiting for (a turn stopped with Esc) go from the bar, once', async ($, on) => {
+  const CONTENT = 'Browser annotations · batch 3 · 1 page · 1 note · 0 marks\n\n### Note 5 — "esc then this"'
+  const submitted: string[] = []
+  let taken = false
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n4242\n', stderr: '' } }) as never)
+  on('fs.exists', (_$, e) => ({ value: e.path === SESSIONS || e.path === `${SESSIONS}/4242.json` }))
+  on('fs.read', () => ({ value: JSON.stringify(BRIDGE) }))
+  on('fs.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: { command: 'annotations' } }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.render', () => ({ type: 'Box', props: {}, children: [] }) as never)
+  const clock = mock.clock(on)
+  on('process.spawn', async function* () { return { value: { code: 0, signal: null } } } as never)
+  on('prompt.submit', (_$, e) => { submitted.push(e.text); return { text: e.text } })
+  on('http.fetch', (_$, e) => {
+    if (e.url.endsWith('/next?wait=0')) {
+      if (taken) return { value: { status: 204, ok: true, headers: {}, text: '' } }
+      taken = true
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ ok: true, content: CONTENT }) } }
+    }
+    const o = JSON.parse(overviewWith([TAB]))
+    o.delivery = { queued: taken ? 0 : 1, listening: false }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(o) } }
+  })
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true } as never)
+  await $.command.run({ command: 'annotations', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(submitted).toEqual([]) // not at once: a hook may still arm
+  await clock.advance(3500)
+  expect(submitted).toEqual([CONTENT])
+  await clock.advance(3500)
+  expect(submitted).toEqual([CONTENT]) // once
 })

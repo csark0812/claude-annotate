@@ -27,6 +27,8 @@ let bridge: Bridge | null = null
 let lastSeen = ''
 let lastRev: number | null = null
 let wasLinked = false // this chat's server answered once: gone now means it stopped
+let working = false // Claude is mid-turn (from the prompt area's props)
+let unheardSince: number | null = null // when notes started waiting with no chat hook to deliver them
 let cwd = ''
 
 export const register: Register = on => {
@@ -77,6 +79,7 @@ export const register: Register = on => {
   // the words, a trash) and Discard. Under it, dim lines: which tab is annotating, and the notes
   // Claude has and has not finished.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    working = !!e.props.isWorking
     const now = await read($, overview)
     if (e.props.hasSurvey) return next(e)
     // Claude Code does not start a chat's MCP server again by itself: say so, and how.
@@ -331,6 +334,32 @@ async function refreshOnce($: EngineInterface) {
   lastSeen = seen
   await update($, overview, () => next)
   $.ui.status(next.kind === 'linked' && next.totals.notes > 0 ? statusLine(next.totals) : undefined)
+  void deliverUnheard($, next)
+}
+
+// The chat hook delivers notes; it is armed when a turn ends. A turn stopped with Esc ends without
+// arming it, and notes would wait until the user types. Notes that have waited UNHEARD_MS with no
+// hook listening, while Claude isn't working, go from here instead: the same batch, once (the
+// server hands each batch out one time).
+const UNHEARD_MS = 3000
+async function deliverUnheard($: EngineInterface, now: Overview) {
+  if (now.kind !== 'linked' || now.mode !== 'chat' || now.delivery.queued === 0 || now.delivery.listening) {
+    unheardSince = null
+    return
+  }
+  const t = await $.clock.now()
+  unheardSince ??= t
+  if (working || t - unheardSince < UNHEARD_MS) {
+    $.clock.after(UNHEARD_MS, async () => deliverUnheard($, await read($, overview))) // an unchanged overview fetches nothing new
+    return
+  }
+  unheardSince = null
+  try {
+    const { content } = await call($, 'GET', '/next?wait=0')
+    if (content) await $.prompt.submit({ text: content })
+  } catch {
+    // Nothing waiting after all (a hook took it), or the server went: nothing to do.
+  }
 }
 
 async function act($: EngineInterface, cwd: string, method: string, path: string, body?: unknown) {

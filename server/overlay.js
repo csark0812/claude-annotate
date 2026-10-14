@@ -303,7 +303,7 @@
         // The extension's worker restarted: come back and listen again.
         if (subscribed) setTimeout(() => {
           if (closed || port) return;
-          try { connect(); port.postMessage({ subscribe: true, query }); } catch { /* orphaned: unmounting */ }
+          try { connect(); port.postMessage({ subscribe: true, query, chat: CFG.chat }); } catch { /* orphaned: unmounting */ }
         }, 1000);
       });
     };
@@ -314,7 +314,7 @@
         const id = ++seq;
         return new Promise((resolve, reject) => {
           waiting.set(id, { resolve, reject });
-          port.postMessage({ id, method, path: p, body });
+          port.postMessage({ id, method, path: p, body, chat: CFG.chat });
         });
       },
       events(q) {
@@ -322,7 +322,7 @@
         closed = false;
         try { if (!port) connect(); } catch { return stream; }
         subscribed = true;
-        port.postMessage({ subscribe: true, query });
+        port.postMessage({ subscribe: true, query, chat: CFG.chat });
         return stream;
       },
     };
@@ -2313,14 +2313,14 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Switching chats: what this chat has already got stays with it; unsent marks and comments go
   // along to the new one. The extension then mounts the overlay again for that chat.
   // auto: the open chat changed and the tab follows it (a pick in the menu holds instead).
-  // rescue: the chat the notes went to is gone; what it never got to goes along too.
-  async function chooseChat(pid, { auto = false, rescue = false } = {}) {
+  async function chooseChat(pid, { auto = false } = {}) {
     closeChatMenu();
     if (pid === CFG.chat) return;
     if (popNote) commitPopover();
     const url = pageUrl();
-    const lost = rescue ? takeInFlight(url) : { notes: [], shapes: [] };
-    const carry = { url, shapes: [...shapes.filter((x) => !x.batch), ...lost.shapes], notes: [...notes.filter((n) => !n.batch), ...lost.notes] };
+    // Notes sent to this chat that Claude hasn't reported on go along: the next overlay keeps
+    // watching them there (checkElsewhere), and sends them again if that chat is gone.
+    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch), inFlight: [...inFlight.entries()], sentHere: [...sentHere] };
     shapes = shapes.filter((x) => x.batch);
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
@@ -2331,7 +2331,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // Not mid-comment or mid-recording: the next change looks again.
   async function followOpenChat() {
     if (!CHOOSES_CHAT || !CFG.automatic || popNote || draft || rec || phase === "sending") return;
-    const pid = Number(await askExtension("recheck"));
+    const pid = Number(await askExtension("recheck", 4000, { chat: CFG.chat }));
     if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) chooseChat(pid, { auto: true });
   }
   const chatLabel = () => [CFG.sendsTo, CFG.sendsFolder].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ") || "Claude";
@@ -2342,7 +2342,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (CFG.automatic) return;
     if (popNote) commitPopover();
     const url = pageUrl();
-    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch) };
+    const carry = { url, shapes: shapes.filter((x) => !x.batch), notes: notes.filter((n) => !n.batch), inFlight: [...inFlight.entries()], sentHere: [...sentHere] };
     shapes = shapes.filter((x) => x.batch);
     notes = notes.filter((n) => n.batch);
     clearTimeout(saveTimer); saveTimer = null;
@@ -2354,6 +2354,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   async function takeCarried() {
     const c = carried;
     carried = null;
+    takeKept(c);
     if (!c || c.url !== pageUrl() || !(c.notes.length || c.shapes.length)) return;
     for (const n of c.notes) {
       try { n.n = (await req("POST", "/note/next")).n; } catch { n.n = Math.max(0, ...notes.map((k) => k.n)) + 1; }
@@ -2479,10 +2480,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     return image && image.startsWith("data:image/") ? image : null;
   }
   // One question to the worker: its answer as a string, or null (no extension, no answer in time).
-  function askExtension(type, ms = 4000) {
+  function askExtension(type, ms = 4000, extra = {}) {
     if (!EXT) return Promise.resolve(null);
     return Promise.race([
-      EXT.sendMessage({ type }).then((r) => ANSWER[type](r), () => null),
+      EXT.sendMessage({ type, ...extra }).then((r) => (ANSWER[type] ? ANSWER[type](r) : r), () => null),
       new Promise((r) => setTimeout(() => r(null), ms)),
     ]).catch(() => null);
   }
@@ -2521,21 +2522,97 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   const LINK_GIVE_UP_MS = 10000;
   const sentHere = new Set(); // numbers of the notes this tab sent that Claude has not finished
   // Notes this tab sent that Claude has not reported on yet, as they were, with their marks:
-  // id -> { item, batch, url }. A chat that closes mid-turn, or a server that dies, takes a batch
-  // Claude never read with it; these go again, to the server that comes back or the chat that takes over.
+  // id -> { item, batch, url, chat, delivered }. delivered: the chat hook (or the prompt, the
+  // channel) handed it to Claude. They outlive this overlay: a remount for another chat carries
+  // them. Then, for each chat they went to:
+  //  - still reachable: its progress is read from it (the toasts come here too);
+  //  - its server gone, the chat still running: what it never handed over goes again (what it did
+  //    is in Claude's queue: sending it again would be twice);
+  //  - the chat closed: everything it didn't report on goes again, to the chat this tab uses now.
   const inFlight = new Map();
+  const deliveredHere = new Set(); // batches of this tab's chat that Claude has
   let serverBoot = null; // the server this tab sent to
-  function takeInFlight(url) {
+  function takeInFlight(url, only = () => true) {
     const out = { notes: [], shapes: [] };
     for (const [id, f] of inFlight) {
-      if (f.url !== url) continue;
+      if (f.url !== url || !only(f)) continue;
       inFlight.delete(id);
+      keepSoon();
       const item = { ...f.item, batch: null };
       if (item.type) out.shapes.push(item); else { item.status = "draft"; out.notes.push(item); }
     }
     return out;
   }
-  function settled(match) { for (const [id, f] of inFlight) if (match(f)) inFlight.delete(id); }
+  function settled(match) { for (const [id, f] of inFlight) if (match(f)) inFlight.delete(id); keepSoon(); }
+  // The extension keeps them for this tab too: whatever mounts here next (a remount by the
+  // extension, a reload) takes them up (CFG.kept).
+  let keepTimer = null;
+  function keepSoon() {
+    if (!EXT) return;
+    clearTimeout(keepTimer);
+    keepTimer = setTimeout(() => tellExtension("keep", { inFlight: [...inFlight.entries()], sentHere: [...sentHere] }), 150);
+  }
+  function takeKept(k) {
+    // Handed over as maybe sent to this very chat: they are on its page, nothing to watch.
+    if (k && Array.isArray(k.inFlight)) for (const [id, f] of k.inFlight) if (f && f.item && !inFlight.has(id) && !(f.batch === null && f.chat === CFG.chat)) inFlight.set(id, f);
+    if (k && Array.isArray(k.sentHere)) for (const n of k.sentHere) sentHere.add(n);
+  }
+  // Sent again: on this page into the page, elsewhere straight to the server under its own URL.
+  async function sendAgain(only) {
+    const urls = new Set([...inFlight.values()].filter(only).map((f) => f.url));
+    let count = 0;
+    for (const url of urls) {
+      const lost = takeInFlight(url, only);
+      count += lost.notes.length;
+      // Numbered by the server they go to now: the old chat's numbers may be taken there.
+      for (const n of lost.notes) { try { n.n = (await req("POST", "/note/next")).n; } catch { /* kept */ } }
+      if (url === pageUrl()) {
+        notes.push(...lost.notes); shapes.push(...lost.shapes);
+        anchorAll(); renderInk(); renderPins(); renderToolbar(); save();
+      } else {
+        // Its own saver: the server keeps what is already on that page.
+        await req("PUT", "/state", { url, tab: `again-${Math.random().toString(36).slice(2, 10)}`, notes: lost.notes, shapes: lost.shapes }).catch(() => {});
+      }
+    }
+    if (count) toast(`${count === 1 ? "A note" : `${count} notes`} Claude never got to ${count === 1 ? "goes" : "go"} again.`);
+  }
+  // Notes sent to a chat this tab no longer uses: how they stand there, every few seconds.
+  const ELSEWHERE_MS = 4000;
+  takeKept(CFG.kept);
+  {
+    let checking = false; // one look at a time: a slow chat must not get two answers acted on
+    const t = setInterval(() => {
+      if (checking || ![...inFlight.values()].some((f) => f.chat !== CFG.chat)) return;
+      checking = true;
+      checkElsewhere().catch(() => {}).finally(() => { checking = false; });
+    }, ELSEWHERE_MS);
+    off.signal.addEventListener("abort", () => clearInterval(t));
+  }
+  async function checkElsewhere() {
+    const chats = new Set([...inFlight.values()].map((f) => f.chat).filter((c) => c !== CFG.chat && Number.isInteger(c)));
+    for (const chat of chats) {
+      const mine = [...inFlight.values()].filter((f) => f.chat === chat);
+      const ns = mine.filter((f) => !f.item.type).map((f) => f.item.n);
+      const state = await askExtension("chat-state", 4000, { pid: chat, ns });
+      if (!state) continue;
+      if (!state.alive) { await sendAgain((f) => f.chat === chat); continue; }
+      if (!state.reachable) { await sendAgain((f) => f.chat === chat && !f.delivered); continue; }
+      for (const f of mine) {
+        if (f.item.type) continue;
+        const st = state.statuses && state.statuses[f.item.n];
+        // Handed over as maybe sent: not there after two looks (that chat sends within seconds)
+        // means it never went: it goes now, to this chat.
+        if (f.batch === null && !st) {
+          f.missing = (f.missing || 0) + 1;
+          if (f.missing >= 2) await sendAgain((v) => v === f || (f.item.shape && v.item.id === f.item.shape));
+          continue;
+        }
+        if (!st || (st.status !== "done" && st.status !== "skipped")) continue;
+        toast(`${st.status === "done" ? "Done" : "Skipped"} · ${f.item.n}${st.result ? ` · ${st.result}` : ""}`, st.status === "done" ? "ok" : "");
+        settled((v) => v === f || (f.item.shape && v.item.id === f.item.shape));
+      }
+    }
+  }
   let tabId = null, relinkTimer = null, relinkTries = 0, linkLostAt = 0, restoreOnHello = false;
   const presenceQuery = () => new URLSearchParams({ url: pageUrl(), title: document.title.slice(0, 200), kind: mode === "record" ? "recording" : "annotating", visible: document.visibilityState === "visible" ? "1" : "0" }).toString();
   function connectSse() {
@@ -2567,7 +2644,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       if (!at || !at.pid) return linkLost();
       if (at.pid !== CFG.chat) {
         if (!CFG.automatic) toast(`${chatLabel()} is gone. Notes now go to the chat open in Claude Code.`);
-        return chooseChat(at.pid, { auto: true, rescue: true }); // remounts for that chat, unsent notes carried, and sent ones it never got to
+        return chooseChat(at.pid, { auto: true }); // remounts for that chat, unsent notes carried, and sent ones it hasn't reported on
       }
       if (at.endpoint) { CFG.endpoint = at.endpoint; CFG.token = at.token; }
     }
@@ -2584,14 +2661,10 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         case "hello":
           if (m.tab !== undefined) tabId = m.tab; // annotate_open's hello names no tab
           // Another server than the one this tab sent to: what that one never got to goes again.
+          // The chat is the same one (still running): what it got is in its queue; the rest goes again.
           if (m.server && serverBoot && m.server !== serverBoot && inFlight.size) {
-            const lost = takeInFlight(pageUrl());
-            if (lost.notes.length) {
-              notes.push(...lost.notes); shapes.push(...lost.shapes);
-              anchorAll(); renderInk(); renderPins(); renderToolbar();
-              restoreOnHello = true; // saved just below
-              toast(`${lost.notes.length === 1 ? "A note" : `${lost.notes.length} notes`} Claude never got to ${lost.notes.length === 1 ? "goes" : "go"} again.`);
-            }
+            settled((f) => f.chat === CFG.chat && f.delivered);
+            sendAgain((f) => f.chat === CFG.chat);
           }
           if (m.server) serverBoot = m.server;
           linkLostAt = 0; relinkTries = 0; setLink("on");
@@ -2616,16 +2689,22 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
           phase = "sent"; if (m.totals) totals = m.totals;
           if ((m.ids || []).some((id) => notes.some((n) => n.id === id))) toast(`Sent to ${chatLabel()}.`, "ok");
           for (const n of notes) if ((m.ids || []).includes(n.id)) sentHere.add(n.n);
-          for (const x of [...notes, ...shapes]) if ((m.ids || []).includes(x.id)) inFlight.set(x.id, { item: JSON.parse(JSON.stringify(x)), batch: m.batch, url: pageUrl() });
+          for (const x of [...notes, ...shapes]) if ((m.ids || []).includes(x.id)) inFlight.set(x.id, { item: JSON.parse(JSON.stringify(x)), batch: m.batch, url: pageUrl(), chat: CFG.chat, delivered: deliveredHere.has(m.batch) });
+          keepSoon();
           flushOut(m.ids || []);
+          break;
+        case "delivered": // Claude has this batch now (in its queue, or reading it)
+          deliveredHere.add(m.batch); // a waiting hook takes a batch before the server says it was sent
+          for (const f of inFlight.values()) if (f.chat === CFG.chat && f.batch === m.batch) f.delivered = true;
+          keepSoon();
           break;
         case "changed": if (m.url === pageUrl() && m.from !== SAVER && !saveTimer && !draft && !popNote && !drag) hydrate(); break; // edited from outside this tab
         case "chats": followOpenChat(); break; // a chat was opened, typed in, started or ended
         case "ask": answerAsk(m); break; // Claude's annotate_screenshot, annotate_read, annotate_inspect…
         case "stop": exitAnnotating(); break; // the ✕ on the bar in Claude Code
         case "done":
-          if (sentHere.size) { toast(m.summary ? `Claude: ${m.summary}` : "Claude is done.", "ok"); sentHere.clear(); }
-          settled((f) => !m.batch || f.batch === m.batch);
+          if (sentHere.size && m.last !== false) { toast(m.summary ? `Claude: ${m.summary}` : "Claude is done.", "ok"); sentHere.clear(); }
+          if (m.batch) settled((f) => f.chat === CFG.chat && f.batch === m.batch);
           for (const n of notes) if (n.batch && (!m.batch || n.batch === m.batch) && (n.status === "pending" || n.status === "working")) { n.status = "done"; updatePin(n); }
           phase = "done";
           totals.open = 0;
@@ -2646,9 +2725,20 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   api.capture = (on) => { if (!host) return; host.classList.toggle("capturing", !!on); };
 
   // Removes the overlay and everything it hooked into the page. Unsaved edits are saved first.
-  api.unmount = async () => {
+  // remount: the extension puts another overlay here for another chat. Notes still on this page may
+  // have just gone to this chat a moment ago, unheard here: they are handed over as maybe sent, and
+  // the next overlay finds out (checkElsewhere).
+  api.unmount = async ({ remount = false } = {}) => {
     if (off.signal.aborted) return;
     if (popNote) commitPopover(); // an open comment is saved, and stops holding its note back
+    if (remount && EXT) {
+      for (const x of [...notes.filter((n) => !n.batch && n.text), ...shapes.filter((x) => !x.batch && notes.some((n) => n.shape === x.id && n.text))]) {
+        if (!inFlight.has(x.id)) inFlight.set(x.id, { item: JSON.parse(JSON.stringify(x)), batch: null, url: pageUrl(), chat: CFG.chat, delivered: false });
+      }
+      clearTimeout(keepTimer);
+    }
+    // What the extension keeps for this tab, answered straight back (before the next overlay's config is made).
+    const handover = remount && inFlight.size ? { inFlight: [...inFlight.entries()], sentHere: [...sentHere] } : null;
     if (saveTimer) {
       clearTimeout(saveTimer);
       await req("PUT", "/state", stateBody(pageUrl())).catch(() => {});
@@ -2662,6 +2752,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (host) host.remove();
     if (CFG.helped) document.dispatchEvent(new CustomEvent("claude-annotate:helper-off"));
     if (window.__claudeAnnotate === api) delete window.__claudeAnnotate;
+    return handover;
   };
 
   // ---------------------------------------------------------------------------

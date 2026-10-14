@@ -38,6 +38,23 @@ function isWebStore(url) {
 const isScriptRefusal = (e) => /cannot (access|be scripted)|chrome:\/\/|extensions gallery|file URL/i.test(String(e?.message));
 
 // ---------------------------------------------------------------------------
+// Shared state in storage.session. Many handlers run at once (every tab following the open chat
+// remounts together): each read-modify-write of a key goes through this one queue, so none writes
+// over another's change from a stale copy.
+// ---------------------------------------------------------------------------
+let storageQueue = Promise.resolve();
+function mutate(key, fallback, change) {
+  const run = storageQueue.then(async () => {
+    const value = (await chrome.storage.session.get(key))[key] ?? fallback;
+    const next = (await change(value)) ?? value;
+    await chrome.storage.session.set({ [key]: next });
+    return next;
+  });
+  storageQueue = run.catch(() => {});
+  return run;
+}
+
+// ---------------------------------------------------------------------------
 // Pictures of pages the overlay can't enter: snapshot.html#<id> shows one and annotates it. The
 // notes are filed under the page's own URL.
 // ---------------------------------------------------------------------------
@@ -62,11 +79,11 @@ async function openSnapshot(tab) {
     throw new Error(`Chrome doesn't let extensions into this page, and it couldn't be captured either (${e.message}).`);
   }
   const id = crypto.randomUUID();
-  const all = await snapshots();
-  all[id] = { url: tab.url, title: tab.title || tab.url, image, w: tab.width, h: tab.height, at: Date.now() };
-  // Keep the newest few: storage.session holds 10 MB.
-  for (const old of Object.keys(all).sort((a, b) => all[a].at - all[b].at).slice(0, -4)) delete all[old];
-  await chrome.storage.session.set({ snapshots: all });
+  await mutate("snapshots", {}, (all) => {
+    all[id] = { url: tab.url, title: tab.title || tab.url, image, w: tab.width, h: tab.height, at: Date.now() };
+    // Keep the newest few: storage.session holds 10 MB.
+    for (const old of Object.keys(all).sort((a, b) => all[a].at - all[b].at).slice(0, -4)) delete all[old];
+  });
   await chrome.tabs.create({ url: `${SNAPSHOT_PAGE}#${id}`, index: tab.index + 1, openerTabId: tab.id, windowId: tab.windowId });
 }
 
@@ -90,9 +107,8 @@ async function getPinnedPid() {
 
 async function targetSession(url, tabId) {
   const sessions = await listSessions(url);
-  const { sessionsByPid = {}, chosen = {} } = await chrome.storage.session.get(["sessionsByPid", "chosen"]);
-  for (const s of sessions) sessionsByPid[s.pid] = s;
-  await chrome.storage.session.set({ sessionsByPid });
+  await mutate("sessionsByPid", {}, (byPid) => { for (const s of sessions) byPid[s.pid] = s; });
+  const { chosen = {} } = await chrome.storage.session.get("chosen");
   const pinned = await getPinnedPid();
   const pick = (pid) => pid != null && sessions.find((s) => s.pid === pid);
   // Automatic: the page's project, else the chat typed in last. A chat picked in the bar or the
@@ -105,10 +121,7 @@ async function targetSession(url, tabId) {
 // The chat a tab's notes go to, chosen in the overlay's chat pill. It holds across reloads until
 // the tab closes or that chat ends.
 async function chooseForTab(tabId, pid) {
-  const { chosen = {} } = await chrome.storage.session.get("chosen");
-  if (pid == null) delete chosen[tabId];
-  else chosen[tabId] = pid;
-  await chrome.storage.session.set({ chosen });
+  await mutate("chosen", {}, (chosen) => { if (pid == null) delete chosen[tabId]; else chosen[tabId] = pid; });
 }
 
 // What the overlay may know about a chat: never its endpoint or token.
@@ -123,23 +136,24 @@ async function onTabs() {
   return (await chrome.storage.session.get("tabs")).tabs ?? {};
 }
 async function setTabSession(tabId, pid) {
-  const tabs = await onTabs();
-  if (pid == null) delete tabs[tabId];
-  else tabs[tabId] = pid;
-  await chrome.storage.session.set({ tabs });
+  await mutate("tabs", {}, (tabs) => { if (pid == null) delete tabs[tabId]; else tabs[tabId] = pid; });
   await chrome.action.setIcon({ tabId, path: ICONS(pid == null ? "off" : "on") }).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
 // The overlay in the page
 // ---------------------------------------------------------------------------
-async function unmountOverlay(tabId) {
+// remount: another overlay follows at once (another chat): the old one hands over what it may just
+// have sent (overlay.js, api.unmount).
+async function unmountOverlay(tabId, { remount = false } = {}) {
   for (const world of ["MAIN", "ISOLATED"]) {
-    await chrome.scripting.executeScript({
+    const [r] = await chrome.scripting.executeScript({
       target: { tabId },
       world,
-      func: async () => { await window.__claudeAnnotate?.unmount?.(); window.__claudeAnnotateHelper?.off?.(); }, // MAIN: an older overlay, or the page helper
-    }).catch(() => {}); // the page is gone or not scriptable: nothing to remove
+      func: async (again) => { const h = await window.__claudeAnnotate?.unmount?.({ remount: again }); window.__claudeAnnotateHelper?.off?.(); return h ?? null; }, // MAIN: an older overlay, or the page helper
+      args: [remount],
+    }).catch(() => []); // the page is gone or not scriptable: nothing to remove
+    if (r?.result?.inFlight?.length) await mutate("kept", {}, (kept) => { kept[tabId] = r.result; });
   }
 }
 
@@ -152,13 +166,11 @@ async function mountOverlay(tabId, url, session, { carry = null, automatic = tru
   if (isSnapshotTab(tab)) {
     // Our own page: it can't be scripted, so it asks for its config as it loads.
     await setTabSession(tabId, session.pid);
-    const { snapshotMounts = {} } = await chrome.storage.session.get("snapshotMounts");
-    snapshotMounts[tabId] = { carry, automatic };
-    await chrome.storage.session.set({ snapshotMounts });
+    await mutate("snapshotMounts", {}, (mounts) => { mounts[tabId] = { carry, automatic }; });
     await chrome.tabs.reload(tabId);
     return;
   }
-  await unmountOverlay(tabId); // a page may still carry an overlay for another session
+  await unmountOverlay(tabId, { remount: true }); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
   const cfg = await overlayConfig(tabId, url, session, { carry, automatic });
   if (cfg.helped) {
@@ -178,7 +190,8 @@ async function overlayConfig(tabId, url, session, { carry = null, automatic = tr
   const recording = rec?.tabId === tabId ? { startedAt: rec.startedAt, phase: rec.phase } : null;
   const recordingSaved = recording ? null : (await savedVideos())[tabId] ?? null;
   if (recording) await showRecording(tabId, true); // a page load clears the tab's badge
-  const common = { renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved, pageUrl };
+  const kept = (await chrome.storage.session.get("kept")).kept?.[tabId] ?? null;
+  const common = { kept, renderOnly: false, version, startMode: "draw", sendsTo: session.title || folder(session.cwd), sendsFolder: folder(session.cwd), sendsPrompt: session.lastPrompt ?? null, automatic, chat: session.pid, carry, recording, recordingSaved, pageUrl };
   return { transport: "port", helped: isLocalUrl(url) && !pageUrl, ...common };
 }
 
@@ -213,10 +226,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     (async () => {
       const snap = (await snapshots())[msg.id];
       if (!snap) return null;
-      const { snapshotMounts = {} } = await chrome.storage.session.get("snapshotMounts");
-      const opts = snapshotMounts[tab.id] ?? {};
-      delete snapshotMounts[tab.id];
-      await chrome.storage.session.set({ snapshotMounts });
+      let opts = {};
+      await mutate("snapshotMounts", {}, (mounts) => { opts = mounts[tab.id] ?? {}; delete mounts[tab.id]; });
       const { session, automatic } = await targetSession(snap.url, tab.id);
       if (!session) return { snap, cfg: null };
       await setTabSession(tab.id, session.pid);
@@ -240,7 +251,10 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg?.type === "recheck" && sender.tab) {
     const tab = sender.tab;
     pageUrlOf(tab).then((url) => Promise.all([targetSession(url, tab.id), onTabs()]))
-      .then(([{ session, automatic }, tabs]) => reply({ pid: automatic && session && session.pid !== tabs[tab.id] ? session.pid : null }), () => reply({ pid: null }));
+      .then(([{ session, automatic }, tabs]) => {
+        const current = Number.isInteger(msg.chat) ? msg.chat : tabs[tab.id]; // the chat the overlay is mounted for
+        reply({ pid: automatic && session && session.pid !== current ? session.pid : null });
+      }, () => reply({ pid: null }));
     return true;
   }
   // The overlay lost its server: ask the host again. The same chat may be back with a new token (its
@@ -249,6 +263,28 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     const tab = sender.tab;
     pageUrlOf(tab).then((url) => targetSession(url, tab.id))
       .then(({ session }) => reply(session ? { pid: session.pid } : null), () => reply(null));
+    return true;
+  }
+  // A tab's notes Claude hasn't reported on, kept for whatever overlay mounts in it next.
+  if (msg?.type === "keep" && sender.tab) {
+    mutate("kept", {}, (kept) => { if (msg.inFlight?.length) kept[sender.tab.id] = { inFlight: msg.inFlight, sentHere: msg.sentHere || [] }; else delete kept[sender.tab.id]; });
+  }
+  // How notes sent to a chat stand, for a tab that has since moved to another chat (or whose chat's
+  // server went): { alive, reachable, statuses: { n: { status, result } } }.
+  if (msg?.type === "chat-state" && sender.tab && Number.isInteger(msg.pid)) {
+    (async () => {
+      let alive = false;
+      try { alive = !!(await chrome.runtime.sendNativeMessage(HOST, { type: "alive", pid: msg.pid }))?.alive; } catch { /* host gone: unknown, say alive */ alive = true; }
+      if (!alive) return { alive: false, reachable: false };
+      const session = (await chrome.storage.session.get("sessionsByPid")).sessionsByPid?.[msg.pid];
+      if (!session) return { alive: true, reachable: false };
+      try {
+        const o = await (await fetch(`${session.endpoint}/overview`, { headers: { "X-Annot-Token": session.token }, signal: AbortSignal.timeout(3000) })).json();
+        const statuses = {};
+        for (const k of o.sent || []) if ((msg.ns || []).includes(k.n)) statuses[k.n] = { status: k.status, result: k.result || "" };
+        return { alive: true, reachable: true, statuses };
+      } catch { return { alive: true, reachable: false }; }
+    })().then(reply, () => reply(null));
     return true;
   }
   // Back to following the open chat.
@@ -343,10 +379,7 @@ async function savedVideos() {
   return (await chrome.storage.session.get("savedVideos")).savedVideos ?? {};
 }
 async function forgetSavedVideo(tabId) {
-  const saved = await savedVideos();
-  if (!(tabId in saved)) return;
-  delete saved[tabId];
-  await chrome.storage.session.set({ savedVideos: saved });
+  await mutate("savedVideos", {}, (saved) => { delete saved[tabId]; });
 }
 
 class RecordingError extends Error {
@@ -434,9 +467,7 @@ async function finishRecording({ cancel = false } = {}) {
   if (cancel) return tellTab(rec.tabId, { state: "cancelled" });
   if (!session) return tellTab(rec.tabId, { state: "failed", error: "no Claude Code chat to send it to" });
   if (!result?.ok) return tellTab(rec.tabId, { state: "failed", error: result?.error ?? "the recorder didn't answer" });
-  const saved = await savedVideos();
-  saved[rec.tabId] = result.video;
-  await chrome.storage.session.set({ savedVideos: saved });
+  await mutate("savedVideos", {}, (saved) => { saved[rec.tabId] = result.video; });
   tellTab(rec.tabId, { state: "saved", video: result.video });
 }
 
@@ -501,10 +532,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   if ((await getRecording())?.tabId === tabId) await stopRecording({ cancel: true });
   await forgetSavedVideo(tabId);
   await chooseForTab(tabId, null);
-  const tabs = await onTabs();
-  if (tabs[tabId] == null) return;
-  delete tabs[tabId];
-  await chrome.storage.session.set({ tabs });
+  await mutate("tabs", {}, (tabs) => { delete tabs[tabId]; });
+  await mutate("kept", {}, (kept) => { delete kept[tabId]; });
 });
 
 // Toggles and says what went wrong on the icon itself: a "!" badge, the reason in its tooltip.
@@ -602,7 +631,7 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
   if (!String(info.menuItemId).startsWith("pid:")) return;
   const pid = info.menuItemId === "pid:auto" ? null : Number(String(info.menuItemId).slice(4));
   await chrome.storage.local.set({ pinnedPid: pid });
-  await chrome.storage.session.set({ chosen: {} }); // the menu speaks for every tab
+  await mutate("chosen", {}, () => ({})); // the menu speaks for every tab
   await remountAll();
   refreshMenu();
 });
@@ -655,9 +684,15 @@ chrome.runtime.onConnect.addListener((port) => {
     body: m.body === undefined ? undefined : JSON.stringify(m.body),
   });
 
+  // The overlay names the chat it was mounted for (m.chat): its requests go there, whatever the
+  // tab's entry says this instant (a remount for another chat may be writing it).
+  const sessionOf = async (m) => {
+    if (Number.isInteger(m.chat)) return (await chrome.storage.session.get("sessionsByPid")).sessionsByPid?.[m.chat] ?? null;
+    return sessionForTab(tabId);
+  };
   port.onMessage.addListener(async (m) => {
     if (m.unsubscribe) return endRelay();
-    let session = await sessionForTab(tabId);
+    let session = await sessionOf(m);
     if (m.subscribe) {
       endRelay();
       if (!session) return port.postMessage({ closed: true });
@@ -672,7 +707,7 @@ chrome.runtime.onConnect.addListener((port) => {
       // 403: the session's server restarted with a new token. Look it up again and ask once more.
       if (res.status === 403) {
         await targetSession(tab.url, tabId).catch(() => {});
-        const fresh = await sessionForTab(tabId);
+        const fresh = await sessionOf(m);
         if (fresh && fresh.token !== session.token) res = await ask((session = fresh), m);
       }
       const data = await res.json().catch(() => ({}));

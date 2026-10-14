@@ -168,7 +168,7 @@ The bridge listens on `127.0.0.1` only and every request needs the session token
 
 **What about a page behind a login?** The annotation window has its own Chrome profile that persists, so log in once. Claude's temporary tabs for other pages share the same profile.
 
-**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. A note stays with the tab until Claude reports on it: if its chat closes or its server restarts before that, it goes again to the server that comes back or the chat that takes over. If a batch still seems lost, `annotate_pull` returns it.
+**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. A note stays with the tab until Claude reports on it, even after the tab follows another chat: if the chat it went to closes before handing it to Claude, it goes again to the chat the tab uses now; one Claude already has is never sent twice. If you stop Claude's turn with Esc, notes saved after it still go: the bar above the prompt delivers them when no turn is running. If a batch still seems lost, `annotate_pull` returns it.
 
 **"Annotate stopped in this chat."** The chat's annotate server ended and Claude Code doesn't start it again by itself: run `/mcp` and reconnect annotate.
 
