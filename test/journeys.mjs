@@ -18,6 +18,9 @@
 //  8. A local page fighting back: a strict CSP, a page that grabs every key, scripts that wrap
 //     fetch. Notes still go, Esc still leaves, the page never sees the token, and React's data
 //     comes through the page helper.
+//  9. Pages built the modern way: an element inside a cross-origin frame and inside a web
+//     component's shadow root is picked, read and inspected; a client-side route change files
+//     each note under its own URL.
 import { chromium } from "playwright-core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -115,7 +118,22 @@ const HOSTILE_PAGE = `<!doctype html><meta charset="utf-8"><title>Hostile</title
   document.getElementById("buy").__reactFiber$j8 = { type: "button", return: { type: Checkout, _debugSource: { fileName: "/src/Checkout.tsx", lineNumber: 12 }, return: null } };
 </script>`;
 const HOSTILE_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'none'; connect-src 'self'";
+// Journey 9's pages: a web component, a frame from another origin, and an app that routes itself.
+const MODERN_PAGE = (frameOrigin) => `<!doctype html><meta charset="utf-8"><title>Modern</title><body style="font:16px system-ui;margin:40px">
+<h1 id="h">Modern</h1>
+<my-widget id="wc"></my-widget>
+<iframe id="cross" src="${frameOrigin}/frame" style="width:320px;height:120px;border:1px solid #ccc"></iframe>
+<p><a id="go" href="/modern/about">About</a></p>
+<script>
+  customElements.define("my-widget", class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: "open" }).innerHTML = '<button id="inner-btn" style="font-size:20px">Inside the widget</button>'; }
+  });
+  document.getElementById("go").addEventListener("click", (e) => { e.preventDefault(); history.pushState({}, "", "/modern/about"); document.getElementById("h").textContent = "About"; });
+</script>`;
+const FRAME_PAGE = `<!doctype html><body style="margin:0;font:16px system-ui"><button id="in-frame" style="margin:20px;font-size:20px">In the frame</button>`;
 const site = http.createServer((req, res) => {
+  if (req.url.startsWith("/modern")) { res.writeHead(200, { "Content-Type": "text/html" }); return res.end(MODERN_PAGE(`http://127.0.0.1:${site.address().port}`)); }
+  if (req.url.startsWith("/frame")) { res.writeHead(200, { "Content-Type": "text/html" }); return res.end(FRAME_PAGE); }
   if (req.url.startsWith("/hostile")) { res.writeHead(200, { "Content-Type": "text/html", "Content-Security-Policy": HOSTILE_CSP }); return res.end(HOSTILE_PAGE); }
   res.writeHead(200, { "Content-Type": "text/html" });
   res.end(req.url.startsWith("/next") ? NEXT_PAGE : HOME_PAGE);
@@ -499,6 +517,56 @@ async function noteOn(page, selector, text) {
     assert.match(sent.content, /annotated as a picture/, "Claude is told it is a picture");
     await snap.locator('claude-annotate .bar [data-act="exit"]').click();
     await until("Done closes the picture", async () => !context.pages().some((p) => p.url().includes("snapshot.html")));
+  });
+  await context.close();
+}
+
+// ---------------------------------------------------------------------------
+// 9. Pages built the modern way
+// ---------------------------------------------------------------------------
+{
+  const { context, sw, page } = await launch();
+  await journey("a cross-origin frame and a web component are picked into; a route change files notes under their own URL", async () => {
+    await fetch(`${session.endpoint}/clear`, { method: "POST", headers: H });
+    const url = `${SITE}/modern`;
+    await page.goto(url);
+    await page.frameLocator("#cross").locator("#in-frame").waitFor();
+    await click(sw, await tabIdOf(sw, url));
+    await until("the overlay", async () => (await overlayMode(page)) === "draw");
+    const next = async () => (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json();
+    { // the button inside the frame, where the user would click it
+      const btn = await page.frameLocator("#cross").locator("#in-frame").boundingBox();
+      await page.mouse.click(btn.x + btn.width / 2, btn.y + btn.height / 2);
+      const comment = page.locator("claude-annotate .pop textarea");
+      await comment.waitFor();
+      await comment.pressSequentially("inside the frame");
+      await comment.press("Enter");
+    }
+    let got = await next();
+    assert.match(got.content, /on: <button#in-frame> {2}"In the frame"/, "the element inside a cross-origin frame");
+    assert.match(got.content, /inside frame: http:\/\/127\.0\.0\.1/, "and which frame it is in");
+    await sleep(600);
+    await noteOn(page, "#wc", "inside the widget");
+    got = await next();
+    assert.match(got.content, /on: <button#inner-btn> {2}"Inside the widget"/, "the element inside an open shadow root");
+    assert.match(got.content, /in: .*my-widget#wc/, "its host in the chain");
+    const said = (r) => r.content.map((c) => c.text || "").join("\n");
+    assert.match(said(await client.callTool({ name: "annotate_inspect", arguments: { selector: "#inner-btn" } })), /button#inner-btn/, "inspect finds it");
+    assert.match(said(await client.callTool({ name: "annotate_read", arguments: {} })), /Inside the widget/, "read includes the widget's text");
+    await sleep(600);
+    // A note, then the app routes away at once: the note stays under the page it was written on.
+    await noteOn(page, "#h", "on the first page");
+    await page.keyboard.down(" ");
+    await page.click("#go");
+    await page.keyboard.up(" ");
+    await until("the route", async () => page.url().endsWith("/modern/about"));
+    await sleep(300);
+    assert.equal(await page.evaluate(() => document.querySelector("claude-annotate").shadowRoot.querySelectorAll(".pin:not(.flushed)").length), 0, "the first page's pins leave with it");
+    await noteOn(page, "#h", "on the about page");
+    const batches = [await next(), await next().catch(() => ({ content: "" }))].map((b) => b.content || "").join("\n");
+    const pageOf = (text) => { const at = batches.indexOf(`"${text}"`); return batches.slice(0, at).match(/## Page \d+ of \d+ — (\S+)/g).at(-1); };
+    assert.match(pageOf("on the first page"), /\/modern$/, "the first note is filed under the first URL");
+    assert.match(pageOf("on the about page"), /\/modern\/about$/, "the second under the new one");
   });
   await context.close();
 }

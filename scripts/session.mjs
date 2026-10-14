@@ -31,7 +31,9 @@ export function findSessionFile() {
 export function stampSession(file, fields) {
   try {
     const session = JSON.parse(fs.readFileSync(file, "utf8"));
-    fs.writeFileSync(file, JSON.stringify({ ...session, ...fields }), { mode: 0o600 });
+    const tmp = `${file}.${process.pid}.tmp`; // whole, then into place: readers never see half a file
+    fs.writeFileSync(tmp, JSON.stringify({ ...session, ...fields }), { mode: 0o600 });
+    fs.renameSync(tmp, file);
   } catch {
     // Gone or being rewritten: skip it this time.
   }

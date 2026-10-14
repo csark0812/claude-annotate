@@ -459,15 +459,25 @@ function logRecording(tabId, event) {
     await setRecording(rec);
   }).catch(() => {});
 }
+const lastNavigation = new Map(); // tabId -> { url, at }: one load fires more than one of these
 async function logNavigation({ tabId, frameId, url, transitionType }, kind) {
   if (frameId !== 0) return;
+  const last = lastNavigation.get(tabId);
+  if (last && last.url === url && Date.now() - last.at < 1500) return;
+  lastNavigation.set(tabId, { url, at: Date.now() });
   const rec = await recordingOf(tabId);
   if (!rec) return;
   logRecording(tabId, { t: Math.round((Date.now() - rec.startedAt) / 100) / 10, kind: transitionType === "reload" ? "reload" : kind, url });
 }
 chrome.webNavigation.onCommitted.addListener((d) => logNavigation(d, "navigate"));
-chrome.webNavigation.onHistoryStateUpdated.addListener((d) => logNavigation(d, "navigate"));
-chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => logNavigation(d, "navigate"));
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => { logNavigation(d, "navigate"); tellUrlChanged(d); });
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((d) => { logNavigation(d, "navigate"); tellUrlChanged(d); });
+// An app's router moved the tab (pushState): the overlay, in the isolated world, can't see the
+// page's own history calls, so it hears it from here at once.
+async function tellUrlChanged({ tabId, frameId }) {
+  if (frameId !== 0 || (await onTabs())[tabId] == null) return;
+  chrome.tabs.sendMessage(tabId, { type: "url-changed" }, { frameId: 0 }).catch(() => {});
+}
 
 // ---------------------------------------------------------------------------
 // Events

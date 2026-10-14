@@ -394,6 +394,42 @@ console.log("✓ bad saves are dropped; sent notes never twice; UTF-8 intact; de
 }
 console.log("✓ page details can't forge the batch or point outside the project; bridge is loopback only");
 
+// Where an element is written: a position in served code goes back through its source map (an
+// inline map, as Vite serves; an index map with sections, as Turbopack does), and the line is
+// checked against the file (React 18 + some transforms report it shifted).
+{
+  const { resolveSource, checkLine, forgetMaps } = await import("../server/sources.mjs");
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "annotate-src-"));
+  fs.mkdirSync(path.join(proj, "src"));
+  const app = ["import React from 'react';", "", "export function App() {", "  return (", "    <main>", '      <h1 id="title">Home page</h1>', '      <button className="buy primary">Buy</button>', "    </main>", "  );", "}"].join("\n");
+  fs.writeFileSync(path.join(proj, "src", "App.jsx"), app);
+  const B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const vlq = (n) => { let v = n < 0 ? (-n << 1) | 1 : n << 1, out = ""; do { let d = v & 31; v >>>= 5; if (v) d |= 32; out += B[d]; } while (v); return out; };
+  // Generated line 40 col 5 -> source 0, original line 6 (0-based 5), col 7.
+  const mappings = ";".repeat(39) + [vlq(4), vlq(0), vlq(5), vlq(6)].join("");
+  const map = { version: 3, sources: [path.join(proj, "src", "App.jsx")], names: [], mappings };
+  const served = "\n".repeat(45) + `//# sourceMappingURL=data:application/json;base64,${Buffer.from(JSON.stringify(map)).toString("base64")}\n`;
+  const index = { version: 3, sections: [{ offset: { line: 0, column: 0 }, map: { version: 3, sources: ["x.js"], names: [], mappings: "AAAA" } }, { offset: { line: 100, column: 0 }, map: { ...map, sources: ["turbopack:///[project]/src/App.jsx"] } }] };
+  const chunk = "\n".repeat(150) + "//# sourceMappingURL=chunk.js.map\n";
+  const dev = http.createServer((req, res) => {
+    if (req.url === "/src/App.jsx") return res.end(served);
+    if (req.url === "/_next/static/chunks/chunk.js") return res.end(chunk);
+    if (req.url === "/_next/static/chunks/chunk.js.map") return res.end(JSON.stringify(index));
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => dev.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${dev.address().port}`;
+  const opts = { cwd: proj, project: proj, toProject: (f, l) => `${path.relative(proj, f)}:${l}`, isLocal: () => true };
+  const h1 = { selector: "h1#title", text: "Home page", react: { components: ["App"], source: null } };
+  assert.deepEqual(await resolveSource({ ...h1, react: { ...h1.react, at: { url: `${base}/src/App.jsx`, line: 40, col: 5 } } }, opts), { source: "src/App.jsx:6", sure: true, components: ["App"] }, "Vite: through the inline map");
+  forgetMaps();
+  assert.deepEqual(await resolveSource({ ...h1, react: { ...h1.react, at: { url: `${base}/_next/static/chunks/chunk.js`, line: 140, col: 5 } } }, opts), { source: "src/App.jsx:6", sure: true, components: ["App"] }, "Turbopack: through the sectioned map to the project file");
+  assert.deepEqual(checkLine(path.join(proj, "src", "App.jsx"), 26, { selector: "button.buy.primary", text: "Buy", react: { components: [] } }), { line: 7, sure: true }, "a line 19 off moves to the element");
+  assert.deepEqual(checkLine(path.join(proj, "src", "App.jsx"), 3, { selector: "section.none", text: "", react: { components: [] } }), { line: 3, sure: false }, "nothing to confirm it: left as reported");
+  dev.close();
+}
+console.log("✓ sources: source maps (inline, sectioned) and the line checked against the file");
+
 
 // The Claude Code bar's follower: "up" once linked, then a line for each change, with no token in its argv.
 {

@@ -23,6 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { chromium } from "playwright-core";
+import { forgetMaps, resolveSource } from "./sources.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")).version; // plugin root
@@ -380,7 +381,7 @@ function fmtCtx(ctx, indent = "") {
   let out = `${indent}on: ${fmtEl(ctx)}\n`;
   if (ctx.chain) out += `${indent}in: ${ctx.chain}\n`;
   if (ctx.react && ctx.react.components && ctx.react.components.length) out += `${indent}component: ${ctx.react.components.join(" ‹ ")}\n`;
-  if (ctx.react && ctx.react.source) out += `${indent}source: ${ctx.react.source}\n`;
+  if (ctx.react && ctx.react.source) out += `${indent}source: ${ctx.react.source}${ctx.react.sure === false ? "  (line not confirmed: look near it)" : ""}\n`;
   if (ctx.inside && ctx.inside.length) out += `${indent}contains: ${ctx.inside.join("; ")}\n`;
   if (ctx.frames && ctx.frames.length) out += `${indent}inside frame: ${ctx.frames.join(" › ")} (the element's position is within that frame)\n`;
   return out;
@@ -453,6 +454,7 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
     })
     .filter(([, p]) => p.shapes.length || p.notes.length);
   if (!pages.length) throw new Error("Nothing to send yet.");
+  await placeSources(pages);
   const id = ++state.batchSeq;
   const dir = path.join(SHOTS_DIR, `batch-${id}`);
   await fsp.mkdir(dir, { recursive: true });
@@ -535,6 +537,18 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
   batch.ids = batch.ids.filter((id) => !kept.has(id)); // the tabs keep those on their pages
   if (kept.size) scheduleAutoSend();
   return batch;
+}
+
+// Each note's source file and line, mapped out of the served code and checked against the file
+// (server/sources.mjs). A few seconds at most for the whole batch: the notes never wait on it longer.
+async function placeSources(pages) {
+  forgetMaps(); // a dev server rebuilds between batches
+  const work = pages.flatMap(([, p]) => p.notes).filter((n) => n.ctx && n.ctx.react && (n.ctx.react.at || n.ctx.react.source)).map(async (n) => {
+    const r = await resolveSource(n.ctx, { cwd: process.cwd(), project: PROJECT_ROOT, toProject: (file, line) => projectSource(line ? `${file}:${line}` : file), isLocal: isLocalUrl }).catch(() => null);
+    if (r) { n.ctx.react.source = r.source; n.ctx.react.sure = r.sure; n.ctx.react.components = r.components; }
+    else if (n.ctx.react.source) n.ctx.react.sure = false;
+  });
+  await Promise.race([Promise.all(work), new Promise((r) => setTimeout(r, 5000))]);
 }
 
 // A note goes out once it has words; one still being written, or open to be changed, stays on its page.
@@ -949,7 +963,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         throw new Error(`No annotating tab showed ${args.url || "the page"}, and Chrome isn't open to remote debugging. Ask the user to turn annotation on in that tab (the extension's icon or ⌥⇧A) and keep it in view, then try again. (${String(e.message).split("\n")[0]})`);
       }
       const { page, temp } = opened;
-      if (!page) throw new Error("No page open. Pass a url.");
+      if (!page) {
+        const hidden = annotatingTabs().filter((t) => !t.visible);
+        throw new Error(hidden.length
+          ? `The annotating tab (${hidden[0].url}) is in the background: the extension captures only a tab in view. Ask the user to bring it to the front, or pass its url.`
+          : "No annotating tab and no page open. Ask the user to turn annotating on in the tab, or pass a url.");
+      }
       await fsp.mkdir(SHOTS_DIR, { recursive: true });
       const file = path.join(SHOTS_DIR, `verify-${Date.now()}.png`);
       if (!args.chrome) await setCapture(page, true).catch(() => {});
@@ -1072,16 +1091,25 @@ const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const oneLine = (v, max) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 const lines = (v, max, each) => (Array.isArray(v) ? v.slice(0, max).map((x) => oneLine(x, each)).filter(Boolean) : []);
 const COMPONENT = /^[A-Za-z_$][\w$.]{0,59}$/;
-function projectSource(v) {
-  const m = /^(.+?)(?::(\d{1,7}))?$/.exec(oneLine(v, 300));
-  if (!m) return null;
-  let file = m[1];
-  if (path.isAbsolute(file)) {
-    const rel = path.relative(process.cwd(), file);
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null; // outside this project
-    file = rel;
+// The project: the repository the chat works in (a monorepo's apps/web chat still owns packages/ui),
+// else the chat's folder.
+const PROJECT_ROOT = (() => {
+  for (let dir = process.cwd(); ; dir = path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir;
+    if (path.dirname(dir) === dir) return process.cwd();
   }
-  if (file.startsWith("~") || file.split(/[\\/]/).includes("..") || /[<>"|*?]/.test(file)) return null;
+})();
+function projectSource(v) {
+  const m = /^(.+?)(?::(\d{1,7}))?(?::\d{1,7})?$/.exec(oneLine(v, 300));
+  if (!m) return null;
+  let file = m[1].replace(/[?#].*$/, ""); // a bundler's ?3 or ?t=… is not part of the file
+  if (path.isAbsolute(file)) {
+    const rel = path.relative(PROJECT_ROOT, file);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null; // outside this project
+    file = path.relative(process.cwd(), file) || rel; // as the chat sees it (packages/ui from apps/web: ../../packages/ui)
+  }
+  if (file.startsWith("~") || /[<>"|*?]/.test(file)) return null;
+  if (path.relative(PROJECT_ROOT, path.resolve(process.cwd(), file)).startsWith("..")) return null; // ".." out of the project
   return m[2] ? `${file}:${m[2]}` : file;
 }
 function cleanCtx(ctx) {
@@ -1090,7 +1118,12 @@ function cleanCtx(ctx) {
   const react = isObj(ctx.react) ? ctx.react : {};
   return {
     selector: oneLine(ctx.selector, 200), text: oneLine(ctx.text, 300), chain: oneLine(ctx.chain, 300), rect,
-    react: { components: (Array.isArray(react.components) ? react.components : []).map((c) => oneLine(c, 60)).filter((c) => COMPONENT.test(c)).slice(0, 5), source: react.source ? projectSource(react.source) : null },
+    react: {
+      components: (Array.isArray(react.components) ? react.components : []).map((c) => oneLine(c, 60)).filter((c) => COMPONENT.test(c)).slice(0, 5),
+      source: react.source ? projectSource(react.source) : null,
+      // Where the JSX is in the served code (React 19, bundles): mapped to the source file when sent.
+      ...(isObj(react.at) && /^https?:\/\//.test(String(react.at.url)) ? { at: { url: oneLine(react.at.url, 500), line: Math.max(1, Math.trunc(num(react.at.line))), col: Math.max(1, Math.trunc(num(react.at.col))) } } : {}),
+    },
     ...(ctx.inside !== undefined ? { inside: lines(ctx.inside, 8, 80) } : {}),
     ...(ctx.frames !== undefined ? { frames: lines(ctx.frames, 4, 160) } : {}),
   };
@@ -1345,9 +1378,11 @@ async function writeSessionFile() {
     if (!pid) continue;
     try { process.kill(pid, 0); } catch { await fsp.rm(path.join(SESSIONS_DIR, f), { force: true }).catch(() => {}); }
   }
-  // Owner-only: it holds the bridge's token.
-  await fsp.writeFile(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, cwd: process.cwd(), startedAt: Date.now() }), { mode: 0o600 });
-  await fsp.chmod(path.join(SESSIONS_DIR, `${PARENT_PID}.json`), 0o600).catch(() => {}); // a file left by an older server keeps its mode otherwise
+  // Owner-only: it holds the bridge's token. Written whole, then moved into place: a hook or the
+  // extension's host reading it never sees half a file.
+  const file = path.join(SESSIONS_DIR, `${PARENT_PID}.json`), tmp = `${file}.${process.pid}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify({ endpoint, token: TOKEN, pid: process.pid, cwd: process.cwd(), startedAt: Date.now() }), { mode: 0o600 });
+  await fsp.rename(tmp, file);
 }
 
 

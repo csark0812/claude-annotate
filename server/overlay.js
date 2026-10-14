@@ -14,8 +14,8 @@
  * was last saved.
  */
 (() => {
+  const CFG = window.top !== window ? {} : window.__CLAUDE_ANNOTATE__; // first: the frame probe below reads it too
   if (window.top !== window) { installFrameProbe(); return; } // inside a frame: only answer the element picker
-  const CFG = window.__CLAUDE_ANNOTATE__;
   try { delete window.__CLAUDE_ANNOTATE__; } catch { window.__CLAUDE_ANNOTATE__ = undefined; } // the token never stays on the page
   if (CFG && CFG.pageHelper) { installPageHelper(); return; } // the page's own world, beside an isolated overlay
   if (!CFG || window.__claudeAnnotate) return;
@@ -74,7 +74,10 @@
   const api = { ready: false };
   window.__claudeAnnotate = api;
 
-  const pageUrl = () => CFG.pageUrl || location.href; // a snapshot tab files its notes under the pictured page
+  // The page the notes on screen belong to: a snapshot tab's pictured page, else the URL this overlay
+  // last took up (onUrlChange), not location.href, which an app's router moves before we hear of it.
+  let currentUrl = location.href;
+  const pageUrl = () => CFG.pageUrl || currentUrl;
   let shapes = []; // { id, type, color, ...geometry, ctx, batch }
   let notes = []; // { id, n, x, y, color, text, status, ctx, batch, result }
   const ink = INKS[0];
@@ -774,9 +777,32 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // ---------------------------------------------------------------------------
   function elementAt(x, y) {
     host.style.visibility = "hidden"; // takes the host out of hit testing
-    const e = document.elementFromPoint(clamp(x - scrollX, 0, innerWidth - 1), clamp(y - scrollY, 0, innerHeight - 1));
+    const e = deepAt(document, clamp(x - scrollX, 0, innerWidth - 1), clamp(y - scrollY, 0, innerHeight - 1));
     host.style.visibility = "";
     return !e || e === document.documentElement ? null : e;
+  }
+  // The element under a point, into open shadow roots (web components: Lit, Shoelace, Ionic…).
+  function deepAt(root, x, y) {
+    let e = root.elementFromPoint(x, y);
+    for (let i = 0; e && e.shadowRoot && i < 10; i++) {
+      const inner = e.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === e) break;
+      e = inner;
+    }
+    return e;
+  }
+  // Every element with an open shadow root inside root (and root itself), shadow roots included.
+  function shadowHosts(root, out = []) {
+    if (root.shadowRoot) out.push(root);
+    for (const el of root.querySelectorAll("*")) if (el.shadowRoot && el !== host) { out.push(el); shadowHosts(el.shadowRoot, out); }
+    return out;
+  }
+  // querySelector that also looks inside open shadow roots.
+  function deepQuery(sel, root = document) {
+    const found = root.querySelector(sel);
+    if (found) return found;
+    for (const el of root.querySelectorAll("*")) if (el.shadowRoot) { const inner = deepQuery(sel, el.shadowRoot); if (inner) return inner; }
+    return null;
   }
   function shortSel(e) {
     if (!e || e.nodeType !== 1) return "";
@@ -800,11 +826,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       const v = e.getAttribute("data-claude-annotate-react");
       e.removeAttribute("data-claude-annotate-react");
       const r = v ? JSON.parse(v) : null;
-      return r && Array.isArray(r.components) ? { components: r.components.map(String).slice(0, 5), source: typeof r.source === "string" ? r.source : null } : none;
+      if (!r || !Array.isArray(r.components)) return none;
+      const at = r.at && typeof r.at.url === "string" && /^https?:/.test(r.at.url) ? { url: r.at.url.slice(0, 500), line: Number(r.at.line) || 0, col: Number(r.at.col) || 0 } : null;
+      return { components: r.components.map(String).slice(0, 5), source: typeof r.source === "string" ? r.source : null, ...(at ? { at } : {}) };
     } catch { return none; }
   }
   function reactInfo(e) {
-    if (CFG.helped && e && e.ownerDocument === document) return reactFromHelper(e);
+    if (CFG && CFG.helped && e && e.ownerDocument === document) return reactFromHelper(e);
     const out = { components: [], source: null };
     try {
       let node = e, fiber = null;
@@ -814,7 +842,13 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         else node = node.parentElement;
       }
       if (!fiber) return out;
-      const isLibFile = (file) => /node_modules|\/@(?!fs\/)|react-dom|react-refresh|chunk-|\.vite\//.test(file);
+      // A library, not the user's code: node_modules, React's own files, and in a served URL (not a
+      // file path, where "/@org/" is just a folder) Vite's /@id and pre-bundled chunks, Next's chunks.
+      const isLibFile = (file) => /node_modules|react-dom|react-refresh|\/react\/|jsx-dev-runtime|jsx-runtime|\.vite\//.test(file) ||
+        (/^https?:/.test(file) && /\/@(?!fs\/)|chunk-/.test(new URL(file).pathname));
+      // A bundle (Next's chunks): the user's code and libraries alike, no file to name. The server
+      // maps a position in it to the source.
+      const isBundle = (file) => /^https?:/.test(file) && /\/_next\/static\/chunks\//.test(new URL(file).pathname);
       // ponytail: React 19 line numbers are post-transform (esbuild-shifted under Vite, chunk
       // offsets under Turbopack). The file is right, the line is a hint. React 18 is exact.
       // Where this fiber was created: React <19 keeps _debugSource, React 19 keeps the
@@ -827,22 +861,32 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
         const st = f._debugStack;
         const stack = typeof st === "string" ? st : st && st.stack;
         if (!stack) return null;
-        const frames = [...stack.matchAll(/\(?((?:https?:\/\/[^\s)]+?)|(?:\/[^\s)]+?)):(\d+):(\d+)\)?/g)].map((x) => ({ file: x[1], line: x[2] }));
-        const user = frames.find((fr) => !isLibFile(fr.file));
-        if (user) return { src: `${relPath(user.file)}:${user.line}`, user: true };
-        return frames.length ? { src: null, user: false } : null;
+        const frames = [...stack.matchAll(/^\s*at (?:(.+?) \()?((?:https?:\/\/|\/)[^\s)]+?):(\d+):(\d+)\)?\s*$/gm)].map((x) => ({ fn: x[1] || "", file: x[2], line: Number(x[3]), col: Number(x[4]) }));
+        // Where the JSX was written: the first frame past React's own jsx() calls. Its position is in
+        // the served (transformed or bundled) file; the server maps it to the source file and line.
+        const written = frames.find((fr) => !/jsx|react_stack_bottom_frame/i.test(fr.fn) && !/jsx-(dev-)?runtime|react-stack-top-frame/.test(fr.file));
+        const at = written && /^https?:/.test(written.file) ? { url: written.file, line: written.line, col: written.col } : null;
+        const own = frames.find((fr) => !isLibFile(fr.file) && !isBundle(fr.file));
+        if (own) return { src: `${relPath(own.file)}:${own.line}`, user: true, at };
+        // Written in a bundle: no file here, but the component may well be the user's.
+        // Created where we can't see (a server component): unknown, so the name is kept.
+        return frames.length ? { src: null, user: written ? !isLibFile(written.file) : true, at } : null;
       };
       const nameOf = (t) => (typeof t === "function" ? (t.displayName || t.name) : t && typeof t === "object" ? (t.displayName || (t.render && (t.render.displayName || t.render.name)) || (t.type && (t.type.displayName || t.type.name))) : null) || null;
       const NOISE = /Slot|Collection|Provider|Consumer|Context|Impl$|^Primitive|Presence|Portal|FocusScope|Dismissable|RovingFocus|^Fragment$|^Suspense$|^StrictMode$|^Profiler$|^Root$/;
-      let f = fiber;
+      let f = fiber, below = null;
       for (let depth = 0; f && depth < 80; depth++, f = f.return) {
         const name = nameOf(f.type);
         const site = callSite(f);
         if (!out.source && site && site.user) out.source = site.src;
+        if (!out.at && site && site.at) out.at = site.at; // the nearest JSX site, even inside a bundle
         if (name && !name.startsWith("_") && !NOISE.test(name) && out.components.length < 5 && !out.components.includes(name)) {
-          // Keep components that appear in the user's own JSX (or whose origin is unknown).
-          if (!site || site.user) out.components.push(name);
+          // The user's component: its own JSX (where the element below it was created) is the user's
+          // code, or unknown. Where it was created can be a framework's (a server component's client child).
+          const own = below || site;
+          if (!own || own.user) out.components.push(name);
         }
+        below = site;
         if (out.components.length >= 5 && out.source) break;
       }
     } catch { /* not react */ }
@@ -890,8 +934,9 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const r = e.getBoundingClientRect();
     const text = (e.innerText || e.textContent || "").trim().replace(/\s+/g, " ").slice(0, 90);
     const chain = [];
-    let p = e.parentElement;
-    while (p && p !== doc.body && chain.length < 3) { chain.unshift(shortSel(p)); p = p.parentElement; }
+    const up = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null; // out of a shadow root to its host
+    let p = up(e);
+    while (p && p !== doc.body && chain.length < 3) { chain.unshift(shortSel(p)); p = up(p); }
     return {
       selector: shortSel(e), text,
       rect: [Math.round(r.left + win.scrollX), Math.round(r.top + win.scrollY), Math.round(r.width), Math.round(r.height)],
@@ -909,7 +954,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   // hideOverlay: the top document's call, which must look past the overlay. Frames never touch it.
   async function pickIn(doc, x, y, hideOverlay = false) {
     if (hideOverlay) host.style.visibility = "hidden";
-    const el = doc.elementFromPoint(x, y);
+    const el = deepAt(doc, x, y);
     if (hideOverlay) host.style.visibility = "";
     if (!el || el === doc.body || el === doc.documentElement) return null;
     if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
@@ -1607,7 +1652,16 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       else if (rec.events.length < 300) rec.events.push(ev);
     };
     const pageEvent = (e) => rec && !fromOverlay(e);
-    addEventListener("click", (e) => { if (pageEvent(e)) log("click", { on: actionLabel(e.target) }); }, { capture: true, passive: true, signal });
+    // A menu that opens on press (Radix) takes the pointer away from the page before the click,
+    // which then lands on <html>: the element pressed is the one clicked.
+    let pressed = null;
+    addEventListener("pointerdown", (e) => { if (pageEvent(e)) pressed = { el: e.target, at: Date.now() }; }, { capture: true, passive: true, signal });
+    addEventListener("click", (e) => {
+      if (!pageEvent(e)) return;
+      const onRoot = e.target === document.documentElement || e.target === document.body;
+      const el = onRoot && pressed && Date.now() - pressed.at < 1000 ? pressed.el : e.target;
+      log("click", { on: actionLabel(el) });
+    }, { capture: true, passive: true, signal });
     addEventListener("change", (e) => { // a choice; a text field's change is its typing, logged below
       const value = pageEvent(e) && choiceValue(e.target);
       if (value) log("change", { on: actionLabel(e.target), value });
@@ -1652,7 +1706,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     if (CFG.startMode !== "draw" || document.visibilityState !== "visible") return undefined; // only the extension captures, only what is in view
     let target = null;
     if (m.selector) {
-      try { target = document.querySelector(m.selector); } catch { /* not a selector */ }
+      try { target = deepQuery(m.selector); } catch { /* not a selector */ }
       if (target) {
         const r = target.getBoundingClientRect();
         if (r.bottom < 0 || r.top > innerHeight) { target.scrollIntoView({ block: "nearest" }); await new Promise((res) => setTimeout(res, 120)); }
@@ -1705,15 +1759,19 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   function askedElement(m) {
     if (m.selector) {
       let e = null;
-      try { e = document.querySelector(m.selector); } catch { throw new Error(`not a selector: ${m.selector}`); }
+      try { e = deepQuery(m.selector); } catch { throw new Error(`not a selector: ${m.selector}`); }
       if (!e) throw new Error(`nothing on the page matches ${m.selector}`);
       return e;
     }
     if (m.note) {
       const n = notes.find((k) => k.n === m.note);
       if (!n) throw new Error(`no note ${m.note} on this page`);
-      if (n.y < scrollY || n.y > scrollY + innerHeight) scrollTo({ top: Math.max(0, n.y - innerHeight / 2) }); // the pin into view: hit testing sees only the viewport
+      // Hit testing sees only the viewport: the pin into view for a moment, then back where the user was.
+      const was = [scrollX, scrollY];
+      const away = n.y < scrollY || n.y > scrollY + innerHeight;
+      if (away) scrollTo({ top: Math.max(0, n.y - innerHeight / 2), behavior: "instant" });
       const e = elementAt(n.x, n.y);
+      if (away) scrollTo({ left: was[0], top: was[1], behavior: "instant" });
       if (!e) throw new Error(`note ${m.note} is not over an element`);
       return e;
     }
@@ -1723,10 +1781,12 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   const OUTLINE_MAX = 300;
   function readAnswer(m) {
     const scope = askedElement(m) || document.body;
-    const text = (scope.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
+    // innerText leaves out what web components render in their shadow roots: their text follows.
+    const shadowText = shadowHosts(scope).map((h) => [...h.shadowRoot.children].map((c) => c.innerText || "").join("\n").trim()).filter(Boolean);
+    const text = [scope.innerText || "", ...shadowText].join("\n").replace(/\n{3,}/g, "\n\n").trim();
     const max = m.maxChars || 20000;
     const outline = [];
-    for (const e of scope.querySelectorAll(OUTLINE_SEL)) {
+    for (const e of [scope, ...shadowHosts(scope).map((h) => h.shadowRoot)].flatMap((r) => [...r.querySelectorAll(OUTLINE_SEL)])) {
       if (outline.length >= OUTLINE_MAX) break;
       if (host.contains(e) || !e.getClientRects().length) continue; // ours, or not rendered
       outline.push(actionLabel(e) + (e.tagName === "A" ? ` → ${e.getAttribute("href")}` : ""));
@@ -1744,7 +1804,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
   }
   function consoleAnswer(m) {
     const since = Number(m.since) || 0;
-    return { url: pageUrl(), capturing: VIA_PORT ? "page errors only: this overlay can't see the page's console on a site that isn't local" : "page errors and console errors and warnings", entries: pageLog.filter((x) => x.t > since) };
+    return { url: pageUrl(), capturing: VIA_PORT && !CFG.helped ? "page errors only: this overlay can't see the page's console on a site that isn't local" : "page errors and console errors and warnings", entries: pageLog.filter((x) => x.t > since) };
   }
 
   // Discard all pending annotations? Cancel / Discard, as Codex asks.
@@ -1896,7 +1956,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     bindHold(signal);
     bindRecordingLog(signal);
     bindPageLog(signal);
-    if (EXT) { const onMsg = (m) => { if (m && m.type === "rec-state") onRecState(m); }; EXT.onMessage.addListener(onMsg); signal.addEventListener("abort", () => EXT.onMessage.removeListener(onMsg)); }
+    if (EXT) { const onMsg = (m) => { if (m && m.type === "rec-state") onRecState(m); if (m && m.type === "url-changed") onUrlChange(); }; EXT.onMessage.addListener(onMsg); signal.addEventListener("abort", () => EXT.onMessage.removeListener(onMsg)); }
     // The server hides the toolbar for screenshots. A DOM event reaches the overlay in any world.
     document.addEventListener("claude-annotate:capture", (e) => api.capture(!!e.detail), { signal });
 
@@ -1941,11 +2001,15 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     }, { signal });
     bindShield(signal); // after onKey: the overlay's keys reach onKey before the shield stops them
   }
-  let currentUrl = location.href;
   function onUrlChange() {
     if (off.signal.aborted || location.href === currentUrl) return;
+    // The old page's notes are saved under the old URL, a comment being written with them; then the
+    // screen is the new page's.
+    if (popNote) commitPopover();
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; req("PUT", "/state", stateBody(currentUrl)).catch(() => {}); }
     currentUrl = location.href;
-    closePopover();
+    notes = []; shapes = []; anchors.clear(); undo.length = 0; redo.length = 0;
+    renderInk(); renderPins(); renderToolbar();
     hydrate();
     postPresence({ url: pageUrl(), title: document.title.slice(0, 200) });
   }
