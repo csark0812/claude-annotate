@@ -116,10 +116,22 @@
   const NEGATED_PSEUDO = /:(not|has)\([^)]*:(hover|focus)/; // a twin of :not(:hover) would match the opposite
   let held = null; // { marked: [[el, attr]], twins: [[container, rule]], hover: Element[], focus: Element | null }
 
+  // A remount (the tab follows another chat) takes over the hold the overlay before it left marked
+  // on the page, and never a fresh one: :hover only moves with the mouse, so it would name what was
+  // under the pointer before annotating began.
+  let adoptHold = !!CFG.remount;
   function holdPage() {
     if (held || RENDER_ONLY) return;
-    const hover = [...document.querySelectorAll(":hover")].filter((e) => e !== document.documentElement && e !== document.body && e !== host);
-    const focus = pageFocus();
+    let hover, focus;
+    if (adoptHold) {
+      adoptHold = false;
+      hover = [...document.querySelectorAll(`[${HOLD_ATTR.hover}]`)];
+      focus = document.querySelector(`[${HOLD_ATTR.focus}]`);
+      for (const attr of Object.values(HOLD_ATTR)) for (const e of document.querySelectorAll(`[${attr}]`)) e.removeAttribute(attr);
+    } else {
+      hover = [...document.querySelectorAll(":hover")].filter((e) => e !== document.documentElement && e !== document.body && e !== host);
+      focus = pageFocus();
+    }
     const marked = [];
     const mark = (e, attr) => { e.setAttribute(attr, ""); marked.push([e, attr]); };
     for (const e of hover) mark(e, HOLD_ATTR.hover);
@@ -133,7 +145,8 @@
   }
   // Lets the page go: styles back to the real pointer and focus, focus back where the page had it
   // (a comment may have taken it), and what is no longer under the pointer hears it leave on the next move.
-  function releasePage() {
+  // handOver: another overlay takes the hold at once (a remount): its marks stay for it to adopt.
+  function releasePage({ handOver = false } = {}) {
     if (!held) return;
     const h = held;
     held = null;
@@ -141,6 +154,7 @@
       const i = [...container.cssRules].indexOf(rule);
       if (i >= 0) container.deleteRule(i);
     }
+    if (handOver) return renderToolbar();
     for (const [e, attr] of h.marked) e.removeAttribute(attr);
     if (h.focus && h.focus.isConnected && host && document.activeElement === host) h.focus.focus({ preventScroll: true });
     settleHoverLater(h.hover);
@@ -2334,6 +2348,17 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
     const pid = Number(await askExtension("recheck", 4000, { chat: CFG.chat }));
     if (Number.isInteger(pid) && pid > 0 && pid !== CFG.chat) chooseChat(pid, { auto: true });
   }
+  // A chat is named after it starts (its title follows the first prompts): the bar's name keeps up.
+  async function refreshChatName() {
+    if (!CHOOSES_CHAT) return;
+    let list = null;
+    try { list = JSON.parse((await askExtension("chats")) || "null"); } catch { return; }
+    const me = list && Array.isArray(list.chats) && list.chats.find((c) => c.pid === CFG.chat);
+    if (!me) return;
+    const was = chatLabel();
+    CFG.sendsTo = me.title || me.folder; CFG.sendsFolder = me.folder; CFG.sendsPrompt = me.lastPrompt ?? null;
+    if (chatLabel() !== was) renderToolbar();
+  }
   const chatLabel = () => [CFG.sendsTo, CFG.sendsFolder].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ") || "Claude";
 
   // Back to following the open chat after a pick in the menu.
@@ -2667,6 +2692,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
             sendAgain((f) => f.chat === CFG.chat);
           }
           if (m.server) serverBoot = m.server;
+          refreshChatName(); // the name may have changed while this tab was away
           linkLostAt = 0; relinkTries = 0; setLink("on");
           if (m.totals) { totals = m.totals; renderToolbar(); }
           // Back after a drop: a restarted server starts empty, so this page's notes go to it again.
@@ -2699,7 +2725,7 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
           keepSoon();
           break;
         case "changed": if (m.url === pageUrl() && m.from !== SAVER && !saveTimer && !draft && !popNote && !drag) hydrate(); break; // edited from outside this tab
-        case "chats": followOpenChat(); break; // a chat was opened, typed in, started or ended
+        case "chats": followOpenChat(); refreshChatName(); break; // a chat was opened, typed in, renamed, started or ended
         case "ask": answerAsk(m); break; // Claude's annotate_screenshot, annotate_read, annotate_inspect…
         case "stop": exitAnnotating(); break; // the ✕ on the bar in Claude Code
         case "done":
@@ -2738,12 +2764,12 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
       clearTimeout(keepTimer);
     }
     // What the extension keeps for this tab, answered straight back (before the next overlay's config is made).
-    const handover = remount && inFlight.size ? { inFlight: [...inFlight.entries()], sentHere: [...sentHere] } : null;
+    const handover = remount ? { remounted: true, inFlight: [...inFlight.entries()], sentHere: [...sentHere] } : null;
     if (saveTimer) {
       clearTimeout(saveTimer);
       await req("PUT", "/state", stateBody(pageUrl())).catch(() => {});
     }
-    releasePage();
+    releasePage({ handOver: remount }); // the next overlay holds what this one held
     if (rec && rec.via === "page") { rec.cancel = true; rec.recorder.onstop = null; for (const t of rec.stream.getTracks()) t.stop(); }
     off.abort();
     if (sse) { sse.onerror = null; sse.close(); }

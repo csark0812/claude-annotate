@@ -145,7 +145,9 @@ async function setTabSession(tabId, pid) {
 // ---------------------------------------------------------------------------
 // remount: another overlay follows at once (another chat): the old one hands over what it may just
 // have sent (overlay.js, api.unmount).
+// Returns whether an overlay was there: the next one then takes over its hold (cfg.remount).
 async function unmountOverlay(tabId, { remount = false } = {}) {
+  let was = false;
   for (const world of ["MAIN", "ISOLATED"]) {
     const [r] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -153,8 +155,10 @@ async function unmountOverlay(tabId, { remount = false } = {}) {
       func: async (again) => { const h = await window.__claudeAnnotate?.unmount?.({ remount: again }); window.__claudeAnnotateHelper?.off?.(); return h ?? null; }, // MAIN: an older overlay, or the page helper
       args: [remount],
     }).catch(() => []); // the page is gone or not scriptable: nothing to remove
-    if (r?.result?.inFlight?.length) await mutate("kept", {}, (kept) => { kept[tabId] = r.result; });
+    if (r?.result?.remounted) was = true;
+    if (r?.result?.inFlight?.length) await mutate("kept", {}, (kept) => { kept[tabId] = { inFlight: r.result.inFlight, sentHere: r.result.sentHere }; });
   }
+  return was;
 }
 
 // Records the tab's session first: an isolated overlay asks for it over the port as soon as it runs.
@@ -170,9 +174,9 @@ async function mountOverlay(tabId, url, session, { carry = null, automatic = tru
     await chrome.tabs.reload(tabId);
     return;
   }
-  await unmountOverlay(tabId, { remount: true }); // a page may still carry an overlay for another session
+  const remount = await unmountOverlay(tabId, { remount: true }); // a page may still carry an overlay for another session
   await setTabSession(tabId, session.pid);
-  const cfg = await overlayConfig(tabId, url, session, { carry, automatic });
+  const cfg = { ...(await overlayConfig(tabId, url, session, { carry, automatic })), remount };
   if (cfg.helped) {
     await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: () => { window.__CLAUDE_ANNOTATE__ = { pageHelper: true }; } });
     await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", files: ["overlay.js"] });

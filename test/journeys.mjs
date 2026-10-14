@@ -583,6 +583,18 @@ async function otherChat(name, pid) {
     await A.client.close();
     await host([B.s], [70001, 70002]);
     assert.equal(await take(B, 10000), null, "A already has it: not sent to B too");
+
+    // Display: following another chat keeps the hold as it was (no "Hover held" on whatever was
+    // under the pointer before); a chat renamed later shows its new name.
+    const badge = () => pg.evaluate(() => document.querySelector("claude-annotate").shadowRoot.querySelector(".bar .frozen")?.textContent ?? "none");
+    await pg.mouse.move(5, 5);
+    await host([A.s, B.s], [70001, 70002]); await remount(id); await sleep(800);
+    const before = await badge();
+    await host([B.s, A.s], [70001, 70002]); await remount(id); await sleep(800);
+    assert.equal(await badge(), before, "the hold is handed over as it was");
+    await host([{ ...B.s, title: "Renamed chat" }, A.s], [70001, 70002]);
+    fs.writeFileSync(path.join(B.home, ".cache", "claude-annotate", "sessions", "touch.json"), "{}"); // a session file changes: the server tells the tabs
+    await until("the bar shows the chat's new name", async () => /Renamed chat/.test(await pg.evaluate(() => document.querySelector("claude-annotate").shadowRoot.querySelector(".bar .to .name")?.textContent || "")), 5000);
   });
   await context.close();
   await B.client.close().catch(() => {});
