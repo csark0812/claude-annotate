@@ -7,7 +7,7 @@
 
 <p align="center">
   <strong>Draw on the page. Claude fixes the code.</strong><br>
-  A Claude Code plugin: mark up your running localhost site in the browser, leave a comment, and it goes by itself: every mark goes to the session that opened the page, with the element, its component and a screenshot under each one.
+  A Claude Code plugin: mark up your running localhost site in the browser, leave comments, and send them when you're ready: every mark goes to the session that opened the page, with the element, its component and a screenshot under each one.
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 /plugin install annotate@claude-annotate
 ```
 
-Then set up the [Chrome extension](#chrome-extension), open your page and turn annotating on (its toolbar icon, or `⌥⇧A`). Click an element or drag over an area, write a comment, hold Space to use the page in between. Scroll, click through to other pages, keep marking. While annotating is on, the bar above the prompt of your open Claude Code chat says so. There is no Send: a moment after you save a note (about 1.5 s, so a quick run of notes goes together) it goes to Claude, which reads the crops and edits the code. The bar then lists the notes Claude is still working on.
+Then set up the [Chrome extension](#chrome-extension), open your page and turn annotating on (its toolbar icon, or `⌥⇧A`). Click an element or drag over an area, write a comment, hold Space to use the page in between. Scroll, click through to other pages, keep marking. While annotating is on, the bar above the prompt of your open Claude Code chat says so. Enter saves a note; nothing goes to Claude until you send. Your notes go with the next message you send in that chat, or with **Send** on the bar above the prompt. Claude then reads the crops and edits the code. The bar then lists the notes Claude is still working on.
 
 ## What Claude receives
 
@@ -84,7 +84,7 @@ A note leaves the page as it goes to Claude (a toast says where it went). What C
 | **Bar** | At the bottom: *Click or drag to add a note* (then *N notes*), Take a screenshot (the view in front of you becomes a note), Record the tab (see **Record**), Hide markers, Discard annotations (asks first; this page only, other tabs and pages keep theirs), the chat the notes go to, and **Done** (`esc`) to leave annotation mode; your notes stay. Drag it by its grip; it remembers where per site. The dot on the grip is the link to the session: green connected, yellow while it reconnects by itself (the session's server restarted, or the chat closed and the open one takes over), red when no chat with annotate is running; it keeps trying. |
 | **Record** | Records the tab while you use it as normal: no pen, no pins, nothing held. A red edge around the tab, a *Recording 0:12* pill with **Stop** and a trash, and a red *REC* on the extension's icon say it is recording. It goes on across page loads, for up to 3 minutes. Stop it with the pill, the icon or `⌥⇧R`; it becomes a note on the page with the comment box open. Claude gets the video, stills cut just after each thing you did, and a timeline: clicks, choices, keys, page loads and page errors with the element and source line each one was on. What you type is not recorded. `⌥⇧R` also starts a recording from any tab. |
 | **Which chat** | The chat open in the Claude desktop app, following you as you switch (outside the app: the one you typed in last). The bar says which, *Claude Annotations · applications* (*auto* while it follows the open chat); click it to pin another chat for this tab, or to follow the open chat again. |
-| **Prompt bar** | Above the chat box, as soon as annotating is on: *Annotating · localhost:5180/pricing*, with **Stop** to turn annotating off in the tab. While a note is on its way, one chip says how many annotations there are, with small pictures of their pages, *Sending to Claude…* and **Discard** (asks first). A note saved just before you press Enter goes with that message, which then shows *📎 N annotations* with what they say. Under the chip, the notes Claude has and has not finished, each with its status (○ waiting, ◐ working). Press the chip to list them, each with its picture, the element it is on and a trash. `/annotations` lists the notes as text. |
+| **Prompt bar** | Above the chat box, as soon as annotating is on: *Annotating · localhost:5180/pricing*, with **Stop** to turn annotating off in the tab. While notes wait, one chip says how many annotations there are, with small pictures of their pages, **Send** (the notes go as a message of their own) and **Discard** (asks first). Notes waiting when you send a message go with it, which then shows *📎 N annotations* with what they say. Under the chip, the notes Claude has and has not finished, each with its status (○ waiting, ◐ working). Press the chip to list them, each with its picture, the element it is on and a trash. `/annotations` lists the notes as text. |
 
 Keys: hold `Space` to use the page · `⌥⇧R` records the tab, again to stop · `esc` leaves annotation mode · `⌘Z` · `⇧⌘Z`. The wheel scrolls the page under the pointer, inner scroll areas included.
 
@@ -168,7 +168,7 @@ The bridge listens on `127.0.0.1` only and every request needs the session token
 
 **What about a page behind a login?** The annotation window has its own Chrome profile that persists, so log in once. Claude's temporary tabs for other pages share the same profile.
 
-**Claude didn't react to a note.** Notes go by themselves about 1.5 s after the last save; while Claude is mid-turn they wait for the turn to end. A note stays with the tab until Claude reports on it, even after the tab follows another chat: if the chat it went to closes before handing it to Claude, it goes again to the chat the tab uses now; one Claude already has is never sent twice. If you stop Claude's turn with Esc, notes saved after it still go: the bar above the prompt delivers them when no turn is running. If a batch still seems lost, `annotate_pull` returns it.
+**Claude didn't react to a note.** Notes go only when you send: with your next message in the chat, or with **Send** on the bar above the prompt. A note stays with the tab until Claude reports on it, even after the tab follows another chat: if the chat it went to closes before handing it to Claude, it goes again to the chat the tab uses now; one Claude already has is never sent twice. If you stop Claude's turn with Esc, notes saved after it still go: the bar above the prompt delivers them when no turn is running. If a batch still seems lost, `annotate_pull` returns it.
 
 **"Annotate stopped in this chat."** The chat's annotate server ended and Claude Code doesn't start it again by itself: run `/mcp` and reconnect annotate.
 
@@ -201,7 +201,7 @@ To have an agent do the setup, point it at [INSTALL.md](INSTALL.md).
 
 ### Prompt bar
 
-The plugin draws a bar above the prompt (`hooks/pane.tsx`, a Claude Code hooks module next to the plugin's classic hooks), in the terminal and in the desktop app. It shows one "N annotations" chip; pressed, it lists the unsent notes (element, page picture on the desktop, trash) and the sent notes Claude is still working on. The server sends notes by itself; one saved just before you press Enter goes with that message. `/annotations` lists them as text; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
+The plugin draws a bar above the prompt (`hooks/pane.tsx`, a Claude Code hooks module next to the plugin's classic hooks), in the terminal and in the desktop app. It shows one "N annotations" chip; pressed, it lists the unsent notes (element, page picture on the desktop, trash) and the sent notes Claude is still working on. Notes wait until the user sends: they go with the next message, or with the bar's Send. `/annotations` lists them as text; the status line shows the counts while there are notes. It reads the annotate server's `GET /overview` and calls `/send`, `/clear` and `/note/delete`.
 
 ```sh
 claude plugin test .             # the pane's tests (tests/pane.test.tsx)

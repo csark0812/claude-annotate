@@ -1457,7 +1457,8 @@ svg.ink .line.box { stroke-width: 1.5; stroke-dasharray: 4 3; }
 
   // Off: one Annotate button. On: grip · Annotating · N · screenshot · record · hide markers ·
   // discard · the chat the notes go to · ×. Recording: grip · Recording 0:12 · Stop · discard.
-  // No Add or Send: a note goes to Claude Code by itself a moment after it is saved.
+  // No Add or Send here: saved notes wait in Claude Code's bar and go with the user's next message
+  // there, or with the bar's Send.
   let lastBar = "";
   function renderToolbar() {
     if (!bar) return;

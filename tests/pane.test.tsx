@@ -235,8 +235,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
 }
 
 for (const surface of ['terminal', 'desktop'] as const) {
-  test(`${surface}: no Send: a saved note is on its way to Claude by itself`, async ($, on) => {
+  test(`${surface}: a saved note waits for Send; the bar's Send posts it as a message of its own`, async ($, on) => {
+    const CONTENT = 'Browser annotations · batch 1 · 1 page · 1 note · 0 marks\n\n### Note 1 — "make it blue"'
     const sends: unknown[] = []
+    const submitted: string[] = []
     on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n4242\n', stderr: '' } }) as never)
     on('fs.exists', (_$, e) => ({ value: e.path === SESSIONS || e.path === `${SESSIONS}/4242.json` }))
     on('fs.read', () => ({ value: JSON.stringify(BRIDGE) }))
@@ -245,18 +247,24 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('command.register', () => ({ value: { command: 'annotations' } }))
     on('session.start', (_$, e) => ({ cwd: e.cwd }))
     on('ui.status', () => ({ value: undefined }))
+    on('prompt.submit', (_$, e) => { submitted.push(e.text); return { text: e.text } })
     on('http.fetch', (_$, e) => {
-      if (e.url.endsWith('/send')) sends.push(e.url)
-      return { value: { status: 200, ok: true, headers: {}, text: overviewWith([TAB], [{ n: 1, text: 'make it blue', color: 'blue' }]) } }
+      if (e.url.endsWith('/send')) {
+        sends.push(JSON.parse(e.init?.body ?? '{}'))
+        return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ ok: true, content: CONTENT }) } }
+      }
+      return { value: { status: 200, ok: true, headers: {}, text: overviewWith([TAB], sends.length ? [] : [{ n: 1, text: 'make it blue', color: 'blue' }]) } }
     })
     on('ui.render', () => ({ type: 'Box', props: {}, children: [] }) as never)
     await $.session.start({ cwd: '/repo', surface, isInteractive: true } as never)
     await $.command.run({ command: 'annotations', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
     const band = await $.ui.mount({ plugin: 'annotate', surface, component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false } as never })
 
-    expect(await band.find({ key: 'send' })).toBeUndefined()
-    expect(await band.find({ text: /Sending to Claude/ })).toBeDefined()
-    expect(sends).toEqual([]) // the server sends it; the bar only shows it going
+    expect(await band.find({ text: /Sending to Claude/ })).toBeUndefined()
+    expect(sends).toEqual([]) // nothing goes until the user says so
+    await band.press({ key: 'send' })
+    expect(sends).toEqual([{ from: 'prompt' }])
+    expect(submitted).toEqual([CONTENT])
   })
 }
 

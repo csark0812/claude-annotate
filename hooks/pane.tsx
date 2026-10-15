@@ -42,8 +42,8 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Notes go to Claude by themselves a moment after they are saved. One saved just before the user
-  // presses Enter rides along with that prompt instead, text and pictures alike. The server is always asked: the bar's copy can be a
+  // Saved notes wait here until the user sends: they ride along with the next prompt, text and
+  // pictures alike, or go with the bar's Send. The server is always asked: the bar's copy can be a
   // moment behind a note just saved. It answers at once (it never waits on the tab), well inside the
   // hook's 10 s budget; past that budget the prompt would go without notes the server already took.
   on('prompt.submit', async ($, e, next) => {
@@ -74,9 +74,8 @@ export const register: Register = on => {
     return ride ? next({ ...e, props: { ...e.props, text: text ? `${text}\n${ride.label}` : ride.label } }) : next(e)
   })
 
-  // Above the prompt, as Codex does it. No Send: notes go to Claude as they are saved. While one is
-  // on its way, the "N annotations" chip (pressed, it lists each note: its picture, what it is on,
-  // the words, a trash) and Discard. Under it, dim lines: which tab is annotating, and the notes
+  // Above the prompt, as Codex does it. While notes wait, the "N annotations" chip (pressed, it
+  // lists each note: its picture, what it is on, the words, a trash), Send and Discard. Under it, dim lines: which tab is annotating, and the notes
   // Claude has and has not finished.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     working = !!e.props.isWorking
@@ -148,7 +147,7 @@ export const register: Register = on => {
             </Box>
             {where && <Button key="stop" label="Stop" dimColor onPress={() => act($, cwd, 'POST', '/stop')} />}
           </Box>
-          {line('hint', writing.length ? 'Writing a note…' : 'Click an element or drag an area in the page; each note goes to Claude as you save it')}
+          {line('hint', writing.length ? 'Writing a note…' : 'Click an element or drag an area in the page; notes go with your next message or Send')}
           {open.slice(-MAX_OPEN_LINES).map(note => line(`open:${noteKey(note.url, note.n)}`, `${STATUS_MARK[note.status]} ${note.n} ${clip(note.text.replace(/\s+/g, ' ').trim(), 80)}`))}
           {error && line('error', error, 'error')}
         </Box>
@@ -175,7 +174,7 @@ export const register: Register = on => {
           {!isOpen && strip.map(({ url, note }) => picture(`chip-pic:${noteKey(url, note.n)}`, note.preview, note.n, 30, 20))}
         </Box>
         <Box key="spacer" flexGrow={1} />
-        <Text key="going" dimColor>Sending to Claude…</Text>
+        <Button key="send" label="Send" variant="primary" plain={roomy ? undefined : true} onPress={() => sendAlone($)} />
         <Button key="discard" label="Discard" dimColor onPress={() => update($, confirmClear, () => true)} />
       </Box>
     )
@@ -426,6 +425,24 @@ function previewSvg(p: Preview, w: number, h: number) {
 // Rejects with the server's reason; "Nothing to send yet." when nothing waits.
 async function takeUnsent($: EngineInterface): Promise<string | undefined> {
   return (await call($, 'POST', '/send', { from: 'prompt' })).content
+}
+
+// Send with nothing typed: the prompt box will not send empty, so the notes go as a message of
+// their own, the same batch they would add to a typed prompt.
+let sendingAlone = false
+async function sendAlone($: EngineInterface) {
+  if (sendingAlone) return
+  sendingAlone = true
+  try {
+    const content = await takeUnsent($)
+    await update($, expanded, () => false)
+    if (content) await $.prompt.submit({ text: content })
+  } catch (err) {
+    await update($, lastError, () => String((err as Error).message ?? err))
+  } finally {
+    sendingAlone = false
+    await refresh($, cwd)
+  }
 }
 
 async function clearAll($: EngineInterface) {

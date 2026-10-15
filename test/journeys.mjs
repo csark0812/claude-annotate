@@ -176,6 +176,19 @@ async function until(what, fn, ms = 10000) {
     await sleep(100);
   }
 }
+// Claude Code's Send (the bar, or a prompt) to a chat's server, as often as it takes for every
+// pattern to be in what went: a tab saves a moment after the note is written. Null when nothing came.
+async function sendNotes(s, want = [], ms = 5000) {
+  const end = Date.now() + ms;
+  let content = "";
+  for (;;) {
+    const r = await fetch(`${s.endpoint}/send`, { method: "POST", headers: { "Content-Type": "application/json", "X-Annot-Token": s.token }, body: JSON.stringify({ from: "prompt" }) }).catch(() => null);
+    if (r?.status === 200) content += `${(await r.json()).content}\n`;
+    if (content && want.every((re) => re.test(content))) return content;
+    if (Date.now() > end) return content || null;
+    await sleep(200);
+  }
+}
 const shown = (page, sel) => page.evaluate((s) => getComputedStyle(document.querySelector(s)).display !== "none", sel);
 const bar = (page) => page.locator("claude-annotate .bar");
 
@@ -481,7 +494,7 @@ async function noteOn(page, selector, text) {
     await until("the overlay back after the reload", async () => (await overlayMode(page)) === "draw", 5000);
 
     // Following the open chat mounts the overlay again: the old one leaves, and a note saved after
-    // reaches Claude by itself. Then Esc leaves annotating.
+    // waits for a Send, then goes. Then Esc leaves annotating.
     const before = await page.evaluate(() => document.querySelector("claude-annotate")?.shadowRoot?.querySelector(".bar") ? 1 : 0);
     await page.evaluate(() => { window.__oldOverlay = document.querySelector("claude-annotate"); });
     await sw.evaluate((id) => self.claudeAnnotate.remount(id), tabId);
@@ -496,8 +509,9 @@ async function noteOn(page, selector, text) {
     assert.equal(leaked, null, "the page gets no chat list");
     await until("one overlay after the remount", async () => (await page.evaluate(() => document.querySelectorAll("claude-annotate").length)) === 1 && (await overlayMode(page)) === "draw");
     await noteOn(page, "#inc", "after following the chat");
-    const auto = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json(); // throws when nothing comes
-    assert.match(auto.content, /### Note \d+ — "after following the chat"/, "the note reached the chat hook with no Send");
+    await sleep(2500);
+    assert.equal((await (await fetch(`${session.endpoint}/overview`, { headers: H })).json()).delivery.queued, 0, "the saved note does not go by itself");
+    assert.match((await sendNotes(session)) ?? "", /### Note \d+ — "after following the chat"/, "Send takes the note");
     await page.mouse.move(600, 500);
     await page.keyboard.press("Escape");
     await until("Esc removes the overlay", async () => (await overlayMode(page)) === "none", 3000);
@@ -516,8 +530,7 @@ async function noteOn(page, selector, text) {
     await snap.bringToFront();
     await until("the overlay on the picture", async () => (await overlayMode(snap)) === "draw");
     await noteOn(snap, "#snap", "on a chrome page");
-    const sent = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json(); // it goes by itself
-    assert.match(sent.content, /annotated as a picture/, "Claude is told it is a picture");
+    assert.match((await sendNotes(session, [/on a chrome page/])) ?? "", /annotated as a picture/, "Claude is told it is a picture");
     await snap.locator('claude-annotate .bar [data-act="exit"]').click();
     await until("Done closes the picture", async () => !context.pages().some((p) => p.url().includes("snapshot.html")));
   });
@@ -542,7 +555,7 @@ async function otherChat(name, pid) {
   const A = await otherChat("A", 70001), B = await otherChat("B", 70002);
   // The native host: the chats listed (the first is the open one) and the ones still running.
   const host = (list, alive) => sw.evaluate(([l, a]) => { chrome.runtime.sendNativeMessage = async (_h, m) => (m.type === "alive" ? { ok: true, alive: a.includes(m.pid) } : { ok: true, sessions: l }); }, [list, alive]);
-  const take = async (c, ms = 5000) => { try { const r = await fetch(`${c.s.endpoint}/next`, { headers: { "X-Annot-Token": c.s.token }, signal: AbortSignal.timeout(ms) }); return r.status === 200 ? (await r.json()).content : null; } catch { return null; } };
+  const take = (c, ms = 5000, want = []) => sendNotes(c.s, want, ms);
   const remount = (id) => sw.evaluate((i) => self.claudeAnnotate.remount(i), id);
   await journey("several chats: tabs follow together; a note never handed over goes again; none twice", async () => {
     await host([A.s, B.s], [70001, 70002]);
@@ -560,29 +573,28 @@ async function otherChat(name, pid) {
     await Promise.all(tabs.map((t) => remount(t.id)));
     await sleep(800);
     for (const [i, t] of tabs.entries()) await noteOn(t.pg, "#inc", `four tabs ${i}`);
-    const inB = [await take(B), await take(B, 2500)].join("\n");
+    const inB = (await take(B, 5000, [0, 1, 2, 3].map((i) => new RegExp(`"four tabs ${i}"`)))) ?? "";
     assert.ok([0, 1, 2, 3].every((i) => inB.includes(`"four tabs ${i}"`)), "every tab's note went to B");
     assert.equal(await take(A, 1500), null, "none to A");
     for (const t of tabs.slice(1)) await t.pg.close();
     const { pg, id } = tabs[0];
 
-    // A note waits in A, unread; the tab follows B; A closes: it goes to B.
+    // A note saved in A, not sent; the tab follows B; A closes: it goes to B with B's Send.
     await host([A.s, B.s], [70001, 70002]); await remount(id); await sleep(800);
     await noteOn(pg, "#size", "waiting in A");
-    await until("queued in A", async () => (await (await fetch(`${A.s.endpoint}/overview`, { headers: { "X-Annot-Token": A.s.token } })).json()).delivery.queued === 1, 5000);
+    await until("saved in A", async () => (await (await fetch(`${A.s.endpoint}/overview`, { headers: { "X-Annot-Token": A.s.token } })).json()).totals.unsent === 1, 5000);
     await host([B.s, A.s], [70001, 70002]); await remount(id); await sleep(800);
     await host([B.s], [70002]); // A closed
-    assert.match((await take(B, 12000)) ?? "", /"waiting in A"/, "the note A never handed over went to B");
-    while (await take(A, 500)); // what A still held
+    assert.match((await take(B, 12000, [/"waiting in A"/])) ?? "", /"waiting in A"/, "the note A never sent went to B");
 
     // A note A's hook takes; the tab follows B; A's server dies while A runs on: not sent again.
     await host([A.s, B.s], [70001, 70002]); await remount(id); await sleep(800);
     await noteOn(pg, "#inc", "taken by A");
-    assert.match((await take(A)) ?? "", /"taken by A"/, "A's hook took it");
+    assert.match((await take(A, 5000, [/"taken by A"/])) ?? "", /"taken by A"/, "A's Send took it");
     await host([B.s, A.s], [70001, 70002]); await remount(id); await sleep(800);
     await A.client.close();
     await host([B.s], [70001, 70002]);
-    assert.equal(await take(B, 10000), null, "A already has it: not sent to B too");
+    assert.equal(await take(B, 4000), null, "A already has it: not sent to B too");
 
     // Display: following another chat keeps the hold as it was (no "Hover held" on whatever was
     // under the pointer before); a chat renamed later shows its new name.
@@ -614,7 +626,7 @@ async function otherChat(name, pid) {
     await page.frameLocator("#cross").locator("#in-frame").waitFor();
     await click(sw, await tabIdOf(sw, url));
     await until("the overlay", async () => (await overlayMode(page)) === "draw");
-    const next = async () => (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json();
+    const next = async (want) => ({ content: (await sendNotes(session, [want])) ?? "" });
     { // the button inside the frame, where the user would click it
       const btn = await page.frameLocator("#cross").locator("#in-frame").boundingBox();
       await page.mouse.click(btn.x + btn.width / 2, btn.y + btn.height / 2);
@@ -623,12 +635,12 @@ async function otherChat(name, pid) {
       await comment.pressSequentially("inside the frame");
       await comment.press("Enter");
     }
-    let got = await next();
+    let got = await next(/inside the frame/);
     assert.match(got.content, /on: <button#in-frame> {2}"In the frame"/, "the element inside a cross-origin frame");
     assert.match(got.content, /inside frame: http:\/\/127\.0\.0\.1/, "and which frame it is in");
     await sleep(600);
     await noteOn(page, "#wc", "inside the widget");
-    got = await next();
+    got = await next(/inside the widget/);
     assert.match(got.content, /on: <button#inner-btn> {2}"Inside the widget"/, "the element inside an open shadow root");
     assert.match(got.content, /in: .*my-widget#wc/, "its host in the chain");
     const said = (r) => r.content.map((c) => c.text || "").join("\n");
@@ -644,7 +656,7 @@ async function otherChat(name, pid) {
     await sleep(300);
     assert.equal(await page.evaluate(() => document.querySelector("claude-annotate").shadowRoot.querySelectorAll(".pin:not(.flushed)").length), 0, "the first page's pins leave with it");
     await noteOn(page, "#h", "on the about page");
-    const batches = [await next(), await next().catch(() => ({ content: "" }))].map((b) => b.content || "").join("\n");
+    const batches = (await sendNotes(session, [/on the first page/, /on the about page/])) ?? "";
     const pageOf = (text) => { const at = batches.indexOf(`"${text}"`); return batches.slice(0, at).match(/## Page \d+ of \d+ — (\S+)/g).at(-1); };
     assert.match(pageOf("on the first page"), /\/modern$/, "the first note is filed under the first URL");
     assert.match(pageOf("on the about page"), /\/modern\/about$/, "the second under the new one");
@@ -664,7 +676,7 @@ async function otherChat(name, pid) {
     await click(sw, await tabIdOf(sw, url));
     await until("the overlay", async () => (await overlayMode(page)) === "draw");
     await noteOn(page, "#buy", "typed past the page");
-    const got = await (await fetch(`${session.endpoint}/next`, { headers: H, signal: AbortSignal.timeout(5000) })).json();
+    const got = { content: (await sendNotes(session, [/typed past the page/])) ?? "" };
     assert.match(got.content, /### Note \d+ — "typed past the page"/, "a page that grabs every key and has a strict CSP: the note goes");
     assert.match(got.content, /Checkout/, "React's component, read in the page's own world");
     const seen = await page.evaluate(() => window.seen.join("\n") + JSON.stringify(window.__CLAUDE_ANNOTATE__ ?? null));

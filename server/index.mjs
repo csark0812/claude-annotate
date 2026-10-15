@@ -73,9 +73,6 @@ const ASK_MS = 4000; // how long a question to the annotating tab waits; annotat
 const VIDEO_MAX_FRAMES = 24; // a recording reaches Claude as at most this many stills
 const VIDEO_SCAN_FPS = 2; // stills are cut at this rate, then the telling ones kept
 const VIDEO_AFTER_S = 0.7; // a still this long after each action shows what it did
-// Notes go to Claude by themselves: this long after the last change on the pages, so a burst of
-// notes goes as one message and a note being written waits for its words.
-const AUTO_SEND_MS = 1500;
 const SENT_KEEP = 200; // finished notes kept in the sent list (and in every /overview)
 // This server's life: a tab that sees another one after a drop knows notes it sent are gone with the old.
 const BOOT = crypto.randomBytes(6).toString("hex");
@@ -544,7 +541,6 @@ async function buildBatch(skip = new Set(), { browser = true } = {}) {
     const drop = new Set(finished.slice(0, Math.max(0, state.sent.length - SENT_KEEP)));
     state.sent = state.sent.filter((k) => !drop.has(k));
   }
-  if (kept.size) scheduleAutoSend();
   return batch;
 }
 
@@ -610,19 +606,6 @@ async function rideAlong(skip) {
   } finally {
     state.riding = null;
   }
-}
-
-// What is on the pages goes to Claude AUTO_SEND_MS after it last changed: no Send.
-let autoSendTimer = null;
-function scheduleAutoSend() {
-  clearTimeout(autoSendTimer);
-  autoSendTimer = setTimeout(autoSend, AUTO_SEND_MS);
-}
-async function autoSend() {
-  if (totals().unsent === 0) return;
-  if (state.sending) return scheduleAutoSend(); // a Send is building: take what is left after it
-  // Screenshots from a browser this server already drives (annotate_open); never reach for Chrome otherwise.
-  try { await sendNow({ browser: !!context }); } catch (e) { log(`auto send: ${e.message}`); }
 }
 
 async function deliver(batch) {
@@ -1246,7 +1229,6 @@ const server = http.createServer(async (req, res) => {
       for (const n of p.notes) if (n.n >= state.nextNote) state.nextNote = n.n + 1;
       if (tab) broadcast({ type: "changed", url: page, from: tab }); // the other tabs on this page look again
       changed();
-      scheduleAutoSend();
       return json(res, 200, { ok: true, totals: totals() });
     }
     if (req.method === "GET" && url.pathname === "/overview") {
